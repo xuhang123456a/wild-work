@@ -538,14 +538,18 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	if bound == 0 {
-		// 匿名渠道没有「重新登录」这个概念，给出针对性提示（否则会误导用户去找登录入口）。
-		hint := fmt.Sprintf("%s 账号需重新登录（日志会有 refresh token is invalid）", rt.Kind)
+		// 全部不可用：如实转述真实原因（冷却/禁用 + 冷却截止时间），
+		// 不要无脑提示「需重新登录」——历史上这里恒拼该文案，会把超时冷却、
+		// 限流等误报成凭证失效，把用户引向错误方向。
+		// 匿名渠道没有「重新登录」这个概念，给出针对性提示。
 		if noLoginChannel(rt.Kind) {
-			hint = "该渠道无需登录，稍后重试即可（若持续失败请查看日志）"
+			writeOpenAIError(w, http.StatusServiceUnavailable, "no_healthy_account",
+				fmt.Sprintf("渠道 %s 的 %d 个账号当前全部不可用（禁用 %d / 冷却 %d）：该渠道无需登录，稍后重试即可（若持续失败请查看日志）",
+					rt.Kind, len(sts), disabled, cooling))
+			return
 		}
 		writeOpenAIError(w, http.StatusServiceUnavailable, "no_healthy_account",
-			fmt.Sprintf("渠道 %s 的 %d 个账号当前全部不可用（禁用 %d / 冷却 %d）：可在面板查看原因；%s",
-				rt.Kind, len(sts), disabled, cooling, hint))
+			unavailableAccountsMessage(rt.Kind, sts, disabled, cooling))
 		return
 	}
 	msg := fmt.Sprintf("渠道 %s 暂无可用账号（共 %d 个：禁用 %d / 冷却 %d；其余余额耗尽或出错）",
@@ -560,6 +564,41 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 // 用于把「去面板重新登录」这类引导文案限定在真正适用的渠道上，
 // 避免匿名通道（oczen）被误导去找一个不存在的登录按钮。
 func noLoginChannel(k provider.Kind) bool { return k == provider.Oczen }
+
+// unavailableAccountsMessage 描述「账号全部不可用」的真实原因。
+// 只有确实出现 session dead 时才提示重新登录；其余情况如实转述冷却/禁用原因
+// 与冷却截止时间——历史上这里无条件拼接「需重新登录（refresh token is invalid）」，
+// 会把超时冷却、限流等误报成凭证失效，把用户引向错误方向。
+func unavailableAccountsMessage(kind provider.Kind, sts []pool.Status, disabled, cooling int) string {
+	var reasons []string
+	seen := map[string]bool{}
+	for _, s := range sts {
+		r := strings.TrimSpace(s.Reason)
+		if r == "" || seen[r] {
+			continue
+		}
+		seen[r] = true
+		reasons = append(reasons, r)
+	}
+	msg := fmt.Sprintf("渠道 %s 的 %d 个账号当前全部不可用（禁用 %d / 冷却 %d）", kind, len(sts), disabled, cooling)
+	if len(reasons) > 0 {
+		msg += "：" + strings.Join(reasons, "；")
+	}
+	var coolingUntil []string
+	for _, s := range sts {
+		if s.Cooling && !s.Disabled && !s.Until.IsZero() {
+			coolingUntil = append(coolingUntil, s.Until.Format(time.RFC3339))
+		}
+	}
+	if len(coolingUntil) > 0 {
+		msg += fmt.Sprintf("，冷却至 %s", strings.Join(coolingUntil, "、"))
+	}
+	msg += "；可在面板查看详情"
+	if seen["session dead"] {
+		msg += fmt.Sprintf("；%s 账号需重新登录", kind)
+	}
+	return msg
+}
 
 func (h *Handler) runtimeForModel(model string) (*Runtime, string, error) {
 	parts := strings.SplitN(strings.TrimSpace(model), "/", 2)
@@ -701,10 +740,14 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 	_, _ = w.Write(raw)
 }
 
-// MaxRequestBody 请求体上限（8MiB）：server 与 gateway 共用，避免两处硬编码不同步。
+// MaxRequestBody 请求体上限（32MiB）：server 与 gateway 共用，避免两处硬编码不同步。
 // 超限直接回 413 说真话，不做静默截断——截断后 JSON 解析失败会被误报成
 // invalid_model（issue #30），比直接拒绝更误导排查。
-const MaxRequestBody = 8 << 20
+//
+// 本地取值 32MiB（上游为 8MiB）：实测长会话（约 9MB）在 8MiB 处被拒，
+// 32MiB 与前置代理 Codex++ 的 MAX_HTTP_BODY_BYTES 对齐并留 3 倍余量；
+// 再大则会显著推高单请求内存峰值。
+const MaxRequestBody = 32 << 20
 
 // ReadBodyLimited 读取请求体：超过 MaxRequestBody 时回 413 并返回错误。
 // 用 LimitReader(max+1) 多读 1 字节以区分「恰好 max」与「超限」。
