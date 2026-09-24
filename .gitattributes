@@ -1,0 +1,6 @@
+# Shell 脚本必须保持 LF：Windows 上 core.autocrlf=true 会把换行改成 CRLF，
+# 导致 bash 报 "$'\r': command not found"。
+*.sh text eol=lf
+# Windows 批处理反过来需要 CRLF。
+*.bat text eol=crlf
+*.cmd text eol=crlf
