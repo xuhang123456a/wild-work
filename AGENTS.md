@@ -225,6 +225,9 @@ go version -m dist/wild-work.exe     # 更可靠：核对 vcs.revision 就是当
 > ⚠️ 不要用「旧版本号出现次数 == 0」当判据：Go 运行时的符号名里会出现形如
 > `.marshalCertificate.1.2.2.1` 的串，旧版本号（如 `2.2.1`）会被误命中。
 > `*.sh` 必须保持 LF（见 `.gitattributes`），否则 Windows 上 bash 会报 `$'\r'`。
+> `*.bat` 必须保持**纯 ASCII + CRLF**：cmd.exe 按 OEM 代码页（zh-CN 为 GBK）解析批处理，
+> UTF-8 中文注释会被按 GBK 切成半字符、把注释碎片当命令执行（`'xxx' 不是内部或外部命令`）。
+> 需要中文输出时在 bat 里先 `chcp 65001`，中文文案写在 `.sh` 里。
 
 ### 发版（tag 触发）
 
