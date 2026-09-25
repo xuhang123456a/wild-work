@@ -240,13 +240,29 @@ GOOS=darwin GOARCH=arm64 go build -o dist/wild-work-darwin ./cmd/wild-work
 GOOS=linux GOARCH=amd64 CGO_ENABLED=0 go build -o dist/wild-work-linux ./cmd/wild-work
 ```
 
+**一键脚本**：`build/build-local.sh`（Windows 也可双击 `build/build-local.bat`）
+把 build + vet + test + 编译 + 版本校验串成一条命令，避免漏步：
+
+```bash
+bash build/build-local.sh            # 完整流程
+bash build/build-local.sh --fast     # 跳过测试
+DEPLOY_DIR=/d/AI/Workbuddy bash build/build-local.sh   # 顺带更新运行目录的 exe
+```
+
 构建后核对版本号已进二进制（防止拿到旧文件）：
 
 ```bash
-# Windows bash 下用 python 字节计数（strings 对 Go 二进制的长串不可靠）
-python -c "b=open('dist/wild-work.exe','rb').read(); print('new:',b.count(b'2.5.3'),'old:',b.count(b'2.5.2'))"
-# 期望：new >= 1 且 old == 0。若旧版本号仍在，说明构建未生效。
+V=$(sed -n 's/^const Version = "\(.*\)"/\1/p' internal/app/app.go)
+grep -a -c "$V" dist/wild-work.exe   # 期望 >= 1
+go version -m dist/wild-work.exe     # 更可靠：核对 vcs.revision 就是当前 HEAD
 ```
+
+> ⚠️ 不要用「旧版本号出现次数 == 0」当判据：Go 运行时的符号名里会出现形如
+> `.marshalCertificate.1.2.2.1` 的串，旧版本号（如 `2.2.1`）会被误命中。
+> `*.sh` 必须保持 LF（见 `.gitattributes`），否则 Windows 上 bash 会报 `$'\r'`。
+> `*.bat` 必须保持**纯 ASCII + CRLF**：cmd.exe 按 OEM 代码页（zh-CN 为 GBK）解析批处理，
+> UTF-8 中文注释会被按 GBK 切成半字符、把注释碎片当命令执行（`'xxx' 不是内部或外部命令`）。
+> 需要中文输出时在 bat 里先 `chcp 65001`，中文文案写在 `.sh` 里。
 
 ### 发版（tag 触发）
 
