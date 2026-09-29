@@ -350,8 +350,21 @@ func (h *Handler) fetchRuntimeModels(rt *Runtime) []provider.ModelInfo {
 	if acct == nil {
 		return nil
 	}
+	// 401 自愈：与费率路径（RefreshPricing）同款——拉取前先检查 token 有效性，
+	// 过期先 refresh + 落盘。否则冷启动时 qodercn/qodercom 等无静态兑底渠道
+	// 拿过期 token 拉 FetchModels → 401 → 静默失败 → 负缓存 5min，
+	// 费率面板整组消失，最坏要等 30min ticker 才补拉（不变量 19）。
+	if acct.NeedsRefresh(10 * time.Minute) {
+		if err := rt.Upstream.RefreshToken(acct); err != nil {
+			log.Printf("models fetch token refresh failed platform=%s uid=%s err=%v", rt.Kind, acct.UID, err)
+		} else if serr := acct.SaveAtomic(); serr != nil {
+			log.Printf("models fetch token save failed platform=%s uid=%s err=%v", rt.Kind, acct.UID, serr)
+		}
+	}
 	infos, err := rt.Upstream.FetchModels(acct)
 	if err != nil || len(infos) == 0 {
+		// 失败不再静默：无静态兑底渠道（qodercn/qodercom）整组消失时，
+		// 至少日志里要有原因可查（曾致 issue #40 复发 40 分钟无法定位）。
 		now := time.Now()
 		rt.mu.Lock()
 		rt.lastFail = now
@@ -361,6 +374,7 @@ func (h *Handler) fetchRuntimeModels(rt *Runtime) []provider.ModelInfo {
 			dynamicModelsCache.lastFail = now
 			dynamicModelsCache.Unlock()
 		}
+		log.Printf("models fetch failed platform=%s uid=%s err=%v n=%d", rt.Kind, acct.UID, err, len(infos))
 		return nil
 	}
 	now := time.Now()
@@ -631,7 +645,7 @@ func unavailableAccountsMessage(kind provider.Kind, sts []pool.Status, disabled,
 func (h *Handler) runtimeForModel(model string) (*Runtime, string, error) {
 	parts := strings.SplitN(strings.TrimSpace(model), "/", 2)
 	if len(parts) != 2 || parts[0] == "" || parts[1] == "" {
-		return nil, "", fmt.Errorf("model must use explicit prefix: workbuddy/<model> / traework/<model> / qoder/<model> / qodercn/<model> / qwenwork/<model> / oczen/<model>")
+		return nil, "", fmt.Errorf("model must use explicit prefix: workbuddy/<model> / workbuddyai/<model> / traework/<model> / qoder/<model> / qodercn/<model> / qodercom/<model> / qwenwork/<model> / glm/<model> / oczen/<model>")
 	}
 	kind := provider.Kind(parts[0])
 	rt := h.cfg.Runtimes[kind]
@@ -680,13 +694,60 @@ func stripChannel(model string) string {
 	return model
 }
 
+// rewriteModel 改写发往上游的请求体：修补工具轮的空 content（见
+// normalizeToolTurnContent），并把 model 覆盖为路由后的真实模型名。
 func rewriteModel(body []byte, model string) ([]byte, error) {
 	var obj map[string]any
 	if err := json.Unmarshal(body, &obj); err != nil {
 		return nil, err
 	}
+	normalizeToolTurnContent(obj)
 	obj["model"] = model
 	return json.Marshal(obj)
+}
+
+// normalizeToolTurnContent 把「content 为 null 或缺失」的工具轮消息补成空串。
+//
+// 上游（实测 qoder/deepseek-flash，2026-09-24）要求带 tool_calls 的 assistant
+// 消息必须携带**字符串** content，null 或字段缺失会让它整请求拒答，并且报一个
+// 完全误导的错：
+//
+//	Messages with role 'tool' must be a response to a preceding message with 'tool_calls'
+//
+// 实测矩阵（同一份客户端真实请求，只改这一处）：
+//
+//	assistant.content = null  → 200 + provider_error 帧（空流）
+//	assistant.content = ""    → 正常出流
+//	content 字段缺失          → 200 + provider_error 帧（空流）
+//
+// 危害在于**中毒进历史**：客户端在「模型只回工具调用、没输出正文」时会把该
+// assistant 消息的 content 落成 null，之后这一轮永远留在 messages 里，于是该
+// 会话的每一发请求都被上游拒（重启客户端也不恢复，只能新建会话）。
+//
+// 放宽到 tool 角色一并处理：工具返回空内容时客户端同样可能给 null，上游对工具
+// 轮是同一套校验。
+func normalizeToolTurnContent(obj map[string]any) {
+	msgs, _ := obj["messages"].([]any)
+	for _, raw := range msgs {
+		m, ok := raw.(map[string]any)
+		if !ok {
+			continue
+		}
+		role, _ := m["role"].(string)
+		switch role {
+		case "assistant":
+			// 只在真的带 tool_calls 时补：普通 assistant 消息 content=null 无证据会出问题。
+			if tc, ok := m["tool_calls"].([]any); !ok || len(tc) == 0 {
+				continue
+			}
+		case "tool":
+		default:
+			continue
+		}
+		if c, exists := m["content"]; !exists || c == nil {
+			m["content"] = ""
+		}
+	}
 }
 
 // ChannelModels 返回每个渠道当前生效的模型列表，与 /v1/models 同源
@@ -718,15 +779,18 @@ func (h *Handler) CachedChannelModels() map[provider.Kind][]provider.ModelInfo {
 		if rt == nil || rt.Pool == nil || len(rt.Pool.List()) == 0 {
 			continue
 		}
-		// 取缓存：TTL 内直接返回，否则静态兜底（不触发网络请求）
+		// 取缓存：优先「上次成功拉取」的动态表，**哪怕已过 TTL**（issue #40）。
+		// 过期数据比空数据好——尤其 qodercn/qodercom 没有静态兜底表，
+		// 若在这里回退 StaticModels(nil)，整个渠道分组会从面板消失。
+		// 陈旧性由后台 StartPricingAutoRefresh（30min）收敛，TTL 只决定
+		// 下次是否重新拉取，不决定「要不要展示」。
 		rt.mu.RLock()
-		if len(rt.models) > 0 && time.Since(rt.fetched) < dynamicModelsTTL {
-			infos := rt.models
-			rt.mu.RUnlock()
-			out[k] = infos
+		models := rt.models
+		rt.mu.RUnlock()
+		if len(models) > 0 {
+			out[k] = models
 			continue
 		}
-		rt.mu.RUnlock()
 		out[k] = rt.StaticModels
 	}
 	return out
@@ -769,12 +833,9 @@ func writeJSON(w http.ResponseWriter, status int, v any) {
 }
 
 // MaxRequestBody 请求体上限（32MiB）：server 与 gateway 共用，避免两处硬编码不同步。
+// 原为 8MiB，实测多模态大图 base64 后（体积 ×~1.37）很宐易超限（issue #30 反馈），提至 32MiB。
 // 超限直接回 413 说真话，不做静默截断——截断后 JSON 解析失败会被误报成
 // invalid_model（issue #30），比直接拒绝更误导排查。
-//
-// 本地取值 32MiB（上游为 8MiB）：实测长会话（约 9MB）在 8MiB 处被拒，
-// 32MiB 与前置代理 Codex++ 的 MAX_HTTP_BODY_BYTES 对齐并留 3 倍余量；
-// 再大则会显著推高单请求内存峰值。
 const MaxRequestBody = 32 << 20
 
 // ReadBodyLimited 读取请求体：超过 MaxRequestBody 时回 413 并返回错误。
@@ -791,8 +852,8 @@ func ReadBodyLimited(r *http.Request) ([]byte, error) {
 	return raw, nil
 }
 
-// errTooLarge 超限哨兵错误（调用方据此回 413）。
-var errTooLarge = fmt.Errorf("request body exceeds limit of %d bytes; please reduce conversation context", MaxRequestBody)
+// errTooLarge 超限哨兵错误（调用方据此回 413）。MiB 数字直接用常量推导，避免改上限后文案不同步。
+var errTooLarge = fmt.Errorf("request body exceeds limit of %d bytes (%d MiB); please reduce request size", MaxRequestBody, MaxRequestBody>>20)
 
 func writeOpenAIError(w http.ResponseWriter, status int, code, msg string) {
 	writeJSON(w, status, map[string]any{"error": map[string]any{"message": msg, "type": "api_error", "code": code}})

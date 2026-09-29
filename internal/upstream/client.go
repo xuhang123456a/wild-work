@@ -131,6 +131,9 @@ type Client struct {
 	// BillingHTTP 供账单/签到接口使用（短超时，慢网络下避免面板操作长时间假死）。
 	// 为 nil 时回退到 HTTP。
 	BillingHTTP *http.Client
+	// StreamHTTP 用于对话流（SSE）：不设整体 Timeout，避免长回答在超时点被掐断
+	// 且无终止帧（R35 / issue #42）。
+	StreamHTTP *http.Client
 
 	ChatBaseCN      string
 	BillingBaseCN   string
@@ -144,6 +147,7 @@ func New() *Client {
 	return &Client{
 		HTTP:            &http.Client{Timeout: 120 * time.Second, Transport: tr},
 		BillingHTTP:     &http.Client{Timeout: 30 * time.Second, Transport: tr},
+		StreamHTTP:      &http.Client{Transport: tr}, // 共用 Transport，不设 Timeout
 		ChatBaseCN:      "https://copilot.tencent.com",
 		BillingBaseCN:   "https://www.codebuddy.cn",
 		ChatBaseGlobal:  "https://www.workbuddy.ai",
@@ -289,7 +293,11 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status
 		return nil, 0, nil, err
 	}
 	ChatHeaders(req, a)
-	resp, err := c.HTTP.Do(req)
+	hc := c.HTTP
+	if c.StreamHTTP != nil {
+		hc = c.StreamHTTP
+	}
+	resp, err := hc.Do(req)
 	if err != nil {
 		log.Printf("chat_stream uid=%s: transport error: %v", a.UID, err)
 		return nil, 0, nil, err

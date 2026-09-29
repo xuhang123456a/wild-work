@@ -26,6 +26,17 @@ type Client struct {
 	HTTP    *http.Client
 	Gateway string // 推理网关（COSY），默认 https://gateway.qwenwork.cn
 	Web     string // 网页域（Bearer），默认 https://qwenwork.cn
+	// StreamHTTP 用于对话流（SSE）：不设整体 Timeout，避免长回答在超时点被掐断
+	// 且无终止帧（R35 / issue #42）。
+	StreamHTTP *http.Client
+}
+
+// httpForStream 返回对话流专用 client（无整体 Timeout）；未配置时回退到 HTTP。
+func (c *Client) httpForStream() *http.Client {
+	if c.StreamHTTP != nil {
+		return c.StreamHTTP
+	}
+	return c.HTTP
 }
 
 // New 生产默认。网关对 HTTP/2 不友好（对齐 qoder 渠道经验），强制 HTTP/1.1。
@@ -42,9 +53,10 @@ func NewWithTimeout(timeout time.Duration) *Client {
 		TLSNextProto:          map[string]func(string, *tls.Conn) http.RoundTripper{}, // 强制 HTTP/1.1
 	}
 	return &Client{
-		HTTP:    &http.Client{Timeout: timeout, Transport: tr},
-		Gateway: GatewayBase,
-		Web:     WebBase,
+		HTTP:       &http.Client{Timeout: timeout, Transport: tr},
+		StreamHTTP: &http.Client{Transport: tr}, // 共用 Transport，不设 Timeout
+		Gateway:    GatewayBase,
+		Web:        WebBase,
 	}
 }
 
@@ -228,7 +240,7 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status
 	}
 	req.Header.Set("x-model-key", modelKeyOf(prepared))
 
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.httpForStream().Do(req)
 	if err != nil {
 		log.Printf("qwenwork chat_stream uid=%s: transport error: %v", a.UID, err)
 		return nil, 0, nil, err

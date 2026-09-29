@@ -71,7 +71,7 @@ body {
 .pa-left .btn { white-space: nowrap; align-self: flex-start; }
 .pa-right {
   display: grid;
-  grid-template-columns: repeat(3, auto);
+  grid-template-columns: repeat(4, auto);
   gap: 8px 12px;
 }
 .pa-right .btn { justify-self: stretch; white-space: nowrap; }
@@ -90,6 +90,13 @@ body {
 .btn.primary.alt.qodercn:hover { background: #5b21b6; }
 .btn.primary.alt.qodercom { background: #b45309; border-color: #b45309; }
 .btn.primary.alt.qodercom:hover { background: #92400e; }
+/* 智谱清言：清言品牌蓝 */
+.btn.primary.alt.glm { background: #1d4ed8; border-color: #1d4ed8; }
+.btn.primary.alt.glm:hover { background: #1e40af; }
+/* 智谱清言登录弹层步骤列表 */
+.glm-steps { margin: 4px 0 8px; padding-left: 20px; font-size: 13px; line-height: 1.9; }
+.glm-steps code { background: #f0f2f5; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
+.glm-steps a { color: var(--primary); }
 .btn.danger { background: var(--danger); border-color: var(--danger); color: #fff; }
 .btn.danger:hover { background: #b91c1c; }
 .btn.small { padding: 5px 10px; font-size: 13px; }
@@ -166,6 +173,18 @@ body {
 .icon-op.help { cursor: help; color: var(--muted); font-weight: 600; }
 .icon-op.help:hover { color: var(--primary); border-color: var(--primary); background: #eff6ff; }
 
+/* 智谱清言弹层顶部风险告知（体验渠道） */
+.glm-warn {
+  border: 1px solid #fde68a;
+  background: #fffbeb;
+  border-radius: 8px;
+  padding: 10px 12px;
+  margin-bottom: 12px;
+}
+.glm-warn-title { font-size: 13px; font-weight: 700; color: var(--warn); margin-bottom: 4px; }
+.glm-warn ol { margin: 0; padding-left: 18px; }
+.glm-warn li { font-size: 12.5px; color: #92400e; line-height: 1.7; }
+
 .empty { color: var(--muted); text-align: center; padding: 24px 0; font-size: 14px; }
 .hidden { display: none !important; }
 
@@ -216,6 +235,44 @@ body {
 .fees .ch-header.qodercom td { color: #b45309; }
 .btn.alt.wbai { background: #0d9488; border-color: #0d9488; color: #fff; }
 .fees .note { color: var(--muted); font-size: 12px; margin-bottom: 8px; }
+
+/* 渠道多标签：收束长费率表（每渠道一个 tab，panel 内双列布局不变） */
+.fees-tabs {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 4px 6px;
+  border-bottom: 1px solid var(--border);
+  margin-bottom: 6px;
+  padding-bottom: 6px;
+}
+.fees-tab {
+  border: 1px solid var(--border);
+  background: var(--card);
+  border-radius: 999px;
+  padding: 4px 10px;
+  font-size: 12.5px;
+  cursor: pointer;
+  color: var(--muted);
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+}
+.fees-tab:hover { color: var(--primary); border-color: var(--primary); }
+.fees-tab.active {
+  color: var(--primary);
+  border-color: var(--primary);
+  background: #eff6ff;
+  font-weight: 600;
+}
+.fees-tab .fees-tab-n {
+  font-size: 10.5px;
+  color: var(--muted);
+  background: var(--border);
+  border-radius: 999px;
+  padding: 0 5px;
+  line-height: 15px;
+}
+.fees-tab.active .fees-tab-n { color: var(--primary); background: #dbeafe; }
 .fees td.dim { color: var(--muted); font-size: 12px; }
 /* 倍率显示：Free 高亮 / 已定价 / 未知（带 tooltip） */
 .fees .rate-free {
@@ -361,6 +418,8 @@ body {
 .btn.primary.alt.qwenwork:hover { background: #155e75; }
 .badge.qwenwork { background: #0e7490; }
 .fees .ch-header.qwenwork td { color: #0e7490; }
+.badge.glm { background: #1d4ed8; }
+.fees .ch-header.glm td { color: #1d4ed8; }
 
 /* oczen：OpenCodeZen 匿名通道（暗灰蓝，与其它紫/青系区分，弱化「固定账号」观感） */
 .badge.oczen { background: #475569; }

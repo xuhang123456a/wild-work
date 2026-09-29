@@ -50,9 +50,22 @@ type state struct {
 func NewClient() *http.Client { return &http.Client{Timeout: 30 * time.Second} }
 
 // Start 启动本地一次性回调监听，返回 Trae 授权 URL。
+//
+// 设备指纹持久化：官方客户端 `F8.getDeviceId()` 是持久化的（同一台电脑恒占 1 个登录
+// 名额）。若每次登录都随机重新生成，每点一次「+ TraeWork」都相当于登录一台新设备，
+// 会逐步逼近「同一账号最多 10 台设备」的上限。因此复用并落盘 machineId/deviceId
+// （对 `login-state.json` 同目录下的 `device-id.json`），除非文件缺失才新生成。
+//
+// 注意：不能复用 login-state.json 本身——它承载的一次性登录状态（authCode/verifier）
+// 在登录成功/取消时会被删除，用作设备号持久化会把它删掉。
 func Start(client *http.Client, statePath string) (string, error) {
-	machineID := randHex(32)                          // 真实客户端 64 位 hex（32 字节）
-	deviceID := randNumericID()                       // 真实客户端 15 位数字设备 ID（首次绑定随机产生）
+	dir := filepath.Dir(statePath)
+	machineID, deviceID := loadPersistedDeviceID(dir)
+	if machineID == "" || deviceID == "" {
+		machineID = randHex(32)    // 真实客户端 64 位 hex（32 字节）
+		deviceID = randNumericID() // 真实客户端 15 位数字设备 ID（首次绑定随机产生）
+		_ = persistDeviceID(dir, machineID, deviceID)
+	}
 	codeVerifier, codeChallenge := traework.GenPKCE() // PKCE：verifier 必须保存，交换 AuthCode 时用
 	ln, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -174,6 +187,20 @@ func Poll(client *http.Client, statePath string) (Result, error) {
 		// PKCE 新流程：AuthCode + codeVerifier + 设备公钥交换
 		res, err := c.ExchangeAuthCode(a, st.AuthCode, st.CodeVerifier)
 		if err != nil {
+			// 终端性 4xx 拒绝：authCode 已一次性耗尽，重试无意义。把错误固化到 state.Err，
+			// 并清空 AuthCode，让后续轮询经顶部 `st.Err != ""` 短路直接返回可行动错误
+			// （而不再每 2s 重复消耗同一次性 authCode 刷屏日志）。
+			// 注意 ExchangeAuthCode 对 429/408/5xx/传输层还是会换 origin 重试并在全部失败
+			// 后返回普通 error——此处仅对 *AuthCodeRejectedError 判断为可固化终态。
+			var rej *traework.AuthCodeRejectedError
+			if errors.As(err, &rej) {
+				st.AuthCode = ""
+				st.Err = err.Error()
+				if traework.IsDeviceLimitReached(rej) {
+					st.Err = "设备数量已达上限：请到其它设备登出该账号或设备列表「下线」释放名额（同一账号最多 10 台设备）"
+				}
+				_ = writeState(statePath, st)
+			}
 			return Result{}, err
 		}
 		a.AccessToken = res.AccessToken
@@ -330,6 +357,36 @@ func getString(m map[string]any, key string) string {
 }
 
 func randHex(n int) string { b := make([]byte, n); _, _ = rand.Read(b); return hex.EncodeToString(b) }
+
+// deviceIDFile 设备指纹持久化文件（与 login-state.json 同目录，独立存在，不复用 state）。
+type deviceIDFile struct {
+	MachineID string `json:"machineId"`
+	DeviceID  string `json:"deviceId"`
+}
+
+func deviceIDFileFP(dataDir string) string { return filepath.Join(dataDir, "device-id.json") }
+
+// loadPersistedDeviceID 读回持久化的设备指纹（无文件或损坏 → 空串，调用方重新生成）。
+func loadPersistedDeviceID(dir string) (machineID, deviceID string) {
+	raw, err := os.ReadFile(deviceIDFileFP(dir))
+	if err != nil {
+		return "", ""
+	}
+	var f deviceIDFile
+	if err := json.Unmarshal(raw, &f); err != nil {
+		return "", ""
+	}
+	return f.MachineID, f.DeviceID
+}
+
+// persistDeviceID 落盘设备指纹；失败不致命（下次登录重新生成即可，进入的是一次性副作用）。
+func persistDeviceID(dir, machineID, deviceID string) error {
+	raw, err := json.Marshal(deviceIDFile{MachineID: machineID, DeviceID: deviceID})
+	if err != nil {
+		return err
+	}
+	return os.WriteFile(deviceIDFileFP(dir), raw, 0o600)
+}
 
 // randNumericID 生成 15 位数字 ID，对齐官方客户端 device_id 格式（纯数字）。
 // 首次绑定随机产生并持久化到 auth 文件，后续签到沿用同一 ID。

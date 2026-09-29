@@ -28,6 +28,9 @@ type Client struct {
 	HTTP    *http.Client
 	Base    string // 业务 API，默认 https://openapi.qoder.com.cn
 	Gateway string // 推理网关，默认 https://gateway.qoder.com.cn
+	// StreamHTTP 用于对话流（SSE）：不设整体 Timeout，避免长回答在超时点被掐断
+	// 且无终止帧（R35 / issue #42）。
+	StreamHTTP *http.Client
 
 	// modelMap 客户端名（display_name 规范化）→ 上游 model key；
 	// cache 为最近一次成功拉取的完整模型表（无静态兜底，仅此缓存）。
@@ -54,11 +57,12 @@ func NewWithTimeout(timeout time.Duration) *Client {
 		TLSNextProto:        map[string]func(string, *tls.Conn) http.RoundTripper{}, // 强制 HTTP/1.1
 	}
 	return &Client{
-		HTTP:      &http.Client{Timeout: timeout, Transport: tr},
-		Base:      OpenAPIBase,
-		Gateway:   GatewayBase,
-		modelMap:  map[string]string{},
-		userTypes: map[string]string{},
+		HTTP:       &http.Client{Timeout: timeout, Transport: tr},
+		StreamHTTP: &http.Client{Transport: tr}, // 共用 Transport，不设 Timeout
+		Base:       OpenAPIBase,
+		Gateway:    GatewayBase,
+		modelMap:   map[string]string{},
+		userTypes:  map[string]string{},
 	}
 }
 
@@ -258,6 +262,14 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 	return nil
 }
 
+// streamHTTP 返回对话流专用 client（无整体 Timeout）；未配置时回退到 HTTP。
+func (c *Client) streamHTTP() *http.Client {
+	if c.StreamHTTP != nil {
+		return c.StreamHTTP
+	}
+	return c.HTTP
+}
+
 // ChatStream 发 chat 请求并返回原始嵌套 SSE body 流（调用方负责 Close）。
 // 非 2xx 时 rc 为 nil、respBody 为上游响应体、err 为 nil；只有传输层失败才返回 err。
 func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status int, respBody []byte, err error) {
@@ -311,7 +323,7 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status
 	if err := sess.ApplyHeaders(req, encoded, url, a.UID, "text/event-stream", true, modelKey); err != nil {
 		return nil, 0, nil, fmt.Errorf("cosy headers: %w", err)
 	}
-	resp, err := c.HTTP.Do(req)
+	resp, err := c.streamHTTP().Do(req)
 	if err != nil {
 		log.Printf("qodercn chat_stream uid=%s model=%s: transport error: %v", a.UID, modelKey, err)
 		return nil, 0, nil, err

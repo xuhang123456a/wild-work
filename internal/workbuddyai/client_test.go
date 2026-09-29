@@ -167,6 +167,10 @@ func TestClassify(t *testing.T) {
 		{200, "Offline user session not found", "session_dead"},
 		{200, "code=12153", "session_dead"},
 		{429, "too many requests", "soft_rate"},
+		// issue #53：按**模型**限流（6004 / "switch to the other models"）→ 请求级透传，
+		// 不按账号级冷却（否则该账号其它可用模型一起被拖下水）。
+		{429, "usage exceeds frequency limit ... switch to the other models to continue", "passthrough"},
+		{429, "our gateway is closed currently", "soft_rate"},
 		{404, "", "not_found"},
 		{500, "", "server"},
 		{400, "code=11102", "client"},

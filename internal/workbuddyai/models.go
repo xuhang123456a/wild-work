@@ -64,6 +64,7 @@ type catalogResp struct {
 }
 
 // catalogCache 目录缓存：FetchModels 与 FetchModelPricing 共用，避免重复请求。
+// v3 与 v2 分别缓存（两路独立探测、独立容错）。
 type catalogCache struct {
 	mu      sync.RWMutex
 	models  []catalogModel
@@ -71,6 +72,10 @@ type catalogCache struct {
 	badges  map[string]string
 	colors  map[string]string
 	fetched time.Time
+
+	v3      []catalogModel // /v3/config 全量模型面（不过滤）
+	v3OK    bool           // v3 探测是否成功过（失败不写缓存，避免负缓存住坏结果）
+	v3Fetched time.Time
 }
 
 const catalogTTL = 10 * time.Minute
@@ -165,6 +170,113 @@ func (c *Client) fetchCatalog(a *auth.Auth) ([]catalogModel, error) {
 	cache.models, cache.promo, cache.badges, cache.colors, cache.fetched = out, promo, badges, colors, time.Now()
 	cache.mu.Unlock()
 	return out, nil
+}
+
+// fetchV3Catalog 抓取 /v3/config 全量模型面（2026-09-28 实测，issue #39）。
+//
+// 与 v2 的三点差异：
+//   - 模型为**全量面**（22 个 vs cli 面 18 个），不经 agents[cli] 过滤——
+//     extraModels 里的 deepseek-v4.1-flash/gpt-6-astra/kimi-k2.8-preview 只在这里有；
+//   - **UA 门禁**：web UA → 400 code=12403 "check ua"，必须带 CLI 形 UA（clientUA 即可）；
+//   - credits 可能为空串（如 default-model），合并时以「非空者优先」。
+//
+// 失败不影响 v2：两路独立容错，v3 挂了退化为原有行为（issue #39 的 unknown 依旧）。
+func (c *Client) fetchV3Catalog(a *auth.Auth) ([]catalogModel, error) {
+	cache.mu.RLock()
+	if cache.v3OK && len(cache.v3) > 0 && time.Since(cache.v3Fetched) < catalogTTL {
+		out := cache.v3
+		cache.mu.RUnlock()
+		return out, nil
+	}
+	cache.mu.RUnlock()
+
+	req, err := http.NewRequest(http.MethodGet, c.base()+EpCatalogV3, nil)
+	if err != nil {
+		return nil, err
+	}
+	commonHeaders(req)
+	req.Header.Set("Authorization", "Bearer "+a.AccessToken)
+	req.Header.Set("Accept", "application/json")
+	// UA 门禁：commonHeaders 已设 clientUA（CLI 形），实测可通过；
+	// 此处显式再设一次以防调用方改写（12403 的教训）。
+	req.Header.Set("User-Agent", clientUA)
+	resp, err := c.HTTP.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 4<<20))
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("v3 config status %d: %s", resp.StatusCode, truncate(string(raw), 120))
+	}
+	var env catalogResp
+	if err := json.Unmarshal(raw, &env); err != nil {
+		return nil, fmt.Errorf("v3 config parse: %w", err)
+	}
+	if env.Code != 0 {
+		return nil, fmt.Errorf("v3 config code=%d", env.Code)
+	}
+	if len(env.Data.Models) == 0 {
+		return nil, fmt.Errorf("v3 config empty models")
+	}
+
+	cache.mu.Lock()
+	cache.v3, cache.v3OK, cache.v3Fetched = env.Data.Models, true, time.Now()
+	cache.mu.Unlock()
+	return env.Data.Models, nil
+}
+
+// mergeV3 合并 v3 目录：v2 为主序与主数据源，v3 只补 v2 缺失的 id；
+// 对两边都有的模型，v3 的 credits 非空时**覆盖** v2（v3 面更新，如 hy4-preview）。
+//
+// 返回 (合并后的模型表, v3 倍率表)。失败（v3 不可用）时返回 (v2 原样, nil)，
+// 调用方无需感知 v3 是否参与——这正是「尽力增强，不拖累主路」的容错语义。
+func mergeV3(v2 []catalogModel, v3 []catalogModel) ([]catalogModel, map[string]string) {
+	if len(v3) == 0 {
+		return v2, nil
+	}
+	byID := make(map[string]catalogModel, len(v3))
+	for _, m := range v3 {
+		byID[m.ID] = m
+	}
+	out := make([]catalogModel, 0, len(v2)+len(v3))
+	seen := make(map[string]bool, len(v2)+len(v3))
+	for _, m := range v2 {
+		if vm, ok := byID[m.ID]; ok {
+			if vm.Credits != "" {
+				m.Credits = vm.Credits // v3 的倍率面更新
+			}
+			// 能力/上下文字段以 v3 为准（字段更全：maxAllowedSize/vendor/描述）
+			if vm.MaxInputTokens > 0 {
+				m.MaxInputTokens = vm.MaxInputTokens
+			}
+			if vm.MaxOutputTokens > 0 {
+				m.MaxOutputTokens = vm.MaxOutputTokens
+			}
+			m.SupportsImages = vm.SupportsImages || m.SupportsImages
+			m.SupportsToolCall = vm.SupportsToolCall || m.SupportsToolCall
+		}
+		if m.ID == "" || seen[m.ID] {
+			continue
+		}
+		seen[m.ID] = true
+		out = append(out, m)
+	}
+	// v3 独有：追加在尾部（issue #39 的主角正是这批）
+	for _, m := range v3 {
+		if seen[m.ID] || m.ID == "" {
+			continue
+		}
+		seen[m.ID] = true
+		out = append(out, m)
+	}
+	rates := make(map[string]string, len(v3))
+	for _, m := range v3 {
+		if m.Credits != "" {
+			rates[m.ID] = m.Credits
+		}
+	}
+	return out, rates
 }
 
 // fetchPromotions 返回促销折扣表（factor==0 → 免费）。
@@ -335,6 +447,13 @@ func Classify(status int, body string) provider.ErrKind {
 	}
 	// 429 优先于 hardRule：限流 body 高频带 "quota exceeded"。
 	if status == http.StatusTooManyRequests {
+		// 上游按**模型**限流（6004 / "switch to the other models"）：属请求级拒绝，
+		// **不得**按账号级冷却——否则该账号上其它还能用的模型一起被拖下水
+		// （issue #53：A 的 deepseek-v4.1-flash 撞每日上限后，A 的 gpt-5.6-luna 也不能用）。
+		// 透传原文让客户端按 Retry-After 自行退避或换模型，与 R16 单账号渠道同款哲学。
+		if strings.Contains(lower, "switch to the other models") || strings.Contains(lower, "usage exceeds frequency limit") {
+			return provider.ErrPassthrough
+		}
 		return provider.ErrSoftRate
 	}
 	for _, m := range hardMarkers {
@@ -345,6 +464,10 @@ func Classify(status int, body string) provider.ErrKind {
 	// 非 429 但 body 含限流文案 → 软限流
 	if strings.Contains(lower, "rate limit") || strings.Contains(lower, "too many requests") ||
 		strings.Contains(lower, "usage limit") || strings.Contains(lower, "请求过于频繁") {
+		// 同上：模型级限流不算账号问题。
+		if strings.Contains(lower, "switch to the other models") {
+			return provider.ErrPassthrough
+		}
 		return provider.ErrSoftRate
 	}
 	if status == http.StatusNotFound {

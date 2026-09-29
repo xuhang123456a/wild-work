@@ -20,6 +20,11 @@ const (
 
 	// EpCatalog 模型目录（国际版专用路径）。
 	EpCatalog = "/v2/enterprises/personal/models"
+	// EpCatalogV3 模型目录 v3 端点（2026-09-28 实测国际版可用）。
+	// 与 v2 差异：全量模型面（22 个 vs cli 面 18 个），extraModels 里的
+	// deepseek-v4.1-flash/gpt-6-astra/kimi-k2.8-preview 只在这里有 credits。
+	// 有 UA 门禁：web UA → 400 code=12403 "check ua"，必须带 CLI 形 UA。
+	EpCatalogV3 = "/v3/config"
 	// EpChat 对话（OpenAI 兼容 SSE）。
 	EpChat = "/v2/chat/completions"
 	// EpRefresh 刷新 token（X-Refresh-Token 专属端点）。
@@ -59,6 +64,11 @@ var brokenModels = map[string]bool{
 
 // extraModels 目录接口不返回、但实测可用的模型，硬编码补进 /models 列表。
 // 注意：这些模型无上游能力数据，故不声明任何能力（见 /v1/models 的透传原则）。
+//
+// 2026-09-28 起 /v3/config 已覆盖其中 3 个（deepseek-v4.1-flash/gpt-6-astra/
+// kimi-k2.8-preview，且带能力与倍率字段），合并后此处条目仅作「v3 也不返回时」
+// 的兜底；其余 6 个（deepseek-v3/glm-5.1/glm-5v-turbo/hy4-preview-f/kimi-k2.7/
+// minimax-m3）在 v2/v3 均无，仍靠本表补进模型清单（无费率，面板显示 unknown）。
 var extraModels = []provider.ModelInfo{
 	{ID: "deepseek-v4.1-flash", Name: "Deepseek-V4.1-Flash", ContextWindow: 1_000_000, MaxTokens: 128_000},
 	{ID: "hy4-preview-f", Name: "Hy4 preview F", ContextWindow: 1_000_000, MaxTokens: 64_000},

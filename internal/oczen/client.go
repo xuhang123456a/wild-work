@@ -30,7 +30,10 @@ import (
 // Client 上游 HTTP 客户端。Base 可覆盖以便测试。
 type Client struct {
 	HTTP *http.Client
-	Base string
+	// StreamHTTP 用于对话流（SSE）：不设整体 Timeout，避免长回答在超时点被掐断
+	// 且无终止帧（R35 / issue #42）。
+	StreamHTTP *http.Client
+	Base       string
 
 	// mu 保护 apikey 的并发读写（面板热更新与请求路径并发）。
 	mu sync.RWMutex
@@ -51,7 +54,9 @@ func New() *Client {
 		IdleConnTimeout:       30 * time.Second,
 		ResponseHeaderTimeout: 120 * time.Second,
 	}
-	return &Client{HTTP: &http.Client{Timeout: requestTimeout, Transport: tr}, Base: DefaultBase}
+	return &Client{HTTP: &http.Client{Timeout: requestTimeout, Transport: tr}, Base: DefaultBase,
+		StreamHTTP: &http.Client{Transport: tr}, // 共用 Transport，不设 Timeout
+	}
 }
 
 // NewWithBase 测试用：覆盖上游基址。
@@ -273,7 +278,11 @@ func (c *Client) ChatStream(_ *auth.Auth, body []byte) (io.ReadCloser, int, []by
 		return nil, 0, nil, err
 	}
 	c.headered(req, session)
-	resp, err := c.HTTP.Do(req)
+	hc := c.HTTP
+	if c.StreamHTTP != nil {
+		hc = c.StreamHTTP
+	}
+	resp, err := hc.Do(req)
 	if err != nil {
 		return nil, 0, nil, err
 	}

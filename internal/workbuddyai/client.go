@@ -22,7 +22,11 @@ import (
 // Client 国际版上游 HTTP 客户端。Base 可覆盖以便测试。
 type Client struct {
 	HTTP *http.Client
-	Base string // 默认 https://www.workbuddy.ai
+	// StreamHTTP 用于对话流（SSE）。与 traework/glm 同款模式（见 R35）：
+	// 流式请求不得设 Client.Timeout——它覆盖整个响应体读取，长回答会在超时点被
+	// 掐断且无终止帧（issue #42 实测：tool_call 写到一半被断）。
+	StreamHTTP *http.Client
+	Base       string // 默认 https://www.workbuddy.ai
 }
 
 // New 生产默认。配置连接池减少 TLS 握手。
@@ -41,8 +45,9 @@ func NewWithTimeout(timeout time.Duration) *Client {
 		ResponseHeaderTimeout: 60 * time.Second,
 	}
 	return &Client{
-		HTTP: &http.Client{Timeout: timeout, Transport: tr},
-		Base: WBAIHost,
+		HTTP:       &http.Client{Timeout: timeout, Transport: tr},
+		StreamHTTP: &http.Client{Transport: tr}, // 共用 Transport（连接池复用），不设 Timeout
+		Base:       WBAIHost,
 	}
 }
 
@@ -272,7 +277,11 @@ func (c *Client) chatStreamOnce(a *auth.Auth, prepared []byte) (rc io.ReadCloser
 		return nil, 0, nil, err
 	}
 	chatHeaders(req, a)
-	resp, err := c.HTTP.Do(req)
+	hc := c.HTTP
+	if c.StreamHTTP != nil {
+		hc = c.StreamHTTP
+	}
+	resp, err := hc.Do(req)
 	if err != nil {
 		log.Printf("workbuddyai chat_stream uid=%s: transport error: %v", a.UID, err)
 		return nil, 0, nil, err
@@ -290,10 +299,22 @@ func (c *Client) chatStreamOnce(a *auth.Auth, prepared []byte) (rc io.ReadCloser
 // FetchModels 拉取国际版模型目录。
 // 目录内模型剔除 brokenModels（实测 11102 不可用），再补入 extraModels
 // （目录不返回但实测可用，含免费模型 deepseek-v4.1-flash）。
+// FetchModels 返回当前可用模型清单（issue #39 起为 v2 ∪ v3 合并口径）。
+//
+// 目录来源两层：
+//   - /v2/enterprises/personal/models（cli agent 面，权威顺序）；
+//   - /v3/config（全量面，2026-09-28 实测可用，带能力与倍率字段）。
+//
+// v3 失败不拖累主路：退化为原 v2+extraModels 行为。
 func (c *Client) FetchModels(a *auth.Auth) ([]provider.ModelInfo, error) {
 	raws, err := c.fetchCatalog(a)
 	if err != nil {
 		return nil, err
+	}
+	// v3 增强：补 v2 缺失的模型、以 v3 的能力/容量字段修正重复项。
+	// v3 里的模型也要过 brokenModels/disabled 过滤（同一套口径）。
+	if v3, verr := c.fetchV3Catalog(a); verr == nil {
+		raws, _ = mergeV3(raws, v3)
 	}
 	seen := make(map[string]bool, len(raws)+len(extraModels))
 	out := make([]provider.ModelInfo, 0, len(raws)+len(extraModels))
@@ -331,10 +352,21 @@ func (c *Client) FetchModels(a *auth.Auth) ([]provider.ModelInfo, error) {
 
 // FetchModelPricing 拉取模型倍率。费率面板「仅供参考」，
 // 因此直接引用目录返回的 credits，不做增删（不含 extraModels、不剔除 brokenModels）。
+//
+// issue #39：v2 目录不含 deepseek-v4.1-flash/gpt-6-astra/kimi-k2.8-preview 等
+// extraModels，它们此前永远显示 unknown。/v3/config 对这批模型返回了真实倍率
+// （x0.00 / x6.67 / x0.77，2026-09-28 实测），故在 v2 基础上并入 v3 的倍率表。
+// v3 也没有的模型（deepseek-v3/glm-5.1/glm-5v-turbo/hy4-preview-f/kimi-k2.7/
+// minimax-m3）上游确实无费率数据，继续由面板显示 unknown——不编数据。
 func (c *Client) FetchModelPricing(a *auth.Auth) ([]provider.ModelPricing, error) {
 	raws, err := c.fetchCatalog(a)
 	if err != nil {
 		return nil, err
+	}
+	// v3 倍率并入（同 id 时 v3 非空优先，v3 独有模型直接新增）
+	var v3Rates map[string]string
+	if v3, verr := c.fetchV3Catalog(a); verr == nil {
+		raws, v3Rates = mergeV3(raws, v3)
 	}
 	// 促销折扣（modelPromotions）优先：discount.factor==0 表示当前免费。
 	promo := c.fetchPromotions(a)
@@ -358,6 +390,15 @@ func (c *Client) FetchModelPricing(a *auth.Auth) ([]provider.ModelPricing, error
 			Note:    note,
 			Color:   colorOf(m.ID),
 		})
+	}
+	// v3 独有但 mergeV3 后仍在 raws 里的条目已含 credits；
+	// 这里补一层：v3 有倍率而 v2 条目 credits 为空的（如 v3 面更新的情况）。
+	if v3Rates != nil {
+		for i := range out {
+			if r, ok := v3Rates[out[i].Model]; ok && parseCredits(r) > 0 && out[i].Rate == 0 {
+				out[i].Rate = parseCredits(r)
+			}
+		}
 	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("pricing api returned empty models")

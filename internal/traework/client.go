@@ -99,16 +99,28 @@ func (c *Client) agentBase() string { return c.AgentHost }
 func (c *Client) ugBase() string    { return c.UgHost }
 func (c *Client) oauthBase() string { return c.OAuthHost }
 
+// maxJSONBody doJSON 单次响应的读取上限。
+//
+// 上限的意义不是「够不够用」，而是给上游异常返回一个内存上界。目录接口
+// （get_detail_param）在 solo_agent 下实测 1.28MB，而旧上限 1MB 会把 JSON
+// 截成半截、解析失败后静默回退静态兜底表（面板只显示 16 个模型，issue #41）。
+const maxJSONBody = 8 << 20
+
 func (c *Client) doJSON(req *http.Request) (json.RawMessage, error) {
 	resp, err := c.HTTP.Do(req)
 	if err != nil {
 		return nil, err
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	// 多读 1 字节用于判定是否被截断：读满 maxJSONBody+1 说明上游响应超限，
+	// 此时显式报错——否则半截 JSON 会被 json.Unmarshal 误报成语法错误（issue #41）。
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxJSONBody+1))
 	if resp.StatusCode >= 400 {
 		kind := Classify(resp.StatusCode, string(raw))
 		return nil, &provider.Error{Kind: kind, Status: resp.StatusCode, Msg: truncate(string(raw), 200)}
+	}
+	if len(raw) > maxJSONBody {
+		return nil, fmt.Errorf("traework: response body exceeds %d bytes", maxJSONBody)
 	}
 	return raw, nil
 }
@@ -536,30 +548,32 @@ type entPackage struct {
 	} `json:"usage"`
 }
 
-// unusableProductID 专用池商品 ID 黑名单：200 档每日签到（官方客户端专用）。
-// 历史（2026-09-18）该条目 available_endpoint=1，现上游把专用池也标成 0，
-// 只能靠 product_id 区分——209 恒为「200 签到」，实测本工具对话前后 used 分毫不动。
-const unusableProductID = 209
-
 // usable 判定该包是否属于本工具可消耗的额度池。
-// 判据（2026-09-23 更新）：product_id==209（专用池）或 available_endpoint==1（历史兜底）为不可用；
-// 其余（150 签到/每月登录/用户福利/免费订阅能力）均可消耗。
+//
+// 判据（2026-09-26 更新，issue #44）：只有 available_endpoint==1（上游显式声明的
+// 专用端点池）不可用，其余一律可消耗。
+//
+// 历史沿革：
+//   - 2026-09-18：专用池下发 ep=1，判据 = ep==0；
+//   - 2026-09-23（f6f41a4）：上游不再下发 ep=1，改判 pid==209；
+//   - 2026-09-26（issue #44）：pid==209 判据被证伪——pid=209 是「200 档每日签到」，
+//     上游已把它升级为通用积分。本仓自有日志铁证：2026-09-23 15:20–16:10 该账号
+//     连发 99 次对话，期间 remain（208/221 池）纹丝不动停在 3086，而「不可用」小计
+//     从 2200 降到 1846（-354，正是那 99 次对话的消耗量）——
+//     即**扣费实际就发生在这个被判为不可用的池上**。把它排除只会让
+//     pool 按虚低的余额选号、面板把真实可用的积分标成「不可用」。
+//     故撤回 pid==209 判据，仅保留 ep==1 作历史兜底（上游若重新显式声明则仍尊重）。
 func (p entPackage) usable() bool {
-	if p.EntitlementBaseInfo.AvailableEndpoint == 1 {
-		return false
-	}
-	if p.EntitlementBaseInfo.ProductID == unusableProductID {
-		return false
-	}
-	return true
+	return p.EntitlementBaseInfo.AvailableEndpoint != 1
 }
 
 // fetchEntUsage 调用上游积分接口，返回全部条目 + 可消耗余额（仅 usable() 判定为可用的包）。
 // 不可消耗余额由调用方对条目按 Usable 标记汇总（provider.Summarize），本函数不重复算。
 //
-// 可用性判据见 entPackage.usable：product_id==209（200 签到专用池）与 ep==1（历史兜底）
-// 不可用。早期实现用 group_type!=1 判定，会把「用户福利」等误计入；后改为
-// available_endpoint==0，2026-09-23 起该字段也失效（专用池被标成 0），再改为 product_id。
+// 可用性判据见 entPackage.usable：仅 available_endpoint==1 不可用（issue #44）。
+// 早期实现用 group_type!=1 判定，会把「用户福利」等误计入；后改为
+// available_endpoint==0，2026-09-23 起该字段也失效（专用池被标成 0），
+// 一度改用 product_id==209，2026-09-26 证伪后撤回（详见 usable 注释）。
 func (c *Client) fetchEntUsage(a *auth.Auth) ([]entPackage, int64, error) {
 	req, err := http.NewRequest(http.MethodPost, c.ugBase()+EpEntUsage, bytes.NewReader([]byte(`{"require_usage":true}`)))
 	if err != nil {

@@ -13,6 +13,7 @@ import (
 	"encoding/base64"
 	"encoding/json"
 	"encoding/pem"
+	"errors"
 	"fmt"
 	"io"
 	"log"
@@ -87,41 +88,92 @@ func (c *Client) ExchangeAuthCode(a *auth.Auth, authCode, codeVerifier string) (
 	}
 	raw, _ := json.Marshal(body)
 
-	// 依次尝试候选 origin（回调 host 优先，再回退 trae.cn / trae.com.cn）
-	var lastErr string
+	// 依次尝试候选 origin（回调 host 优先，再回退 trae.cn / trae.com.cn）。
+	// 关键：authCode 是一次性的，4xx 属终态（不换 origin 重试）——换 origin 会把首因
+	// 覆盖成语义更模糊的兜底错误（实测：首选 api.trae.cn 的 403/20401 设备数上限，被回退
+	// 的 api.trae.com.cn 的 400/10101 覆盖后再打印，表象彻底指向参数写错）。故 4xx
+	// 立即返回携带**首个** origin 真实响应的 *AuthCodeRejectedError；仅 429/408/5xx /
+	// 传输层错误为暂时性，继续尝试下一个 origin。
+	var lastErr error
 	for _, origin := range authCodeOrigins(a.ApiHost) {
 		req, err := http.NewRequest(http.MethodPost, origin+EpAuthCodeExchange, bytes.NewReader(raw))
 		if err != nil {
-			lastErr = err.Error()
+			lastErr = err
 			continue
 		}
 		req.Header.Set("Content-Type", "application/json")
 		req.Header.Set("Accept", "application/json")
 		resp, err := c.HTTP.Do(req)
 		if err != nil {
-			lastErr = origin + " => " + err.Error()
+			lastErr = fmt.Errorf("%s => %w", origin, err)
 			continue
 		}
 		data, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
 		if resp.StatusCode >= 400 {
-			lastErr = fmt.Sprintf("%s => HTTP %d %s", origin, resp.StatusCode, truncate(string(data), 160))
-			continue
+			rj := &AuthCodeRejectedError{Status: resp.StatusCode, Origin: origin, Body: string(data)}
+			if resp.StatusCode >= 400 && resp.StatusCode != http.StatusTooManyRequests && resp.StatusCode != http.StatusRequestTimeout {
+				// 4xx（除 429/408）= 终态：authCode 已一次性耗尽，重试无意义。
+				// 识别 20401 设备数上限（可恢复动作：去其它设备登出释放名额）。
+				return nil, rj
+			}
+			lastErr = rj
+			continue // 429/408/5xx：暂时性，试下一个 origin
 		}
 		res, err := parseAuthCodeResult(data)
 		if err != nil {
-			lastErr = origin + " => " + err.Error()
+			lastErr = fmt.Errorf("%s => %w", origin, err)
 			continue
 		}
 		if res.AccessToken == "" {
-			lastErr = origin + " => " + truncate(string(data), 160)
+			lastErr = fmt.Errorf("%s => %s", origin, truncate(string(data), 160))
 			continue
 		}
 		res.Host = origin
 		log.Printf("traework authcode exchange success host=%s token_len=%d refresh=%t", origin, len(res.AccessToken), res.RefreshToken != "")
 		return res, nil
 	}
-	return nil, fmt.Errorf("AuthCode ExchangeToken failed: %s", lastErr)
+	if lastErr == nil {
+		lastErr = fmt.Errorf("no candidate origin")
+	}
+	return nil, fmt.Errorf("AuthCode ExchangeToken failed: %w", lastErr)
+}
+
+// AuthCodeRejectedError AuthCode 交换被上游拒绝（4xx 终态，或暂时的 429/408/5xx）。
+// 携带首个 origin 的真实响应，供上层区分可行动错误（如设备数上限）与参数问题。
+// 注意 404（任意 URL 都如此）是路径枚举陷阱，不作为终态判定。
+type AuthCodeRejectedError struct {
+	Status int
+	Origin string
+	Body   string
+}
+
+func (e *AuthCodeRejectedError) Error() string {
+	return fmt.Sprintf("AuthCode rejected: %s => HTTP %d %s", e.Origin, e.Status, truncate(e.Body, 160))
+}
+
+// IsDeviceLimitReached 判断是否设备数上限（20401 / Device limit reached）。
+// 官方客户端定义：tc[tc.Handle_Login_DeviceLimitError=20401]。达到上限需到其它设备
+// 登出或设备列表「下线」释放名额（同一账号最多同时登录 10 台设备）。
+type DeviceLimitError struct {
+	*AuthCodeRejectedError
+}
+
+func (e *DeviceLimitError) Error() string {
+	return "设备数量已达上限：请到其它设备登出该账号或登录设备列表「下线」释放名额（同一账号最多 10 台设备）"
+}
+
+// IsDeviceLimitReached 非 nil 且属设备数上限错误时返回 true。
+func IsDeviceLimitReached(err error) bool {
+	if err == nil {
+		return false
+	}
+	var rj *AuthCodeRejectedError
+	if !errors.As(err, &rj) {
+		return false
+	}
+	return rj.Status == 403 && (strings.Contains(strings.ToLower(rj.Body), "20401") ||
+		strings.Contains(strings.ToLower(rj.Body), "device limit"))
 }
 
 // authCodeOrigins 候选交换 origin：api_host（api.trae.cn）优先，再回退回调 host / trae.com.cn。

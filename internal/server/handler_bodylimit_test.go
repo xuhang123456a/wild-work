@@ -1,5 +1,5 @@
-// handler_bodylimit_test.go 回归 issue #30：请求体超 8MiB 不得静默截断后
-// 误报 invalid_model，应明确回 413 request_too_large。
+// handler_bodylimit_test.go 回归 issue #30：请求体超上限（原 8MiB，后提至 32MiB 容纳
+// 多模态大图）不得静默截断后误报 invalid_model，应明确回 413 request_too_large。
 package server
 
 import (
@@ -24,7 +24,7 @@ func oversizedBody(n int) []byte {
 	return append(append([]byte(head), pad...), tail...)
 }
 
-// TestBodyOverLimit413 超 8MiB 1 字节：应回 413 request_too_large，
+// TestBodyOverLimit413 超上限 1 字节：应回 413 request_too_large，
 // 而不是截断后误报 invalid_model（issue #30 的字节级复现场景）。
 func TestBodyOverLimit413(t *testing.T) {
 	h := NewHandler(Config{APIKey: ""})
@@ -51,7 +51,7 @@ func TestBodyOverLimit413(t *testing.T) {
 	}
 }
 
-// TestBodyAtLimitOK 恰好 8MiB：未超限，应正常通过读取阶段
+// TestBodyAtLimitOK 恰好等于上限：未超限，应正常通过读取阶段
 // （无上游配置时停在账号选择失败，但绝不能是 413/invalid_model）。
 func TestBodyAtLimitOK(t *testing.T) {
 	h := NewHandler(Config{APIKey: ""})
@@ -61,7 +61,7 @@ func TestBodyAtLimitOK(t *testing.T) {
 	h.ServeHTTP(rec, req)
 
 	if rec.Code == http.StatusRequestEntityTooLarge {
-		t.Fatalf("恰好 8MiB 不应回 413: %s", rec.Body.String())
+		t.Fatalf("恰好上限不应回 413: %s", rec.Body.String())
 	}
 	// 无 runtime 配置时停在 "provider not configured" 属正常；
 	// 只断言不得发生静默截断（截断后必然报 invalid_model 前缀格式错误或 invalid JSON）

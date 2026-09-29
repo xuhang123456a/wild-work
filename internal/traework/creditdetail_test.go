@@ -12,7 +12,7 @@ import (
 // entUsageBody 构造一份 web_user_ent_usage 响应：
 //   - product_id=221 每月登录（可用，500 限额已用 40）
 //   - product_id=208 每日签到 150 档（可用，150 限额未用）
-//   - product_id=209 每日签到 200 档（不可用：官方客户端专用池，本工具扣不到）
+//   - product_id=209 每日签到 200 档（可用：2026-09-26 起升级为通用积分，issue #44）
 //   - ep=1 每日签到（不可用：available_endpoint 历史兜底判据）
 //   - 限额 0 的免费包（应被明细过滤掉）
 //
@@ -52,16 +52,16 @@ func entUsageClient(t *testing.T, body string) *Client {
 }
 
 // TestUserResourceExcludesOfficialClientPool 可消耗余额只算 usable()：
-// product_id=209（200 签到专用池）与 ep=1 必须排除，否则 pool 按虚高余额选号。
+// ep=1 必须排除，否则 pool 按虚高余额选号；pid=209 已升级为通用积分，计入（issue #44）。
 func TestUserResourceExcludesOfficialClientPool(t *testing.T) {
 	c := entUsageClient(t, entUsageBody)
 	remain, err := c.UserResource(&auth.Auth{AccessToken: "at"})
 	if err != nil {
 		t.Fatalf("UserResource: %v", err)
 	}
-	// 460 (每月登录) + 150 (product_id=208 签到) = 610；不含 209 的 200 与 ep=1 的 300。
-	if remain != 610 {
-		t.Errorf("remain=%d want 610 (209 专用池与 ep=1 不应计入)", remain)
+	// 460 (每月登录) + 150 (pid=208 签到) + 200 (pid=209 签到，已通用) = 810；不含 ep=1 的 300。
+	if remain != 810 {
+		t.Errorf("remain=%d want 810 (仅 ep=1 不应计入)", remain)
 	}
 }
 
@@ -72,8 +72,8 @@ func TestUserResourceDetailMarksUsableAndExpiry(t *testing.T) {
 	if err != nil {
 		t.Fatalf("UserResourceDetail: %v", err)
 	}
-	if remain != 610 {
-		t.Errorf("remain=%d want 610", remain)
+	if remain != 810 {
+		t.Errorf("remain=%d want 810", remain)
 	}
 	// 限额 0 的免费包应被过滤，剩 4 条
 	if len(items) != 4 {
@@ -81,8 +81,8 @@ func TestUserResourceDetailMarksUsableAndExpiry(t *testing.T) {
 	}
 
 	usable, unusable := provider.Summarize(items)
-	if usable != 610 || unusable != 500 {
-		t.Errorf("usable=%d unusable=%d, want 610/500", usable, unusable)
+	if usable != 810 || unusable != 300 {
+		t.Errorf("usable=%d unusable=%d, want 810/300", usable, unusable)
 	}
 
 	byName := map[string][]item{}
@@ -96,29 +96,29 @@ func TestUserResourceDetailMarksUsableAndExpiry(t *testing.T) {
 	if month[0].expire != "2026-09-30" {
 		t.Errorf("每月登录积分到期日=%q want 2026-09-30", month[0].expire)
 	}
-	// 同名「每日签到」按判据区分可用性：208(可用150) / 209(不可用200) / ep=1(不可用300)
+	// 同名「每日签到」按判据区分可用性：208(可用150) / 209(可用200，已通用) / ep=1(不可用300)
 	checkins := byName["每日签到"]
 	if len(checkins) != 3 {
 		t.Fatalf("每日签到应有 3 条: %+v", checkins)
 	}
-	var avail, unavail209, unavailEp1 bool
+	var avail150, avail209, unavailEp1 bool
 	for _, ci := range checkins {
 		if ci.usable && ci.remain == 150 {
-			avail = true
+			avail150 = true
 		}
-		if !ci.usable && ci.remain == 200 {
-			unavail209 = true
+		if ci.usable && ci.remain == 200 {
+			avail209 = true
 		}
 		if !ci.usable && ci.remain == 300 {
 			unavailEp1 = true
 		}
 	}
-	if !avail || !unavail209 || !unavailEp1 {
-		t.Errorf("每日签到应区分可用(150)/不可用209(200)/不可用ep1(300): %+v", checkins)
+	if !avail150 || !avail209 || !unavailEp1 {
+		t.Errorf("每日签到应为可用150/可用200/不可用ep1: %+v", checkins)
 	}
 }
 
-// TestEntPackageUsable 直接钉住可用性判据：209 专用池与 ep=1 均不可用，其余可用。
+// TestEntPackageUsable 直接钉住可用性判据：仅 ep=1 不可用（issue #44 撤回 pid==209 判据）。
 func TestEntPackageUsable(t *testing.T) {
 	cases := []struct {
 		name string
@@ -128,7 +128,7 @@ func TestEntPackageUsable(t *testing.T) {
 	}{
 		{"每月登录221", 0, 221, true},
 		{"150签到208", 0, 208, true},
-		{"200签到209专用", 0, 209, false},
+		{"200签到209已通用", 0, 209, true},
 		{"ep1历史兜底", 1, 208, false},
 		{"免费订阅0", 0, 0, true},
 	}

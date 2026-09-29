@@ -27,6 +27,7 @@ import (
 	"wild-work/internal/gateway"
 	"wild-work/internal/ledger"
 	"wild-work/internal/oczen"
+	"wild-work/internal/glm"
 	"wild-work/internal/platform"
 	"wild-work/internal/pool"
 	"wild-work/internal/provider"
@@ -124,11 +125,16 @@ func main() {
 	if err != nil {
 		fatal("读取 QoderCOM 账号目录失败：%v", err)
 	}
+	// 智谱清言：凭据是浏览器 Cookie 里的 chatglm_refresh_token（glm-*.json）。
+	glmAuths, err := auth.LoadGLMDir(cfg.AuthDir)
+	if err != nil {
+		fatal("读取智谱清言账号目录失败：%v", err)
+	}
 	// OpenCodeZen 匿名通道无凭证文件：全程只有一个虚拟账号，
 	// 不经目录扫描、不参与 reload（见 app.reloadAccounts 的说明）。
 	ocAuths := []*auth.Auth{oczen.AnonymousAuth()}
-	log.Printf("loaded accounts: workbuddy=%d %s, traework=%d, qoder=%d, qodercn=%d, qodercom=%d, workbuddyai=%d, qwenwork=%d, oczen=%d(匿名) from %s",
-		len(wbAuths), cfg.Region, len(trAuths), len(qdAuths), len(qcnAuths), len(qcmAuths), len(wbaAuths), len(qwAuths), len(ocAuths), cfg.AuthDir)
+	log.Printf("loaded accounts: workbuddy=%d %s, traework=%d, qoder=%d, qodercn=%d, qodercom=%d, workbuddyai=%d, qwenwork=%d, glm=%d, oczen=%d(匿名) from %s",
+		len(wbAuths), cfg.Region, len(trAuths), len(qdAuths), len(qcnAuths), len(qcmAuths), len(wbaAuths), len(qwAuths), len(glmAuths), len(ocAuths), cfg.AuthDir)
 
 	wbPool := pool.New(filepath.Join(stateDir, "state-workbuddy.json"))
 	for _, a := range wbAuths {
@@ -161,6 +167,13 @@ func main() {
 		qodercom.EnsureFingerprint(a) // 老凭证补机器指纹
 		qcmPool.Add(a)
 	}
+	// 智谱清言：与其它渠道同为多账号池（可加多个 refresh_token），
+	// 但每个账号不可人工恢复（refresh_token 轮换后旧值即失效），
+	// 故 Runtime 置 SingleAccount —— 见 runtimes 装配处的说明。
+	glmPool := pool.New(filepath.Join(stateDir, "state-glm.json"))
+	for _, a := range glmAuths {
+		glmPool.Add(a)
+	}
 	// oczen：整池只有一个匿名虚拟账号，state 仅用于记冷却（无积分、无签到）
 	ocPool := pool.New(filepath.Join(stateDir, "state-oczen.json"))
 	for _, a := range ocAuths {
@@ -189,20 +202,31 @@ func main() {
 	qcmUp := qodercom.New()
 	qcmUp.HTTP.Timeout = time.Duration(cfg.Upstream.TimeoutSeconds) * time.Second
 	ocUp := oczen.New()
+	glmUp := glm.New()
+	// ⚠️ 只改 HTTP（非流式）的 Timeout。
+	// **不要**给 glmUp.StreamHTTP 设 Timeout —— 流式请求一旦有整体超时，
+	// 长回答会在超时点被掐断且无终止帧（实测 2026-09-27 触发 5 次）。
+	// 两者共用同一 Transport，故代理只需套 HTTP 即可（见下方 applyProxies）。
+	glmUp.HTTP.Timeout = time.Duration(cfg.Upstream.TimeoutSeconds) * time.Second
 
 	// 单渠道上游代理：config.proxies 按 kind 套到各渠道 HTTP client 上（未配置 = 直连）。
-	// traework 的 StreamHTTP 与主 client 共用出厂 Transport，先切独立再套代理，
-	// 否则热更新代理时会把非流式 client 的 Transport 一起替换。
+	// traework / glm 的 StreamHTTP 与主 client 共用出厂 Transport，先切独立再套代理，
+	// 否则热更新代理时会把非流式 client 的 Transport 一起替换
+	// （且 SetTransportProxy 会新建 Transport，只套一个会导致另一个漏掉代理）。
 	trUp.StreamHTTP.Transport = trUp.HTTP.Transport
+	glmUp.StreamHTTP.Transport = glmUp.HTTP.Transport
 	applyProxies(cfg, map[string][]*http.Client{
-		provider.WorkBuddy.String():   {wbUp.HTTP, wbUp.BillingHTTP},
-		provider.WorkBuddyAI.String(): {wbaUp.HTTP},
+		provider.WorkBuddy.String():   {wbUp.HTTP, wbUp.BillingHTTP, wbUp.StreamHTTP},
+		provider.WorkBuddyAI.String(): {wbaUp.HTTP, wbaUp.StreamHTTP},
 		provider.TraeWork.String():    {trUp.HTTP, trUp.StreamHTTP},
-		provider.Qoder.String():       {qdUp.HTTP},
-		provider.QoderCN.String():     {qcnUp.HTTP},
-		provider.QoderCOM.String():    {qcmUp.HTTP},
-		provider.QwenWork.String():    {qwUp.HTTP},
-		provider.Oczen.String():       {ocUp.HTTP},
+		provider.Qoder.String():       {qdUp.HTTP, qdUp.StreamHTTP},
+		provider.QoderCN.String():     {qcnUp.HTTP, qcnUp.StreamHTTP},
+		provider.QoderCOM.String():    {qcmUp.HTTP, qcmUp.StreamHTTP},
+		provider.QwenWork.String():    {qwUp.HTTP, qwUp.StreamHTTP},
+		provider.Oczen.String():       {ocUp.HTTP, ocUp.StreamHTTP},
+		// glm 两个 client 都要传（SetTransportProxy 会**新建** Transport，
+		// 只套 HTTP 会让 StreamHTTP 仍走直连（代理对流式不生效）。
+		provider.GLM.String(): {glmUp.HTTP, glmUp.StreamHTTP},
 	})
 	checkinMinutes, err := config.ParseClockTimes(cfg.Schedule.CheckinTimes)
 	if err != nil {
@@ -252,6 +276,13 @@ func main() {
 	// CheckinMinutes/KeepaliveHours 均为 nil → 调度器不发生任何上游调用。
 	ocSch := scheduler.New(scheduler.Config{Pool: ocPool, Upstream: ocUp, Name: "oczen",
 		CheckinMinutes: nil, KeepaliveHours: nil})
+	// 智谱清言：签到与对话联动（当日需先对话才能领打卡进度），故保活与签到
+	// 合成一个流程（glm.Client.Keepalive 先发最小对话再签到）。
+	// 用 DailyCheckin 通道驱动：CheckinMinutes 用全局签到时间，
+	// KeepaliveHours 也用同一时段（保活=签到，不必额外一次）。
+	glmSch := scheduler.New(scheduler.Config{Pool: glmPool, Upstream: glmUp, Name: "glm",
+		CheckinMinutes: checkinMinutes, KeepaliveHours: cfg.Schedule.KeepaliveHours,
+		ExpiringThreshold: expiringThreshold, Ledger: lg})
 
 	runtimes := map[provider.Kind]*server.Runtime{
 		provider.WorkBuddy: {Kind: provider.WorkBuddy, Pool: wbPool, Upstream: wbUp, StaticModels: server.WorkBuddyStaticModels()},
@@ -266,6 +297,15 @@ func main() {
 		provider.QoderCN:  {Kind: provider.QoderCN, Pool: qcnPool, Upstream: qcnUp, StaticModels: qodercn.StaticModels()},
 		provider.QoderCOM: {Kind: provider.QoderCOM, Pool: qcmPool, Upstream: qcmUp, StaticModels: qodercom.StaticModels()},
 		provider.QwenWork: {Kind: provider.QwenWork, Pool: qwPool, Upstream: qwUp, StaticModels: qwenwork.StaticModels()},
+		provider.GLM:      {Kind: provider.GLM, Pool: glmPool, Upstream: glmUp, StaticModels: glm.StaticModels()},
+		// 注意：GLM **不**置 SingleAccount。
+		//
+		// 早期误判：以为「凭据轮换后不可人工恢复」就该按单账号处理。但
+		// ① 现在可用 CDP 自动登录随时补账号；② 单账号语义会**跳过所有账号级惩罚**，
+		// 导致账号 A 失效/限流时不会切到账号 B —— 多账号完全失效（实测确认）。
+		// 故按正常多账号渠道处理：错误分类惩罚 + 池内轮换。
+		//
+		// 唯一真实约束是「refresh_token 轮换必须落盘」，已由 glm.RefreshToken 保证。
 		// oczen：整池只有一个匿名虚拟账号且不可重登——任何账号级惩罚（冷却/计数/禁用）
 		// 都等于整条渠道下线。SingleAccount 声明该约束，handler 对所有错误一律原文透传；
 		// NoCooldownOnServerError 保留（语义已被 SingleAccount 涵盖，留着不依赖顺序）。
@@ -281,6 +321,7 @@ func main() {
 		provider.QoderCN:     {Kind: provider.QoderCN, Pool: qcnPool, Upstream: qcnUp, Scheduler: qcnSch},
 		provider.QoderCOM:    {Kind: provider.QoderCOM, Pool: qcmPool, Upstream: qcmUp, Scheduler: qcmSch},
 		provider.QwenWork:    {Kind: provider.QwenWork, Pool: qwPool, Upstream: qwUp, Scheduler: qwSch},
+		provider.GLM:         {Kind: provider.GLM, Pool: glmPool, Upstream: glmUp, Scheduler: glmSch},
 		provider.Oczen:       {Kind: provider.Oczen, Pool: ocPool, Upstream: ocUp, Scheduler: ocSch},
 	}
 
@@ -305,6 +346,8 @@ func main() {
 	wbaSch.SetCheckinObserver(func(r scheduler.CheckinResult) { appInst.NotifyCheckin("workbuddyai", r) })
 	wbaSch.SetRefreshObserver(func(uid string, ok bool, msg string) { appInst.NotifyRefresh("workbuddyai", uid, ok, msg) })
 	qwSch.SetRefreshObserver(func(uid string, ok bool, msg string) { appInst.NotifyRefresh("qwenwork", uid, ok, msg) })
+	glmSch.SetCheckinObserver(func(r scheduler.CheckinResult) { appInst.NotifyCheckin("glm", r) })
+	glmSch.SetRefreshObserver(func(uid string, ok bool, msg string) { appInst.NotifyRefresh("glm", uid, ok, msg) })
 
 	// HTTP handler：OpenAI 端点 + Web UI + 管理 API
 	sub, err := fs.Sub(webFS, "web")
@@ -349,14 +392,16 @@ func main() {
 		next := *cfg
 		next.Proxies = proxies
 		applyProxies(&next, map[string][]*http.Client{
-			provider.WorkBuddy.String():   {wbUp.HTTP, wbUp.BillingHTTP},
-			provider.WorkBuddyAI.String(): {wbaUp.HTTP},
+			provider.WorkBuddy.String():   {wbUp.HTTP, wbUp.BillingHTTP, wbUp.StreamHTTP},
+			provider.WorkBuddyAI.String(): {wbaUp.HTTP, wbaUp.StreamHTTP},
 			provider.TraeWork.String():    {trUp.HTTP, trUp.StreamHTTP},
-			provider.Qoder.String():       {qdUp.HTTP},
-			provider.QoderCN.String():     {qcnUp.HTTP},
-			provider.QoderCOM.String():    {qcmUp.HTTP},
-			provider.QwenWork.String():    {qwUp.HTTP},
-			provider.Oczen.String():       {ocUp.HTTP},
+			provider.Qoder.String():       {qdUp.HTTP, qdUp.StreamHTTP},
+			provider.QoderCN.String():     {qcnUp.HTTP, qcnUp.StreamHTTP},
+			provider.QoderCOM.String():    {qcmUp.HTTP, qcmUp.StreamHTTP},
+			provider.QwenWork.String():    {qwUp.HTTP, qwUp.StreamHTTP},
+			provider.Oczen.String():       {ocUp.HTTP, ocUp.StreamHTTP},
+			// glm 两个 client 都要传（同启动路径的理由：SetTransportProxy 新建 Transport）
+			provider.GLM.String(): {glmUp.HTTP, glmUp.StreamHTTP},
 		})
 	})
 	// 面板保存 oczen key 后热更新渠道凭证；启动时也应用一次配置中的初始 key
@@ -391,6 +436,10 @@ func main() {
 	go qcnSch.Run(sctx)
 	go qcmSch.Run(sctx)
 	go ocSch.Run(sctx)
+	// ⚠️ 新增渠道时必须在这里补 Run()。
+	// 漏了**不会报错**——只表现为「该渠道的自动签到/保活从不运行」，
+	// 而手工触发（面板按钮 / RunCheckinNow）仍然可用，极难发现。
+	go glmSch.Run(sctx)
 
 	// 积分自动刷新覆盖全部渠道：
 	// - workbuddyai / qoder 无签到活动，不自动刷就会一直显示旧值或 0；
@@ -399,9 +448,11 @@ func main() {
 	//   启动即出真实拆分数字，并靠 401 自愈（refreshIfSessionDead）及时恢复。
 	// oczen 不在其中：匿名通道无积分可刷（面板显示「不适用」），
 	// 其 FetchModelPricing 已在费率刷新路径单独覆盖。
+	// glm 纳入：其凭据本体是 refresh_token（accessToken 可为空），
+	// 积分靠 member_info 拉取，不刷就永远是 0。
 	appInst.StartCreditAutoRefresh(sctx, []provider.Kind{
 		// 旧 Qoder 渠道已下线：不自动刷积分/token（避免周期性 token refresh failed 噪音）
-		provider.WorkBuddy, provider.WorkBuddyAI, provider.TraeWork, provider.QoderCN, provider.QoderCOM, provider.QwenWork,
+		provider.WorkBuddy, provider.WorkBuddyAI, provider.TraeWork, provider.QoderCN, provider.QoderCOM, provider.QwenWork, provider.GLM,
 	}, app.CreditRefreshInterval)
 
 	// 启动即刷新「模型列表 + 费率」，之后每 30 分钟。
@@ -460,13 +511,17 @@ func main() {
 			},
 			Quit: func() {
 				if platform.AskYesNo("wild-work", "确定退出 wild-work 吗？") {
-					stop()
-					appInst.Stop()
-					os.Exit(0)
+					// 先摘托盘图标：NIM_DELETE 由托盘消息循环执行，返回即已回收。
+					// 直接 os.Exit 会跳过这一步，Windows 任务栏留下幽灵图标。
+					systray.Quit(3 * time.Second)
 				}
 			},
 		})
 	}()
+
+	// Run 返回 = 托盘图标已回收，停机清理后进程自然退出。
+	stop()
+	appInst.Stop()
 }
 
 // workDir 解析数据目录（config.json / auths/ / data/ 的落点）。

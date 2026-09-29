@@ -576,6 +576,15 @@ func streamCore(w http.ResponseWriter, r io.Reader, hintFn func(string) string, 
 
 	br := bufio.NewReaderSize(r, 64*1024)
 	validFrames := 0
+	// truncated 标记「可证实的截断」：读到一半遇到传输层错误，或最后一行没有换行符
+	// 而 JSON 解析失败（半个帧）。两者都是流被从中间砍断，必须**明确报错**，不能靠
+	// 补 [DONE] 伪装成正常收尾——否则客户端会拿着半截 tool_call arguments 去解析，
+	// 报 "tool input was not fully received" 而网关日志里什么都看不到（issue #42）。
+	//
+	// 注意区分：上游「正常 EOF 但没发 [DONE]」（帧完整、有换行符）仍照旧兜底补
+	// [DONE]——部分上游本就不发 DONE，把它当截断会误伤全部正常请求。
+	truncated := false
+	truncErr := ""
 readLoop:
 	for {
 		line, err := br.ReadString('\n')
@@ -587,6 +596,12 @@ readLoop:
 			break readLoop
 		case strings.HasPrefix(trimmed, "data: "):
 			n, werr := writeFrame(strings.TrimPrefix(trimmed, "data: "))
+			// EOF 处未以换行收尾且该帧不是合法 JSON → 这行本身是半个帧（被砍断），
+			// 已按原样写出的是残缺数据，必须按截断处理（不补 DONE）。
+			if err == io.EOF && n == 0 && strings.TrimSpace(line) != "" {
+				truncated = true
+				truncErr = "upstream stream truncated (partial frame at EOF)"
+			}
 			validFrames += n
 			if werr != nil {
 				return werr
@@ -605,27 +620,56 @@ readLoop:
 			if err == io.EOF {
 				break
 			}
-			return err
+			// 传输层错误（连接中断 / Client.Timeout 掐断 body）：可证实的截断。
+			truncated = true
+			truncErr = "upstream stream truncated: " + err.Error()
+			break
 		}
 	}
 	// 空流（0 有效帧）：先写一帧 error（绕过 normalizeFrame 原样保留 error 字段），
 	// 再补 [DONE] 保证客户端能正常收尾，并返回非 nil error 供调用方记录。
 	// 网关本地空流兜底帧走 hintFn=nil 的直写路径：该形态未覆盖（不编造 hint），
 	// 且 writeRaw 的 hintFn 闭包在空流路径下可能携带上一帧的上下文造成误配。
-	if validFrames == 0 {
+	if validFrames == 0 && !truncated {
 		_ = writeRaw(`{"error":{"message":"empty upstream stream","type":"upstream_error","code":"upstream_parse"}}`)
 	}
-	// 保证恰好写一个 [DONE]（上游漏发时兜底补上）。
+	// 截断：写一帧 OpenAI 规范的 error（客户端据此明确判失败），**不补 [DONE]**。
+	// 空流（0 有效帧）同理，它已在上面写过上游错误帧，此处只负责不发 DONE。
+	if truncated || validFrames == 0 {
+		if truncated {
+			raw := fmt.Sprintf(`{"error":{"message":%s,"type":"upstream_error","code":"upstream_truncated"}}`, jsonString(truncErr))
+			if werr := writeRaw(raw); werr != nil {
+				return werr
+			}
+		} else if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
+			// 空流仍补 DONE：客户端至少能正常收尾（错误帧已在前给出）。
+			return err
+		}
+		if fl != nil {
+			fl.Flush()
+		}
+		if truncated {
+			return errors.New(truncErr)
+		}
+		return errEmptyStream
+	}
+	// 保证恰好写一个 [DONE]（上游漏发或显式发出，均在此统一写出）。
 	if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
 		return err
 	}
 	if fl != nil {
 		fl.Flush()
 	}
-	if validFrames == 0 {
-		return errEmptyStream
-	}
 	return nil
+}
+
+// jsonString 把字符串编成 JSON 字面量（用于构造本地 error 帧的 message 字段）。
+func jsonString(s string) string {
+	b, err := json.Marshal(s)
+	if err != nil {
+		return `"upstream error"`
+	}
+	return string(b)
 }
 
 // frameGatewayHint 取 error 帧的 gateway_hint（hintFn 缺失/异常返回空串 → 不附加）。

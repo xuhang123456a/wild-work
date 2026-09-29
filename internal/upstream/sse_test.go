@@ -2,6 +2,8 @@ package upstream
 
 import (
 	"encoding/json"
+	"errors"
+	"io"
 	"net/http/httptest"
 	"strings"
 	"testing"
@@ -348,4 +350,76 @@ func TestStreamEmptyUpstreamErrors(t *testing.T) {
 			t.Errorf("raw=%q: empty stream must still close with [DONE]", raw)
 		}
 	}
+}
+
+// 回归（issue #42）：通用流式路径（WorkBuddy/WorkBuddyAI/oczen 共用）在「可证实的
+// 截断」时不得补 [DONE] 伪装成成功收尾。
+//   - 传输层读错误 / 断在半个帧上（末行无换行）→ 发 upstream_truncated error 帧、不补 [DONE]；
+//   - 正常 [DONE] 收尾、EOF 但帧完整且漏发 [DONE] → 行为不变，仍补 [DONE]。
+func TestStreamTruncationNotDisguisedAsDone(t *testing.T) {
+	full := `data: {"id":"x","choices":[{"index":0,"delta":{"content":"hi"}}]}` + "\n\n" +
+		`data: {"id":"x","choices":[{"index":0,"delta":{"tool_calls":[{"index":0,"function":{"name":"Bash","arguments":"{\"cmd\""}}]}}]}` + "\n\n"
+
+	mkStream := func(rd io.Reader) (string, error) {
+		rec := httptest.NewRecorder()
+		err := Stream(rec, rd)
+		return rec.Body.String(), err
+	}
+
+	// 1) 传输层读错误
+	body, err := mkStream(&readErrAfter{payload: full})
+	if err == nil {
+		t.Error("read-error: want err != nil")
+	}
+	if strings.Contains(body, "[DONE]") || !strings.Contains(body, "upstream_truncated") {
+		t.Errorf("read-error: 截断不得补 [DONE]，应发 error 帧\nbody=%s", body)
+	}
+
+	// 2) 断在半个帧上
+	body, err = mkStream(&cutStream{payload: full, keep: len(full) - 12})
+	if err == nil {
+		t.Error("cut: want err != nil")
+	}
+	if strings.Contains(body, "[DONE]") || !strings.Contains(body, "upstream_truncated") {
+		t.Errorf("cut: 截断不得补 [DONE]，应发 error 帧\nbody=%s", body)
+	}
+
+	// 3) 正常 [DONE] 收尾
+	body, err = mkStream(strings.NewReader(full + "data: [DONE]\n\n"))
+	if err != nil {
+		t.Fatalf("normal: %v", err)
+	}
+	if !strings.Contains(body, "[DONE]") || strings.Contains(body, "truncated") {
+		t.Errorf("normal: 应恰好一个 [DONE] 且无 error 帧\nbody=%s", body)
+	}
+
+	// 4) EOF 但帧完整、上游漏发 [DONE]（向后兼容兜底）
+	body, err = mkStream(strings.NewReader(full))
+	if err != nil {
+		t.Fatalf("eof-no-done: %v", err)
+	}
+	if !strings.Contains(body, "[DONE]") || strings.Contains(body, "truncated") {
+		t.Errorf("eof-no-done: 仍应兜底补 [DONE]\nbody=%s", body)
+	}
+}
+
+type readErrAfter struct{ payload string; sent bool }
+
+func (r *readErrAfter) Read(p []byte) (int, error) {
+	if !r.sent {
+		r.sent = true
+		return copy(p, r.payload), nil
+	}
+	return 0, errors.New("simulated: broken pipe")
+}
+
+type cutStream struct{ payload string; keep, off int }
+
+func (r *cutStream) Read(p []byte) (int, error) {
+	if r.off >= r.keep {
+		return 0, io.EOF
+	}
+	n := copy(p, r.payload[r.off:r.keep])
+	r.off += n
+	return n, nil
 }

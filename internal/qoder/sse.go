@@ -6,6 +6,7 @@ package qoder
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"io"
 	"net/http"
@@ -17,11 +18,25 @@ import (
 //   - body == "[DONE]" → 正常结束
 //   - "event:finish" 行 → 忽略
 //   - body 二次 unmarshal 失败 → 跳过该行（不致命）
-func parseNestedSSE(r io.Reader, onChunk func(map[string]any) error) error {
+//
+// truncated 为出参（调用方给非 nil 指针才写）：报告「可证实的截断」——传输层错误
+// （连接中断 / 读超时）或 EOF 处停在一个不完整的帧上。调用方据此决定是向客户端补
+// [DONE] 还是改发 error 帧：把半截流伪装成正常结束，会让客户端拿着残缺的 tool_call
+// arguments 去解析并报 "tool input was not fully received"（issue #42）。
+//
+// 注意：本渠道的 [DONE] 在 envelope 内部（body=="[DONE]"），**不是**客户端可见的
+// data: [DONE] 帧，故它只用于停止解析，不能拿来抑制调用方的收尾帧。
+func parseNestedSSE(r io.Reader, onChunk func(map[string]any) error, truncated *bool) error {
+	set := func() {
+		if truncated != nil {
+			*truncated = true
+		}
+	}
 	br := bufio.NewReaderSize(r, 256*1024)
 	for {
 		line, err := br.ReadString('\n')
 		if err != nil && err != io.EOF {
+			set() // 连接中断 / 读超时：可证实的截断
 			return err
 		}
 		line = strings.TrimRight(line, "\r\n")
@@ -30,19 +45,29 @@ func parseNestedSSE(r io.Reader, onChunk func(map[string]any) error) error {
 			var env struct {
 				Body string `json:"body"`
 			}
-			if json.Unmarshal([]byte(payload), &env) == nil && env.Body != "" {
+			outerOK := json.Unmarshal([]byte(payload), &env) == nil
+			innerOK := false
+			if outerOK && env.Body != "" {
 				if env.Body == "[DONE]" {
-					return nil
+					return nil // 上游显式收尾
 				}
 				var chunk map[string]any
-				if json.Unmarshal([]byte(env.Body), &chunk) == nil {
+				innerOK = json.Unmarshal([]byte(env.Body), &chunk) == nil
+				if innerOK {
 					if err := onChunk(chunk); err != nil {
 						return err
 					}
 				}
 			}
+			if err == io.EOF && !(outerOK && innerOK) {
+				set() // EOF 处这一行（内层或外层）不是完整 JSON：半个帧
+			}
 		}
 		if err == io.EOF {
+			// 最后一行没有换行符收尾且非空 → 帧不完整（半帧）；正常收尾的最后一行是空行。
+			if strings.TrimSpace(line) != "" {
+				set()
+			}
 			return nil
 		}
 	}
@@ -114,7 +139,7 @@ func aggregate(r io.Reader, model string) (map[string]any, error) {
 			}
 		}
 		return nil
-	})
+	}, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -200,10 +225,14 @@ func sortInts(a []int) {
 }
 
 // streamAsOpenAI 把嵌套 SSE 流边读边转写为标准 OpenAI SSE 给客户端。
-// 每个 chunk 重写 model 字段为客户端模型名；末尾补 data: [DONE]。
+// 每个 chunk 重写 model 字段为客户端模型名。
+//
+// 收尾规则（issue #42）：正常收尾（含上游未发 [DONE] 的兜底）补 data: [DONE]；
+// 可证实的截断（传输层错误 / 停在半个帧上）改发一帧 OpenAI 规范 error 且**不补**
+// [DONE]，让客户端明确感知失败，而不是收到半截 tool_call 参数。
 func streamAsOpenAI(w io.Writer, r io.Reader, model string, flush func()) (map[string]any, error) {
 	var usage map[string]any
-	sawDone := false
+	truncated := false
 	err := parseNestedSSE(r, func(chunk map[string]any) error {
 		// usage 捕获：末帧覆盖前面（OpenAI 语义末帧才是全量），并照常透传
 		if u, ok := chunk["usage"].(map[string]any); ok && len(u) > 0 {
@@ -218,17 +247,27 @@ func streamAsOpenAI(w io.Writer, r io.Reader, model string, flush func()) (map[s
 			flush()
 		}
 		return nil
-	})
-	if err != nil {
-		return usage, err
-	}
-	if !sawDone {
-		if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
-			return usage, err
+	}, &truncated)
+	// 截断优先于 err：读错误（连接中断/超时）本身就体现为 err != nil，必须先把
+	// 已透传的半截流的收尾处理掉（发 error 帧、不补 [DONE]），再报错给调用方。
+	if truncated {
+		if _, werr := io.WriteString(w, "data: {\"error\":{\"message\":\"upstream stream truncated\",\"type\":\"upstream_error\",\"code\":\"upstream_truncated\"}}\n\n"); werr != nil {
+			return usage, werr
 		}
 		if flush != nil {
 			flush()
 		}
+		return usage, errors.New("upstream stream truncated")
+	}
+	if err != nil {
+		return usage, err
+	}
+	// 正常收尾（含上游未发 [DONE] 的兜底）：保证恰好一个 data: [DONE]。
+	if _, err := io.WriteString(w, "data: [DONE]\n\n"); err != nil {
+		return usage, err
+	}
+	if flush != nil {
+		flush()
 	}
 	return usage, nil
 }
