@@ -2,11 +2,13 @@ package upstream
 
 import (
 	"bytes"
+	"context"
 	"errors"
 	"io"
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"wild-work/internal/auth"
 )
@@ -23,9 +25,26 @@ func TestClassify(t *testing.T) {
 		{200, `{"code":10001,"msg":"积分不足，请充值"}`, ErrHardCredit},
 		{400, `{"code":1,"msg":"额度用尽"}`, ErrHardCredit},
 		{429, ``, ErrSoftRate},
+		// 14018 积分耗尽（workbuddyai 生产实录；本渠道预防性同构特判）：归 hard_credit——
+		// 误判软限流只冷 60s，降级链永不触发。
+		{429, `{"error":{"data":{"code":14018,"msg":"Credits exhausted. Please visit the link below to purchase add-on packs and get more credits: https://www.codebuddy.ai/profile/usage ","requestId":"x"}}}`, ErrHardCredit},
+		// 匹配防前缀误伤（S2）：code 140180 含子串 "code":14018，须保持软限流；
+		// 尾形（code 后紧跟 }，无 msg）是真 14018，须命中。
+		{429, `{"error":{"data":{"code":140180,"msg":"future code"}}}`, ErrSoftRate},
+		{429, `{"error":{"data":{"code":14018}}}`, ErrHardCredit},
+		// 回归：6004 模型级限流 / 14003 过频（构造，未实证）/ 429+quota exceeded 均保持软限流。
+		{429, `{"code":6004,"msg":"usage exceeds frequency limit ... will reset at ..."}`, ErrSoftRate},
+		{429, `{"code":14003,"msg":"too many requests"}`, ErrSoftRate},
+		{429, `quota exceeded`, ErrSoftRate},
 		{401, `Offline user session not found`, ErrSessionDead},
 		{401, `{"code":12153,"msg":"Offline user session not found"}`, ErrSessionDead},
-		{401, `{"code":9999,"msg":"bad token"}`, ErrClient},
+		// 401 统一归登录态失效（#134）：上游拒绝我们的凭据 = 需重新登录
+		{401, `{"code":9999,"msg":"bad token"}`, ErrSessionDead},
+		// 会话头族缺失（11128 conversation id missing）= 上游**按账号灰度**的渠道校验，
+		// 归账号级（软冷却 + 换号，见 R116）；同一个 11128 的另一形态（内容指纹
+		// unapproved channel）才是请求级问题，归内容拦截不罚号。
+		{400, `{"code":11128,"msg":"conversation id missing","requestId":"x"}`, ErrAccountFault},
+		{400, `{"code":11128,"msg":"Illegal API invocation from an unapproved channel"}`, ErrContentBlocked},
 		{500, `boom`, ErrServer},
 		{503, `unavailable`, ErrServer},
 		{200, ``, ErrNone},
@@ -142,7 +161,8 @@ func TestChatStreamSendsHeadersAndStreamTrue(t *testing.T) {
 		t.Errorf("200 response should carry nil body, got %q", respBody)
 	}
 	rc.Close()
-	if gotAuth != "Bearer at" || gotUID != "u1" || gotProduct != "WorkBuddy" {
+	// X-Product 取官方 product.json 的 deploymentType（SaaS），见 R117。
+	if gotAuth != "Bearer at" || gotUID != "u1" || gotProduct != "SaaS" {
 		t.Errorf("headers: auth=%q uid=%q product=%q", gotAuth, gotUID, gotProduct)
 	}
 	if !bytes.Contains(gotBody, []byte(`"stream":true`)) {
@@ -229,5 +249,71 @@ func TestRegionBases(t *testing.T) {
 	}
 	if c.chatBase(gl) != "https://gchat.example" || c.billingBase(gl) != "https://gbilling.example" {
 		t.Error("global bases wrong")
+	}
+}
+
+// stallBody 首帧之后永久阻塞，模拟「上游连上但发完首字节后不再吐数据」。
+type stallBody struct {
+	sent      bool
+	cancelled chan struct{}
+}
+
+func (s *stallBody) Read(p []byte) (int, error) {
+	if !s.sent {
+		s.sent = true
+		p[0] = 'x'
+		return 1, nil
+	}
+	// 阻塞直到 ctx 被 cancel（由 idle 监控触发）
+	<-s.cancelled
+	return 0, context.Canceled
+}
+
+func (s *stallBody) Close() error { return nil }
+
+// 上游发完首帧后卡死时，空闲监控必须切断流——这是 idle 接线的核心保证
+// （流式 client 无总时长上限，若没有本机制该请求会无限期挂住，连接与 goroutine 无法释放）。
+func TestChatStreamIdleMonitorBreaksStalledStream(t *testing.T) {
+	stalled := &stallBody{cancelled: make(chan struct{})}
+	c := testClient(func(r *http.Request) (*http.Response, error) {
+		// ctx 被 cancel 时放行阻塞中的 Read
+		go func() {
+			<-r.Context().Done()
+			close(stalled.cancelled)
+		}()
+		return &http.Response{
+			StatusCode: 200,
+			Header:     http.Header{"Content-Type": []string{"text/event-stream"}},
+			Body:       stalled,
+		}, nil
+	})
+	c.IdleTimeout = 50 * time.Millisecond
+	a := &auth.Auth{AccessToken: "at", UID: "u1"}
+
+	rc, status, _, err := c.ChatStream(a, []byte(`{}`))
+	if err != nil || status != 200 {
+		t.Fatalf("chat: status=%d err=%v", status, err)
+	}
+	defer rc.Close()
+
+	// 首帧正常读出
+	buf := make([]byte, 16)
+	if _, err := rc.Read(buf); err != nil {
+		t.Fatalf("首帧应可读: %v", err)
+	}
+
+	// 之后卡死：静默超时后监控应 cancel，使阻塞的 Read 返回错误而非永久挂起
+	done := make(chan error, 1)
+	go func() {
+		_, err := rc.Read(buf)
+		done <- err
+	}()
+	select {
+	case err := <-done:
+		if err == nil {
+			t.Error("卡死流的 Read 应返回错误，实际 nil")
+		}
+	case <-time.After(3 * time.Second):
+		t.Fatal("空闲监控未生效：Read 永久挂起")
 	}
 }

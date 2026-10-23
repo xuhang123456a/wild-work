@@ -9,12 +9,140 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
+	"regexp"
+	"strconv"
 	"strings"
 	"time"
+
+	"wild-work/internal/loopguard"
+	"wild-work/internal/provider"
 )
 
+// sseError 是「HTTP 200 + 信封内嵌 statusCodeValue>=400」形态的流内业务错误。
+//
+// Qoder 上游把排队/限流拒绝塞在 SSE 信封里下发（2026-10-21 抓包实证）：
+//
+//	data:{"headers":{...},"body":"{\"code\":\"403\",\"message\":\"{\\\"code\\\":\\\"10605\\\","
+//	"...\\\"subCode\\\":\\\"RESOURCE_LIMIT\\\"}\"}","statusCodeValue":403,"statusCode":"FORBIDDEN"}
+//
+// 修复前信封只解 body：该帧的 body 是合法 JSON（但没有 choices），于是被当普通 chunk
+// 原样透传，客户端既看不懂也收不到失败信号。两种表现都坏——
+//   - 上游保持连接：连续无字节，90s 后被空闲看门狗掐成「upstream stream truncated」，
+//     错误原因（限流/排队）在日志与客户端两侧都看不见；
+//   - 上游发完即断连：parseNestedSSE 正常返回 nil，收尾补一个 data:[DONE]，
+//     **失败被包装成「空内容的成功流」**（实测喂真实帧得 200 + 原始错误帧 + [DONE]，
+//     err=nil，网关还记成成功流水）。
+//
+// 现在：判出 statusCodeValue>=400 立刻返回本错误，调用方补一帧带原因的 SSE error
+// 并**不补 [DONE]**（R36，同 loomy/officeace 口径），handler 据 Kind() 决定惩罚。
+type sseError struct {
+	status     int
+	msg        string
+	retryAfter int // 上游 retryAfterSeconds / waitTime；0 = 上游未声明
+}
+
+func (e *sseError) Error() string { return fmt.Sprintf("upstream %d: %s", e.status, e.msg) }
+
+// Kind 复用与 HTTP 路径同一套 Classify，使 server 层不必 import 本渠道包。
+func (e *sseError) Kind() provider.ErrKind { return Classify(e.status, e.msg) }
+
+var _ provider.StreamErrorClassifier = (*sseError)(nil)
+
+// envelope Qoder 系 SSE 的外层信封。body 是**字符串**（内层 JSON 文本），
+// 与 internal/qwenwork 的 json.RawMessage 形状不同，不能照抄那边的写法。
+type envelope struct {
+	Body            string              `json:"body"`
+	Headers         map[string][]string `json:"headers"`
+	StatusCodeValue int                 `json:"statusCodeValue"`
+	StatusCode      string              `json:"statusCode"`
+}
+
+// errText 提取上游错误文案；非错误信封返回空串。
+// body 形如 {"code":"403","message":"<再嵌一层的 JSON 文本>"}，文案取 message 原文
+// （内层 10605/RESOURCE_LIMIT 等结构化字段随之带出，不做二次解析）。
+func (e *envelope) errText() string {
+	if e.StatusCodeValue < 400 {
+		return ""
+	}
+	var withMsg struct {
+		Code    string `json:"code"`
+		Message string `json:"message"`
+	}
+	if json.Unmarshal([]byte(e.Body), &withMsg) == nil && withMsg.Message != "" {
+		return withMsg.Message
+	}
+	return truncate(e.Body, 300)
+}
+
+// retryAfterRe 从错误文案里取建议退避秒数。上游在同一处既给 retryAfterSeconds 也给
+// waitTime（本次抓包两者都是 30），取前者、回落后者；只匹配十进制整数。
+//
+// 必须容忍键名两侧的反斜杠：该字段在原始信封 body 里被逐层转义（生产抓包形态是
+// \\\"retryAfterSeconds\\\":30），解出一层后仍是 \"retryAfterSeconds\":30。
+// 只匹配裸 "retryAfterSeconds" 的正则会静默失配 → retry_after_seconds 不下发，
+// 客户端只能盲重试（测试 TestNestedStreamBusinessErrorFailsFast 守这一点）。
+var (
+	retryAfterRe = regexp.MustCompile(`\\*"retryAfterSeconds\\*"\s*:\s*(\d+)`)
+	waitTimeRe   = regexp.MustCompile(`\\*"waitTime\\*"\s*:\s*(\d+)`)
+)
+
+// maxRetryAfter 退避时长的合理上限：上游给得再大也不应超过 1h，超了按未声明处理，
+// 免得解析出的异常值被客户端当真（宁可少给一个提示，不可给一个错的等待时长）。
+const maxRetryAfter = 3600
+
+func parseRetryAfter(s string) int {
+	for _, re := range []*regexp.Regexp{retryAfterRe, waitTimeRe} {
+		if m := re.FindStringSubmatch(s); m != nil {
+			var n int
+			if _, err := fmt.Sscanf(m[1], "%d", &n); err == nil && n > 0 && n <= maxRetryAfter {
+				return n
+			}
+		}
+	}
+	return 0
+}
+
+// streamErrorCode 给出出口 error 帧的 code，便于客户端/日志分原因。
+func streamErrorCode(k provider.ErrKind) string {
+	switch k {
+	case provider.ErrSoftRate:
+		return "upstream_rate_limited"
+	case provider.ErrSessionDead:
+		return "upstream_session_dead"
+	default:
+		return "upstream_business_error"
+	}
+}
+
+// writeStreamErrorFrame 把流内业务错误写成一帧 SSE error（调用方**不得**再补 [DONE]）。
+// retry_after_seconds 只在上游声明了退避时长时输出——上游没给就不编造。
+func writeStreamErrorFrame(w io.Writer, e *sseError) {
+	errObj := map[string]any{
+		"message": truncate(e.msg, 300),
+		"type":    "upstream_error",
+		"code":    streamErrorCode(e.Kind()),
+	}
+	if e.retryAfter > 0 {
+		errObj["retry_after_seconds"] = e.retryAfter
+	}
+	frame, merr := json.Marshal(map[string]any{"error": errObj})
+	if merr != nil {
+		// 纯字符串/整数 map，序列化不会失败；真失败也要保证客户端拿到一帧原因。
+		frame = []byte(`{"error":{"message":"upstream business error","type":"upstream_error","code":"upstream_business_error"}}`)
+	}
+	if _, werr := w.Write(append(append([]byte("data: "), frame...), []byte("\n\n")...)); werr != nil {
+		log.Printf("qodercn stream error frame write failed: %v", werr)
+		return
+	}
+	if fl, ok := w.(interface{ Flush() }); ok {
+		fl.Flush()
+	}
+}
+
 // parseNestedSSE 逐行解析嵌套 SSE，每个有效 chunk 调 onChunk。
+//   - 信封 statusCodeValue >= 400 → 返回 *sseError（上游以 HTTP 200 包裹业务失败，R108）
 //   - body == "[DONE]" → 正常结束
 //   - "event:finish" 行 → 忽略
 //   - body 二次 unmarshal 失败 → 跳过该行（不致命）
@@ -42,10 +170,28 @@ func parseNestedSSE(r io.Reader, onChunk func(map[string]any) error, truncated *
 		line = strings.TrimRight(line, "\r\n")
 		if strings.HasPrefix(line, "data:") {
 			payload := strings.TrimPrefix(line, "data:")
-			var env struct {
-				Body string `json:"body"`
-			}
+			var env envelope
 			outerOK := json.Unmarshal([]byte(payload), &env) == nil
+			if outerOK && env.Body != "" {
+				// 排队 / 额度耗尽 / 业务错误帧：**必须在 onChunk 之前**识别——这类帧没有
+				// choices，透传出去等于给客户端一个空 delta，界面停在「正在等待模型…」，
+				// 直到网关掐断（2026-10-20 qodercn deepseek-flash 实录）。
+				// 顺序不可换：10605→Queued（模型级，R109）；110/112→HardCredit（账号级，R111）；
+				// 其余 >=400→sseError（R108，带 retry_after_seconds）。
+				if q := queueNotice(env.Body, env.StatusCodeValue, env.Headers); q != nil {
+					return q
+				}
+				if e := envelopeError(env.Body, env.StatusCodeValue); e != nil {
+					return e
+				}
+				if env.StatusCodeValue >= 400 {
+					msg := env.errText()
+					if msg == "" {
+						msg = truncate(env.Body, 300)
+					}
+					return &sseError{status: env.StatusCodeValue, msg: msg, retryAfter: parseRetryAfter(env.Body + "\n" + msg)}
+				}
+			}
 			innerOK := false
 			if outerOK && env.Body != "" {
 				if env.Body == "[DONE]" {
@@ -71,6 +217,122 @@ func parseNestedSSE(r io.Reader, onChunk func(map[string]any) error, truncated *
 			return nil
 		}
 	}
+}
+
+// queueNotice 识别「模型排队中」帧（见 provider.Queued）。
+//
+// 上游把排队提示塞在 HTTP 200 的 SSE data 行里，三层嵌套：
+//
+//	data:{"headers":{"Retry-After":["30"]},"body":"{\"code\":\"403\",\"message\":
+//	  \"{\\\"code\\\":\\\"10605\\\",\\\"message\\\":\\\"{...isQueued...}\\\"}\"}"}
+//
+// 命中判据：内层出现 10605 / isQueued，且 **没有 choices**（带 choices 的是正常 delta）。
+// 返回 nil 表示“不是排队帧”，调用方继续按普通 chunk 处理。
+func queueNotice(body string, statusCode int, headers map[string][]string) *provider.Queued {
+	if body == "" || strings.Contains(body, "\"choices\"") {
+		return nil
+	}
+	if !strings.Contains(body, "10605") && !strings.Contains(body, "isQueued") {
+		return nil
+	}
+	vals := unwrapLayers(body)
+	code, _ := vals["code"].(string)
+	if code != "10605" && !truthy(vals["isQueued"]) {
+		return nil
+	}
+	q := &provider.Queued{
+		ModelKey:    strOf(vals["modelKey"]),
+		QueueCount:  intOf(vals["queueCount"]),
+		WaitSeconds: intOf(vals["waitTime"]),
+	}
+	if secs := intOf(vals["retryAfterSeconds"]); secs > 0 {
+		q.RetryAfter = time.Duration(secs) * time.Second
+	}
+	if q.RetryAfter == 0 {
+		for k, vs := range headers {
+			if !strings.EqualFold(k, "Retry-After") || len(vs) == 0 {
+				continue
+			}
+			if n, err := strconv.Atoi(strings.TrimSpace(vs[0])); err == nil && n > 0 {
+				q.RetryAfter = time.Duration(n) * time.Second
+			}
+		}
+	}
+	return q
+}
+
+// envelopeError 识别「HTTP 200 里包着的业务错误帧」（非排队）：这种帧同样没有
+// choices，当普通 chunk 透传只会让客户端拿到空 delta 干等。按外包 statusCode
+// 分类后上抛，走 handler 的统一错误路径（可轮换/可冷却/可降级）。
+//
+// 额度耗尽单独判（2026-10-20 qodercom 同族实测，本渠道代码同源一并补）：
+// 码 110「Billing daily count exceeded」与 112「pricingUrl 付费墙」都是**账号级**
+// 额度耗尽——文案不含 hardMarkers 的 "quota exceeded"，按 statusCode 分类只会落到
+// 普通 4xx，变成「只换号不冷却」，下次请求又撞同一堵墙。归 ErrHardCredit 后
+// 整号硬冷却 + 换下一个号。
+func envelopeError(body string, statusCode int) error {
+	if body == "" || strings.Contains(body, "\"choices\"") {
+		return nil
+	}
+	vals := unwrapLayers(body)
+	if code, _ := vals["code"].(string); code == "110" || code == "112" {
+		// 包成 Classified：流式路径要靠 Kind() 认出 ErrHardCredit 才能「整号冷却 + 换号」。
+		return &provider.Classified{Err: &provider.Error{
+			Kind:   provider.ErrHardCredit,
+			Status: 402, // 语义是付费墙，透传给客户端用 402 比 403 准确
+			Msg:    "upstream quota exhausted (code " + code + "): " + truncate(body, 200),
+		}}
+	}
+	if b, ok := vals["isQuotaExceeded"].(bool); ok && b {
+		return &provider.Classified{Err: &provider.Error{
+			Kind:   provider.ErrHardCredit,
+			Status: 402,
+			Msg:    "upstream quota exhausted: " + truncate(body, 200),
+		}}
+	}
+	// 通用 statusCode>=400 交给 sseError：它能从文案里取 retryAfterSeconds，
+	// 并在出口补带 code/retry_after_seconds 的结构化 error 帧（R108）。
+	return nil
+}
+
+// unwrapLayers 把「message 字段里再套一层 JSON 字符串」逐层解开，收集各层键值（深层覆盖浅层）。
+// 上游三层套娃：{code:403} → {code:10605} → {...isQueued...}。
+func unwrapLayers(body string) map[string]any {
+	vals := map[string]any{}
+	cur := body
+	for depth := 0; depth < 6 && cur != ""; depth++ {
+		var m map[string]any
+		if json.Unmarshal([]byte(cur), &m) != nil {
+			break
+		}
+		for k, v := range m {
+			vals[k] = v
+		}
+		next, _ := m["message"].(string)
+		if next == "" || next == cur {
+			break
+		}
+		cur = next
+	}
+	return vals
+}
+
+func truthy(v any) bool {
+	b, ok := v.(bool)
+	return ok && b
+}
+
+func strOf(v any) string {
+	s, _ := v.(string)
+	return s
+}
+
+func intOf(v any) int {
+	f, ok := v.(float64)
+	if !ok {
+		return 0
+	}
+	return int(f)
 }
 
 // aggregate 聚合完整 SSE 为单个 OpenAI chat.completion 响应。
@@ -233,7 +495,29 @@ func sortInts(a []int) {
 func streamAsOpenAI(w io.Writer, r io.Reader, model string, flush func()) (map[string]any, error) {
 	var usage map[string]any
 	truncated := false
+	// 思考链死循环守卫：仅在全局启用时创建。命中即中断、不罚账号。
+	var guard *loopguard.Guard
+	if loopguard.Enabled() {
+		guard = loopguard.NewDefault()
+	}
 	err := parseNestedSSE(r, func(chunk map[string]any) error {
+		// 思考链死循环守卫：只在 reasoning_content 非空时喂入（无思维链的模型/配置
+		// 不经过守卫，零开销零误伤）。命中即中断。
+		if guard != nil {
+			if rc := loopguard.ReasoningDeltaOf(chunk); rc != "" {
+				if hit := guard.Push(rc); hit != nil {
+					gerr := &loopguard.Error{Hit: *hit}
+					if _, werr := io.WriteString(w, "data: "+loopguard.ErrorFrameJSON(hit)+"\n\n"); werr != nil {
+						log.Printf("qodercn reasoning loop error frame write failed: %v", werr)
+						return gerr
+					}
+					if flush != nil {
+						flush()
+					}
+					return gerr
+				}
+			}
+		}
 		// usage 捕获：末帧覆盖前面（OpenAI 语义末帧才是全量），并照常透传
 		if u, ok := chunk["usage"].(map[string]any); ok && len(u) > 0 {
 			usage = u
@@ -250,14 +534,30 @@ func streamAsOpenAI(w io.Writer, r io.Reader, model string, flush func()) (map[s
 	}, &truncated)
 	// 截断优先于 err：读错误（连接中断/超时）本身就体现为 err != nil，必须先把
 	// 已透传的半截流的收尾处理掉（发 error 帧、不补 [DONE]），再报错给调用方。
+	//
+	// 出口帧与错误文本都**保留原始原因**（R58）：此前无论什么原因都只报固定串
+	// "upstream stream truncated"，err 被丢弃 ⇒ 生产上分不清「空闲看门狗掐的」
+	// （连续无字节，疑似上游排队/卡死）与「上游主动断连 / 读到半个帧」。
+	// 空闲超时另给 code=upstream_timeout，其余仍为 upstream_truncated。
 	if truncated {
-		if _, werr := io.WriteString(w, "data: {\"error\":{\"message\":\"upstream stream truncated\",\"type\":\"upstream_error\",\"code\":\"upstream_truncated\"}}\n\n"); werr != nil {
+		if werr := provider.WriteTruncationFrame(w, err); werr != nil {
 			return usage, werr
 		}
 		if flush != nil {
 			flush()
 		}
-		return usage, errors.New("upstream stream truncated")
+		return usage, provider.TruncationError(err)
+	}
+	// 流内业务错误（信封内嵌 statusCodeValue>=400，R108）：补一帧带原因的 SSE error
+	// 并**不补 [DONE]**（R36）——补了就把失败伪装成正常结束，客户端会拿着空结果继续走，
+	// 网关侧还把它记成一条成功流水。原因与退避时长一并结构化传出，重试交回客户端。
+	var sErr *sseError
+	if errors.As(err, &sErr) {
+		writeStreamErrorFrame(w, sErr)
+		if flush != nil {
+			flush()
+		}
+		return usage, sErr
 	}
 	if err != nil {
 		return usage, err
@@ -270,12 +570,6 @@ func streamAsOpenAI(w io.Writer, r io.Reader, model string, flush func()) (map[s
 		flush()
 	}
 	return usage, nil
-}
-
-// Stream 实现 provider.Upstream：嵌套 SSE → 标准 OpenAI SSE 透传。
-// 返回值为末帧捕获的 usage（供记账，上游未返回时为 nil）。
-func Stream(w http.ResponseWriter, r io.Reader, model string) (map[string]any, error) {
-	return StreamCapture(w, r, model, nil)
 }
 
 // StreamCapture 同 Stream，额外把末帧 usage 回调给 onUsage（非 nil 时）。

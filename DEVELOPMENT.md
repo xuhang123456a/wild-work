@@ -1,7 +1,8 @@
 # wild-work 开发者文档（面向 AI Agent）
 
 > 本文件为**代码维护者（含 AI Agent）**而写，供新 Agent 快速接手二次开发。
-> 普通用户请看 [README.md](README.md)，项目决议见 [AGENTS.md](AGENTS.md)，交接记录见 [HANDOFF.md](HANDOFF.md)。
+> 普通用户请看 [README.md](README.md)，项目纪律与决议索引见 [AGENTS.md](AGENTS.md)，
+> 决议全文见 [docs/决议项.md](docs/决议项.md)，渠道细节见 [docs/渠道接入备忘.md](docs/渠道接入备忘.md)。
 
 ## 0. 项目速览
 
@@ -21,6 +22,7 @@ internal/
 ├── app/app.go                 # 业务编排：HTTP 管理 API + 登录流程 + 费率缓存 + 日志
 ├── app/session.go             # 管理面板鉴权：cookie 会话 + 管理员密码 + 登录限流
 ├── server/handler.go          # OpenAI 兼容 HTTP handler：前缀路由 + 挑号 + 错误透传（含 SingleAccount 豁免）
+├── gateway/                    # 三接口兼容层（Responses/Anthropic → 内层 Chat）；imageslim.go 做入站图片降采样
 ├── pool/pool.go               # 账号池：余额挑号 + 冷却/禁用状态机 + state.json 持久化
 ├── scheduler/scheduler.go     # 定时签到 + token 保活 + 冷却解冻
 ├── provider/provider.go       # Upstream 接口 + 共享类型（ModelInfo/ModelPricing/ResourceItem）
@@ -66,6 +68,15 @@ internal/
       `syncListenRisk()` 是唯一入口（下拉框 onchange / 自定义输入框 input / 打开弹层时各调一次），
       同时控制黄色警告条（`#listenRiskTip`）与管理密码的必填星号（`#adminPassReq`）。
       判定口径须与后端 `config.Listen.IsLoopback` 一致（显式环回才安全，空主机名=对外暴露）。
+14. **入站请求体上限是变量不是常量**：`server.MaxRequestBody` 默认 128MiB，装配层由
+    `config.server.max_request_body_mb` 覆盖（0=默认，钳 8~1024）。判定错误必须用
+    `server.IsBodyTooLarge(err)`，不得靠 `strings.Contains(err, "exceeds limit")` 字符串匹配。
+    `gateway.maxInnerBody()` 必须是**函数**——常量会在包初始化时把上限快照死，改配置不生效。
+15. **图片只在网关转发前降采样，且只动 data URL**：`gateway.imageslim.go` 把内联 base64 图缩到
+    长边 ≤1568（不透明 → JPEG q85，带 alpha → PNG，防透明区涂黑），按 payload sha256 缓存 256 条。
+    `http(s)` 直链不下载不改写；解码失败 / 重编码后变大 / 体积 ≤512KB 且长边合规 ⇒ 原样返回。
+    工具结果里的图片必须走 `image_url` 内容块（`toolContentValue`），**不得** `json.Marshal` 成 base64 文本
+    ——一张 1.6MB 截图按文本计 ≈146 万 token，按 vision 只 ~1K token。
 
 ## 3. 渠道上游接口
 
@@ -141,22 +152,68 @@ CN 凭据在国际端点 401（双向隔离），两渠道凭据文件前缀 `qo
 
 | 用途 | 端点 | 鉴权 |
 |------|------|------|
-| 聊天 | `POST https://opencode.ai/zen/v1/chat/completions` | `Bearer public`（字面量，匿名） |
-| 模型列表 | `GET https://opencode.ai/zen/v1/models` | 同上 |
+| 聊天（匿名） | `POST https://opencode.ai/inference/v1/chat/completions` | `Bearer public`（字面量，匿名） |
+| 聊天（自备 key） | `POST https://opencode.ai/zen/v1/chat/completions` | `Bearer sk-…` |
+| 模型列表 | 同车道基址 + `/models` | 同上 |
+
+> **基址按凭证车道分流**（`Client.base()`）：匿名（无 key）走 `AnonymousBase`(`/inference`)，
+> 自备 `sk-…` key 走 `DefaultBase`(`/zen`)。上游把 **keyless 推理**从 `/zen` 迁到了独立入口，
+> 两条车道基址已分离。匿名打到 `/zen` 会恒回 403 FreeTierError，而两个基址的
+> `GET /models` 完全相同（均 200、7212 字节），差异只在推理入口。opencode2api 的 anonymous
+> 车道走的也是 `/inference`（其 `internal/config/config.go` 的 `Upstream.Anonymous`）。
 
 **无刷新/无余额/无签到**：匿名凭证是常量，`RefreshToken` 为空实现，`UserResource*` 恒 0，
 `DailyCheckin` 返回「无签到活动」（调度器配置为 `CheckinMinutes/KeepaliveHours` 均 nil，不会调用）。
 
-三道闸门（缺一即 403 FreeTierError，详见渠道备忘）：
-1. `x-opencode-session` 必须是 `ses_<12位小写hex><14位Base62>`（由对话首轮哈希稳定派生）；
+免费档请求形状闸门（缺一即 403 FreeTierError，详见渠道备忘与 R69）：
+1. 会话头须是 `ses_<12位小写hex><14位Base62>`（由对话首轮哈希稳定派生），且
+   `x-opencode-session` 与 `x-opencode-session-id` **两个头携带同一值**（官方客户端同时发两种拼写）；
 2. 请求体必须 `stream:true` 且 `tools` 内同含 `bash`/`read` function（缺则注入桩工具；
    客户端无工具时同时置 `tool_choice:"none"`，有工具时保留其 `tool_choice`）；
 3. 伪装头齐套：`User-Agent: opencode/1.18.x`、`x-opencode-client: cli`、
-   `x-session-affinity`/`X-Session-Id`（同会话值）、`x-opencode-request`、`x-opencode-project`。
+   `x-session-affinity`/`X-Session-Id`（同会话值）、`x-opencode-project`。
+   - **不得发 `x-opencode-request`**：上游 2026-10-14 起一旦见到该头即回 403。
+   - `x-opencode-project` 必须是**裸 40 位小写 hex**（官方 CLI 自身的形态）：`prj_` 前缀的
+     规范 id 会被拒 403；值本身不校验，只校验形状。本工具由会话标识 sha256 派生，
+     保证同一会话稳定映射（prompt cache 亲和）。
+   - `bash`/`read` 两个桩工具是正确的，**不要**换成官方 5 工具集
+     （`shell`/`edit`/`glob`/`grep`/`read` 实测 403，无 tools 同样 403）。
 
 模型暴露：只保留 ID 含 `free` 或恰为 `big-pickle` 的模型（地域受限的也保留）；
 上游不可达时回静态清单（`internal/oczen/free.go`）。定价恒为 `Rate=0, Explicit=true`。
 model 字段回填：`Aggregate` 直接改字段；`Stream` 用 `modelRewriter` 逐行替换。
+
+### OfficeAce（officeace，华为云果办）
+
+| 用途 | 端点 | 鉴权 |
+|------|------|------|
+| 对话 | `POST {base}/chat/completions`（网关 OpenAI 兼容，不带 `/v1`） | `Authorization: Basic base64(AK:SK)`（**不过期**） |
+| 模型列表 | `GET {base}/models` | 同上 |
+| 积分/订阅 | `GET {gateway}/v1/subscription` | **V11-HMAC-SHA256**（临时 AK/SK + security_token + project_id） |
+| 每日签到 | `POST {gateway}/v1/subscription/bonus/claim`（body `{}`） | 同上 |
+| 网关发现 | `GET {agentarts}/v1/claw/client-permission-validate` | **V4-HMAC-SHA256**（SDK-HMAC-SHA256） |
+| 续期 | `POST https://sts.cn-north-4.myhuaweicloud.com/v1/oauth2/tokens` | DPoP proof（ES256）+ `refresh_token` |
+
+> **双层凭据**（R70）：网关 Basic 凭据不过期（对话用，落 `accessToken`）；临时 AK/SK 约 2h
+> （控制面签名用，落 `Auth.Extra`）由 `refresh_token` 经 DPoP 换得。refresh_token 是**一次性**的
+> （重放报 STS5.1806）⇒ 单账号单飞 + 死名单，**必顶落盘**（不变量 20）。
+
+**两条添加路径**：① 本机桌面端文件导入（`models.json` + DPAPI/AES-256-GCM 加密档案，
+仅 Windows 可解密）；② 面板自助 OAuth（华为云授权码 + PKCE + DPoP，跨平台）。
+
+**对话改写（`rewriteBody`）**：恒 `stream:true`；`glm-5.3` 系剥 `thinking`/`enable_thinking`/
+`reasoning_effort`（**但不剥 `stream_options`** —— 它是 `include_usage` 载体，剥了 token 流水恒 0，
+故注入顺序是「先剥后注入」）；推理模型补足 `max_tokens` 预算（上游把 max_tokens 当推理+正文总预算，
+思维链会先吃光 ⇒ 正文空；qwen3 系视为非推理，不篡改用户显式值）；temperature/top_p 夹取。
+
+**流内 error 帧（R40）**：上游可能在 HTTP 200 + 流内 error 帧返回业务错误（如 `81111` 限流）。
+`Stream` 与 `Aggregate` **两条出口都挂 `errorSniffer`**（解析 JSON 且顶层有 `error` 键才算，
+不可用 `strings.Contains`），命中即返回实现 `StreamErrorClassifier` 的 `*StreamError` 供 handler 冷却。
+
+**能力字段（R49）**：上游 `/models` 只回 id、无任何能力声明 ⇒ `SupportsTools`/`SupportsReasoning`
+一律保持零值（不编造）；无静态档位面。
+
+**已知限制**：合并时无真实华为账号端到端实盘验证；DPAPI 解密仅 Windows。
 
 ## 4. 渠道扩展点
 

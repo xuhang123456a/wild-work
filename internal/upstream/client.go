@@ -15,6 +15,7 @@ import (
 	"time"
 
 	"wild-work/internal/auth"
+	"wild-work/internal/idle"
 	"wild-work/internal/provider"
 )
 
@@ -63,6 +64,11 @@ func Classify(status int, body string) ErrKind {
 	if status == http.StatusPaymentRequired {
 		return ErrHardCredit
 	}
+	// 401：登录态失效（令牌过期/被吊销）。放在文案标记之前：HTML 形态的 401
+	// Authorization Required（无业务信封）没有可匹配文案，也要归入 SessionDead（#134）。
+	if status == http.StatusUnauthorized {
+		return ErrSessionDead
+	}
 	lower := strings.ToLower(body)
 	for _, m := range sessionDeadMarkers {
 		if strings.Contains(body, m) {
@@ -70,6 +76,21 @@ func Classify(status int, body string) ErrKind {
 		}
 	}
 	if status == http.StatusTooManyRequests {
+		// 例外：积分耗尽（14018 "Credits exhausted"，复数 s 漏配 hardMarkers）是账号级
+		// 余额问题而非限流——误判软限流只冷 60s 且降级链永不触发，客户端死循环吃 429。
+		// 与 workbuddyai/models.go Classify 同构特判（预防性：国内 workbuddy 渠道暂无
+		// 14018 实录，但两份 Classify 语义须同步演进）。归 hard_credit：账号级 12h
+		// 硬冷却（充值后 ReenableIfCredits 自动解冻），下一请求入口降级链正常顶替。
+		// 匹配防前缀误伤："code":140180 含子串 "code":14018——命中后下一字符须非
+		// 数字，防未来 14xxxx 新码误归 12h 账号硬冷却。
+		if idx := strings.Index(body, `"code":14018`); idx >= 0 {
+			if end := idx + len(`"code":14018`); end >= len(body) || body[end] < '0' || body[end] > '9' {
+				return ErrHardCredit
+			}
+		}
+		if strings.Contains(lower, "credits exhausted") {
+			return ErrHardCredit
+		}
 		return ErrSoftRate
 	}
 	for _, m := range hardMarkers {
@@ -98,6 +119,13 @@ func Classify(status int, body string) ErrKind {
 			if strings.Contains(body, `"code":11101`) || strings.Contains(body, "Unmarshal chat params failed") {
 				return ErrClient // BadParams：不罚号但仍轮转
 			}
+		}
+		// 会话头族缺失（11128 "conversation id missing"）是上游**按账号灰度**的渠道校验，
+		// 属账号级问题（补头后仍撞 ⇒ 该号被灰度到别的口径）：软冷却 + 换号。必须排在
+		// contentBlocked 之前——同一个 11128 的另一形态 "Illegal API invocation from an
+		// unapproved channel" 才是请求级指纹问题（改提示词就能过）。R116。
+		if strings.Contains(lower, "conversation id missing") {
+			return ErrAccountFault
 		}
 		for _, m := range contentBlockedMarkers {
 			if strings.Contains(lower, m) {
@@ -134,6 +162,9 @@ type Client struct {
 	// StreamHTTP 用于对话流（SSE）：不设整体 Timeout，避免长回答在超时点被掐断
 	// 且无终止帧（R35 / issue #42）。
 	StreamHTTP *http.Client
+	// IdleTimeout 聊天 SSE 流中空闲超时（StreamHTTP 无总时长上限，靠本字段兜底
+	// 「上游中途卡死」）。<=0 表示禁用（测试用）。
+	IdleTimeout time.Duration
 
 	ChatBaseCN      string
 	BillingBaseCN   string
@@ -148,6 +179,7 @@ func New() *Client {
 		HTTP:            &http.Client{Timeout: 120 * time.Second, Transport: tr},
 		BillingHTTP:     &http.Client{Timeout: 30 * time.Second, Transport: tr},
 		StreamHTTP:      &http.Client{Transport: tr}, // 共用 Transport，不设 Timeout
+		IdleTimeout:     idle.DefaultTimeout,         // 流中空闲监控兜底（见 internal/idle）
 		ChatBaseCN:      "https://copilot.tencent.com",
 		BillingBaseCN:   "https://www.codebuddy.cn",
 		ChatBaseGlobal:  "https://www.workbuddy.ai",
@@ -292,17 +324,21 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status
 	if err != nil {
 		return nil, 0, nil, err
 	}
-	ChatHeaders(req, a)
+	conv, turn := conversationAnchors(body)
+	ChatHeaders(req, a, conv, turn)
+	req, cancel := idle.WithCancel(req)
 	hc := c.HTTP
 	if c.StreamHTTP != nil {
 		hc = c.StreamHTTP
 	}
 	resp, err := hc.Do(req)
 	if err != nil {
+		cancel()
 		log.Printf("chat_stream uid=%s: transport error: %v", a.UID, err)
 		return nil, 0, nil, err
 	}
 	if resp.StatusCode >= 400 {
+		cancel()
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
 		kind := Classify(resp.StatusCode, string(raw))
@@ -310,7 +346,8 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status
 			a.UID, resp.StatusCode, kind, truncate(string(raw), 200))
 		return nil, resp.StatusCode, raw, nil
 	}
-	return resp.Body, resp.StatusCode, nil, nil
+	// 成功分支：cancel 所有权交给 idle.Monitor（其 Close 会 cancel；静默超时也会 cancel）。
+	return idle.Monitor(resp.Body, c.IdleTimeout, cancel), resp.StatusCode, nil, nil
 }
 
 // ModelInfo 动态模型信息（含 maxInputTokens/maxOutputTokens）。
@@ -328,6 +365,20 @@ type catalogModel struct {
 	SupportsReasoning  bool `json:"supportsReasoning"`
 	SupportsToolCall   bool `json:"supportsToolCall"`
 	DisabledMultimodal bool `json:"disabledMultimodal"`
+	// reasoning 档位声明（issue #96；形状对齐 Buddy2api/dsh-connect 实测）。
+	// 上游仅对可调档模型给 supportedEfforts；deepseek 系只有单独 effort
+	//（默认档）没有列表 —— 两者都透传，缺失不编造。
+	Reasoning *catalogReasoning `json:"reasoning"`
+}
+
+// catalogReasoning 目录 reasoning 对象（仅取可透传的权威字段）。
+type catalogReasoning struct {
+	SupportedEfforts []string `json:"supportedEfforts"`
+	DefaultEffort    string   `json:"defaultEffort"`
+	// Effort 老式默认档字段（上游 deepseek 系实测：reasoning:{effort:"high"}）；
+	// DefaultEffort 为空时回退取它。
+	Effort             string `json:"effort"`
+	CanDisableThinking bool   `json:"canDisableThinking"`
 }
 
 // FetchModels 调上游动态模型接口。
@@ -351,7 +402,12 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("models api status %d: %s", resp.StatusCode, truncate(string(raw), 120))
+		// 必须返回**类型化**错误（而非裸 fmt.Errorf）：上层靠 errors.As 取分类
+		// 才能走「refresh + 重试」自愈（不变量 19）。裸错误会让模型列表的
+		// 401 自愈永远不生效——本地 expiresAt 仍在未来而上游已拒绝时，
+		// 费率/模型面板只能一直陈旧（见 R79）。
+		return nil, &Error{Kind: Classify(resp.StatusCode, string(raw)), Status: resp.StatusCode,
+			Msg: fmt.Sprintf("models api: %s", truncate(string(raw), 200))}
 	}
 	var env struct {
 		Code int `json:"code"`
@@ -363,10 +419,11 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 				MaxOutputTokens int64  `json:"maxOutputTokens"`
 				Disabled        bool   `json:"disabled"`
 				// 能力字段（国内版目录同样返回，实测可用）
-				SupportsImages     bool `json:"supportsImages"`
-				SupportsReasoning  bool `json:"supportsReasoning"`
-				SupportsToolCall   bool `json:"supportsToolCall"`
-				DisabledMultimodal bool `json:"disabledMultimodal"`
+				SupportsImages     bool              `json:"supportsImages"`
+				SupportsReasoning  bool              `json:"supportsReasoning"`
+				SupportsToolCall   bool              `json:"supportsToolCall"`
+				DisabledMultimodal bool              `json:"disabledMultimodal"`
+				Reasoning          *catalogReasoning `json:"reasoning"`
 			} `json:"models"`
 			Agents []struct {
 				Name   string   `json:"name"`
@@ -400,7 +457,7 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 		if !ok || m.Disabled {
 			continue
 		}
-		out = append(out, ModelInfo{
+		mi := ModelInfo{
 			ID:             m.ID,
 			Name:           m.Name,
 			ContextWindow:  m.MaxInputTokens,
@@ -410,12 +467,35 @@ func (c *Client) FetchModels(a *auth.Auth) ([]ModelInfo, error) {
 			SupportsImages:    m.SupportsImages && !m.DisabledMultimodal,
 			SupportsReasoning: m.SupportsReasoning,
 			SupportsTools:     m.SupportsToolCall,
-		})
+		}
+		// 思考档位（issue #96）：目录 reasoning 对象原样透传，缺失不编造
+		mi.ReasoningEfforts, mi.DefaultReasoningEffort, mi.CanDisableThinking = applyCatalogReasoning(&m)
+		out = append(out, mi)
 	}
 	if len(out) == 0 {
 		return nil, fmt.Errorf("models api returned empty list")
 	}
 	return out, nil
+}
+
+// applyCatalogReasoning 把目录 reasoning 对象投影进 ModelInfo（供任一渠道复用，
+// 字段形状对齐 Buddy2api model_reasoning.py / dsh-connect upstream.ts 实测）。
+// 全部字段缺失时不留任何痕迹（nil/空串），消费方不得把「未声明」当「不支持」。
+func applyCatalogReasoning(m *catalogModel) (efforts []string, def string, canDisable *bool) {
+	if m == nil || m.Reasoning == nil {
+		return nil, "", nil
+	}
+	r := m.Reasoning
+	efforts = provider.CleanEfforts(r.SupportedEfforts)
+	def = strings.TrimSpace(r.DefaultEffort)
+	if def == "" {
+		def = strings.TrimSpace(r.Effort) // 老式默认档字段回退
+	}
+	if efforts == nil && def == "" {
+		return nil, "", nil // reasoning 对象存在但无任何档位信息：整体视为未声明
+	}
+	cd := r.CanDisableThinking
+	return efforts, def, &cd
 }
 
 // UserResource 查询账号当前可花费积分余额（所有套餐 CycleCapacity 聚合，负值钳 0）。
@@ -448,7 +528,7 @@ func (c *Client) UserResourceDetail(a *auth.Auth) (int64, []provider.ResourceIte
 			Remain:   remain,
 			ExpireAt: acct.expireAt(),
 			// 套餐名+到期日组合伪键：上游无显式 ID，同名录包靠周期结束时间区分
-			Key:    fmt.Sprintf("%s|%s", acct.PackageName, acct.expireAt()),
+			Key:    fmt.Sprintf("%s|%s", acct.PackageName, acct.expireDay()),
 			Usable: true, // 国内版无端点分区，所有套餐均可被本工具消耗
 		})
 	}
@@ -496,16 +576,29 @@ func (r resourceAccount) remain() int64 {
 	return remain
 }
 
-// expireAt 把 CycleEndTime 墙钟串转为 YYYY-MM-DD；缺失/不可解析时返回空串。
+// expireAt 把 CycleEndTime 墙钟串转为 **RFC3339 精确时刻**（UTC+8）；缺失/不可解析时返回空串。
+//
+// 历史：旧实现返回 "YYYY-MM-DD"，丢了时分秒（上游格式本身是 "2006-01-02 15:04:05"，
+// 时分秒是有的）。面板要按「N 小时内到期」分桶，必须拿精确时刻
+// （2026-10-19 实测：按日期桶会把今晚失效的包报成「明日到期」）。
+//
+// ⚠ 伪键不要用本函数（会带时刻）：Key 必须用 expireDay() 取日期前缀，否则升级瞬间
+// 每个包一对 expire+earn 假流水（单账号 28 个包 ⇒ 56 条）。
 func (r resourceAccount) expireAt() string {
 	ts := strings.TrimSpace(r.CycleEndTime)
 	if ts == "" {
 		return ""
 	}
 	if t, err := time.ParseInLocation("2006-01-02 15:04:05", ts, softRateResetLoc); err == nil {
-		return t.Format("2006-01-02")
+		return t.Format(time.RFC3339)
 	}
 	return ""
+}
+
+// expireDay 取到期日的**日期前缀**（"YYYY-MM-DD"），专供 ledger 伪键使用。
+// 与 expireAt() 分开的原因见其注释：键要稳定（不含时刻），值要精确（含时刻）。
+func (r resourceAccount) expireDay() string {
+	return provider.ExpireDate(r.expireAt())
 }
 
 // userResourceResp get-user-resource 响应信封。
@@ -548,20 +641,46 @@ func (c *Client) getUserResource(a *auth.Auth) (*userResourceResp, error) {
 
 // DailyCheckin 执行每日签到。已签到（业务 code 非 0）也返回错误，调用方按 msg 区分。
 func (c *Client) DailyCheckin(a *auth.Auth) error {
+	_, err := c.DailyCheckinGrant(a)
+	return err
+}
+
+// dailyCheckinGrant 执行签到并解析上游回执的发放额：credit/today_credit 字段
+// （权威值，见 ref/Buddy2api 同款实现）。供 provider.CheckinGranter 能力接口
+// （issue #67：签到包落在明日到期 key 上且提前 r=0 建档，差分在「发放即消耗」
+// 场景会把当日 earn 抵消为 0；回执值不依赖差分）。解析失败/未回填返回 0，
+// 调用方降级回快照差分口径，不影响签到主流程。
+func (c *Client) DailyCheckinGrant(a *auth.Auth) (granted int64, err error) {
 	log.Printf("workbuddy checkin start uid=%s", a.UID)
 	url := c.billingBase(a) + "/v2/billing/meter/daily-checkin"
 	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader([]byte("{}")))
 	if err != nil {
-		return err
+		return 0, err
 	}
 	BillingHeaders(req, a)
-	_, err = c.doJSONBilling(req)
+	data, err := c.doJSONBilling(req)
 	if err != nil {
 		log.Printf("workbuddy checkin failed uid=%s err=%v", a.UID, err)
-		return err
+		return 0, err
 	}
-	log.Printf("workbuddy checkin success uid=%s", a.UID)
-	return nil
+	// 容忍响应形状差异：credit 字段可能在 data 层或带 today_credit 别名；
+	// JSON 数字可能带小数（Buddy2api 实测 float）。失败吞掉——记账是锦上添花。
+	var env struct {
+		Credit         json.Number `json:"credit"`
+		TodayCredit    json.Number `json:"today_credit"`
+		TodayCheckedIn bool        `json:"today_checked_in"`
+	}
+	if json.Unmarshal(data, &env) == nil {
+		v := env.Credit
+		if v == "" {
+			v = env.TodayCredit
+		}
+		if f, perr := v.Float64(); perr == nil && f > 0 {
+			granted = int64(f) // 积分是整数口径，小数部分是上游表示误差
+		}
+	}
+	log.Printf("workbuddy checkin success uid=%s granted=%d", a.UID, granted)
+	return granted, nil
 }
 
 // Classify 实现 provider.Upstream。
@@ -600,7 +719,9 @@ func (c *Client) FetchModelPricing(a *auth.Auth) ([]provider.ModelPricing, error
 	defer resp.Body.Close()
 	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 	if resp.StatusCode != http.StatusOK {
-		return nil, fmt.Errorf("pricing api status %d: %s", resp.StatusCode, truncate(string(raw), 120))
+		// 同上：类型化错误，否则 RefreshPricing 里的 refreshIfSessionDead 拿不到分类。
+		return nil, &Error{Kind: Classify(resp.StatusCode, string(raw)), Status: resp.StatusCode,
+			Msg: fmt.Sprintf("pricing api: %s", truncate(string(raw), 200))}
 	}
 	var env struct {
 		Code int `json:"code"`

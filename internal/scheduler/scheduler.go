@@ -20,6 +20,10 @@ import (
 )
 
 // Config 调度器依赖。
+//
+// 三个时间字段的零值语义见 New：nil = 未配置（落默认），
+// []int{} = 本渠道没有这类任务（保持为空）。想关掉某类任务却传 nil，
+// 会被静默补上默认时间并每天空跑。
 type Config struct {
 	Pool           *pool.Pool
 	Upstream       provider.Upstream
@@ -41,10 +45,6 @@ type Config struct {
 	// WorkBuddy 国际版使用该模式。
 	ActivitiesOnly bool
 
-	// ExpiringThreshold 临期阈值（config.schedule.expiring_threshold_hours）。
-	// 0 = 24h 兜底。用于签到后计算临期额度（Pick() 的第一排序键）。
-	ExpiringThreshold time.Duration
-
 	// Ledger 积分流水记账器（非 nil 时签到后余额刷新触发差分记账）。
 	Ledger *ledger.Ledger
 }
@@ -57,6 +57,9 @@ type Scheduler struct {
 	onCheckin func(CheckinResult)        // 结果观察器，供 GUI 接收自动签到结果
 	onRefresh func(string, bool, string) // token 刷新结果观察器
 
+	// refreshOverride 仅测试使用：替换 refreshForCheckin 的刷新动作（模拟「刷新也失败」）。
+	refreshOverride func(*auth.Auth, string) error
+
 	// retryMu 保护签到完成状态（自动调度的 Run goroutine 与手动签到并发）。
 	retryMu sync.Mutex
 	// checkinDone 当日已完成签到的时段集合，键为 "YYYY-MM-DD@起始分钟数"。
@@ -67,8 +70,15 @@ type Scheduler struct {
 }
 
 // New 构建。
+//
+// 零值（nil）与显式空切片语义不同，不可混用：
+//   - nil     = 「未配置」→ 落默认（签到 9:00/21:00，保活 22:00）
+//   - []int{} = 「本渠道没有这类定时任务」→ 保持为空，什么都不跑
+//
+// 用 len(...) == 0 判定会把后者一并兜底成默认时间，导致无签到活动、
+// 无 refresh 端点的渠道每天空跑并记录失败。
 func New(cfg Config) *Scheduler {
-	if len(cfg.CheckinMinutes) == 0 {
+	if cfg.CheckinMinutes == nil {
 		if len(cfg.CheckinHours) > 0 {
 			cfg.CheckinMinutes = make([]int, 0, len(cfg.CheckinHours))
 			for _, h := range cfg.CheckinHours {
@@ -80,11 +90,8 @@ func New(cfg Config) *Scheduler {
 			cfg.CheckinMinutes = []int{9 * 60, 21 * 60}
 		}
 	}
-	if len(cfg.KeepaliveHours) == 0 {
+	if cfg.KeepaliveHours == nil {
 		cfg.KeepaliveHours = []int{22}
-	}
-	if cfg.ExpiringThreshold <= 0 {
-		cfg.ExpiringThreshold = 24 * time.Hour
 	}
 	return &Scheduler{cfg: cfg, wake: make(chan struct{}, 1), checkinDone: map[string]bool{}}
 }
@@ -200,11 +207,6 @@ func (s *Scheduler) NextFire() time.Time {
 	return nextFireMinutes(time.Now(), all)
 }
 
-// nextFire 保留旧测试/API语义：hours 为本地小时（0-23）。
-func nextFire(now time.Time, hours []int) time.Time {
-	return nextFireMinutes(now, hoursToMinutes(hours))
-}
-
 func hoursToMinutes(hours []int) []int {
 	out := make([]int, 0, len(hours))
 	for _, h := range hours {
@@ -235,11 +237,22 @@ func nextFireMinutes(now time.Time, minutes []int) time.Time {
 func (s *Scheduler) Run(ctx context.Context) {
 	for {
 		ch, kh := s.schedule()
+		// 该渠道没有任何定时任务（CheckinMinutes/KeepaliveHours 均为显式空切片）：
+		// 直接阻塞等取消或配置变更。此时 nextFireMinutes 返回零值，靠下面的
+		// IsZero 兜底会变成每分钟唤醒一次的空转。
+		if len(ch) == 0 && len(kh) == 0 {
+			select {
+			case <-ctx.Done():
+				return
+			case <-s.wake:
+			}
+			continue
+		}
 		all := append(s.fireMinutes(ch), hoursToMinutes(kh)...)
 		next := nextFireMinutes(time.Now(), all)
 		if next.IsZero() {
-			// 无任何待触发时刻（理论上不会：KeepaliveHours 至少 [22]）。
-			// 兑底睡一分钟，避免零值时间导致 time.NewTimer 立即返回造成忙循环。
+			// 无任何待触发时刻（列表非空但全部越界时才会走到这里）：
+			// 兜底睡一分钟，避免零值时间导致 time.NewTimer 立即返回造成忙循环。
 			next = time.Now().Add(time.Minute)
 		}
 		timer := time.NewTimer(time.Until(next))
@@ -443,13 +456,27 @@ func (s *Scheduler) checkinOne(uid string) CheckinResult {
 	name := s.name()
 	log.Printf("checkin start platform=%s uid=%s", name, uid)
 	a := s.cfg.Pool.AuthByUID(uid)
-	if a == nil || a.RefreshToken == "" {
-		// 无 refresh token 属上游 no_token 状态：仍标可重试（期间用户重新登录即可恢复），
-		// 且该账号会在面板上以失败状态显示，不会静默漏领。
-		return s.finishCheckin(uid, CheckinResult{UID: uid, Msg: "no refresh token", Retryable: true})
+	if a == nil {
+		return s.finishCheckin(uid, CheckinResult{UID: uid, Msg: "unknown account", Retryable: true})
+	}
+	// ⚠️「无凭据」判定**不能只看 refresh token**（2026-10-17 修）。
+	//
+	// loomy / monkeycode / zcode 是**长会话渠道**：凭据本体是 accessToken（monkeycode 的
+	// 签到还另用 ConsoleCookie），上游没有 refresh 端点，故 auth 文件里 refreshToken 刻意留空。
+	// 旧判据 `a.RefreshToken == ""` 把这类账号一律当 no_token 提前返回，于是：
+	//   - 渠道里已实现的签到（monkeycode / loomy）**根本不会被调用** —— 点「签到」只回
+	//     「no refresh token」，看着像上游问题，实际是本地守卫把路挡死了（静默失效、无日志）；
+	//   - 表现为「功能写了却不生效」，是最难查的一类缺陷。
+	// 正确判据：两种凭据都为空，才算真的没有可用凭据。
+	if a.RefreshToken == "" && a.AccessToken == "" {
+		// 仍标可重试（期间用户重新登录即可恢复），面板会以失败状态显示，不会静默漏领。
+		return s.finishCheckin(uid, CheckinResult{UID: uid, Msg: "no credential", Retryable: true})
 	}
 	// 签到前保证 access token 有效；否则仅依赖晚间 keepalive 时，早上的签到可能拿过期 token。
-	if a.NeedsRefresh(2 * time.Hour) {
+	// 但**只有存在 refresh token 才谈得上「刷新」**：长会话渠道没有可刷的东西，跳过这一步
+	//（其 accessToken 若已过期，由渠道自己的 401 / ErrSessionDead 如实报出，比在这里先报
+	// 一个「refresh 失败」更准确）。
+	if a.RefreshToken != "" && a.NeedsRefresh(2*time.Hour) {
 		if err := s.refreshForCheckin(a, uid); err != nil {
 			// 上游把 no_token/刷新失败归为可重试（窗口内再试一次往往就好了）；
 			// 只有 session dead 才不再重试——那需要人工重新登录。
@@ -460,26 +487,44 @@ func (s *Scheduler) checkinOne(uid string) CheckinResult {
 	structured, checkinErr := s.dailyCheckin(a, &r)
 	// 签到接口本身就是令牌有效性验证；若返回 session dead，刷新一次后重试整套签到。
 	// 要求渠道返回类型化的 provider.Error（见 qodercn/qodercom 的 sessionDead）。
+	// sessionDeadSeen 记录「本账号本次 401 自愈也救不回来」：此时才把结果定为终态。
+	// 只判 checkinErr 的类型不够——刷新失败后被 fmt.Errorf %w 包成普通错误，
+	// 会掉进下方「非 session dead 一律可重试」分支，导致 401 在窗口内被反复重试（无效请求）。
+	sessionDeadSeen := false
 	if checkinErr != nil && isSessionDead(checkinErr) {
 		log.Printf("checkin token invalid platform=%s uid=%s, refreshing and retrying", name, uid)
 		if err := s.refreshForCheckin(a, uid); err != nil {
-			checkinErr = fmt.Errorf("token invalid; refresh failed: %w", err)
+			sessionDeadSeen = true
+			checkinErr = fmt.Errorf("登录已失效，请重新登录（refresh failed: %v）", err)
 		} else {
 			structured, checkinErr = s.dailyCheckin(a, &r)
+			sessionDeadSeen = checkinErr != nil && isSessionDead(checkinErr)
 		}
 	}
-	if checkinErr != nil {
-		log.Printf("checkin failed platform=%s uid=%s err=%v", name, uid, checkinErr)
+	if checkinErr != nil && sessionDeadSeen {
+		// 401 是终态（不变式 19：刷新一次仍失效 ⇒ 需人工重新登录）。
+		// 不得透出渠道的中间态文案（如「无可用签到活动」），那会把用户引向错误的重试方向。
+		log.Printf("checkin failed platform=%s uid=%s err=%v (session dead, terminal)", name, uid, checkinErr)
+		r.OK = false
+		r.Retryable = false
 		r.Msg = shortErr(checkinErr)
+	} else if checkinErr != nil {
+		log.Printf("checkin failed platform=%s uid=%s err=%v", name, uid, checkinErr)
+		// 结构化渠道的失败可能伴随一条有用的渠道文案（如 503 的原始响应体），
+		// 未给出时退回错误文本，保证面板永远有可读原因。
+		if r.Msg == "" || !structured {
+			r.Msg = shortErr(checkinErr)
+		}
 		if isAlready(checkinErr) {
 			r.OK = true // 已签到时视为成功状态
 			r.Msg = "已签到"
 			r.Retryable = false // 已签到即当日完成，不得继续重试
-		}
-		// 非 session dead 的失败均可重试（网络抖动/上游 5xx），
-		// session dead 已由上方自愈处理，不在此处重复标记。
-		if !isSessionDead(checkinErr) && !isAlready(checkinErr) {
+		} else {
+			// 未达成（no_campaign / error 等）：失败且窗口内可重试。
+			// OK 必须与 Retryable 取反——两者同时为真会让面板同时显示
+			// 「签到成功」与「暂未领到：无可用签到活动」（2026-10-17 现场 toast）。
 			r.Retryable = true
+			r.OK = false
 		}
 	} else if !structured {
 		// 渠道未给出结构化状态（非 CheckinReporter）：保持旧行为，视为成功。
@@ -512,10 +557,14 @@ func (s *Scheduler) checkinOne(uid string) CheckinResult {
 		}
 	} else {
 		_, unusable := provider.Summarize(items)
-		expiring := provider.ExpiringWithin(items, s.cfg.ExpiringThreshold)
+		// 临期额度（仅展示）与最早到期时刻（Pick 排序键）同一份 items。
+		// 阈值固定 provider.ExpiringDays，R112 起不再可配。
+		now := time.Now()
+		expiring := provider.ExpiringWithinDays(items, provider.ExpiringDays, now)
+		earliest, _ := provider.EarliestExpire(items, now)
 		r.Remain, r.HasRemain = usable, true
-		log.Printf("checkin credits platform=%s uid=%s remain=%d expiring=%d unusable=%d", name, uid, usable, expiring, unusable)
-		s.cfg.Pool.ReenableIfCredits(uid, usable, expiring, unusable)
+		log.Printf("checkin credits platform=%s uid=%s remain=%d expiring=%d unusable=%d earliest=%v", name, uid, usable, expiring, unusable, earliest)
+		s.cfg.Pool.ReenableIfCredits(uid, usable, expiring, unusable, earliest)
 		// 差分记账：与上次快照对比产出 earn/spend/expire 流水
 		if s.cfg.Ledger != nil {
 			s.cfg.Ledger.DiffCredits(name, uid, usable, items)
@@ -532,6 +581,21 @@ func (s *Scheduler) checkinOne(uid string) CheckinResult {
 func (s *Scheduler) dailyCheckin(a *auth.Auth, r *CheckinResult) (structured bool, err error) {
 	rep, ok := s.cfg.Upstream.(provider.CheckinReporter)
 	if !ok {
+		// 回执自带发放额的渠道（workbuddy，issue #67）：走 Grant 变体执行签到并拿权威发放额，
+		// 直接记 earn——这是唯一执行路径，不会重复请求（勿在此之后再调 DailyCheckin）。
+		if g, isG := s.cfg.Upstream.(provider.CheckinGranter); isG {
+			granted, gerr := g.DailyCheckinGrant(a)
+			if gerr == nil && granted > 0 && s.cfg.Ledger != nil {
+				note := "签到奖励"
+				if s.cfg.ActivitiesOnly {
+					note = "活跃保活奖励"
+				}
+				if s.cfg.Ledger.RecordCheckinEarn(s.name(), a.UID, granted, r.Remain, note) {
+					log.Printf("checkin earn recorded platform=%s uid=%s amount=%d (来自签到回执)", s.name(), a.UID, granted)
+				}
+			}
+			return false, gerr
+		}
 		return false, s.cfg.Upstream.DailyCheckin(a)
 	}
 	report, err := rep.DailyCheckinReport(a)
@@ -539,6 +603,18 @@ func (s *Scheduler) dailyCheckin(a *auth.Auth, r *CheckinResult) (structured boo
 	r.Retryable = report.Status.Retryable()
 	if report.Msg != "" {
 		r.Msg = report.Msg
+	}
+	// 结构化渠道也可能在回执里给出权威发放额（如 WorkBuddy 的 CheckinReporter 实现，
+	// issue #147）：与 CheckinGranter 同口径记 earn——否则 issue #67 的「发放即消耗」
+	// 差分归零问题会在 reporter 路径上重现（同一渠道两条路径不能不一致）。
+	if report.Status == provider.CheckinClaimed && report.Amount > 0 && s.cfg.Ledger != nil {
+		note := "签到奖励"
+		if s.cfg.ActivitiesOnly {
+			note = "活跃保活奖励"
+		}
+		if s.cfg.Ledger.RecordCheckinEarn(s.name(), a.UID, report.Amount, r.Remain, note) {
+			log.Printf("checkin earn recorded platform=%s uid=%s amount=%d (来自结构化回执)", s.name(), a.UID, report.Amount)
+		}
 	}
 	return true, err
 }
@@ -570,6 +646,9 @@ func (s *Scheduler) name() string {
 func (s *Scheduler) refreshForCheckin(a *auth.Auth, uid string) error {
 	name := s.name()
 	log.Printf("refresh start platform=%s uid=%s reason=checkin", name, uid)
+	if s.refreshOverride != nil { // 仅测试注入
+		return s.refreshOverride(a, uid)
+	}
 	if err := s.cfg.Upstream.RefreshToken(a); err != nil {
 		log.Printf("refresh failed platform=%s uid=%s err=%v", name, uid, err)
 		return err

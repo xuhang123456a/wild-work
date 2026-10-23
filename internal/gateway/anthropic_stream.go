@@ -118,6 +118,12 @@ func (g *Gateway) streamAnthropic(w http.ResponseWriter, r *http.Request, res *i
 	}
 
 	err := iterateChatSSE(res.Body, func(c chatChunk) error {
+		// 流内错误帧：直接中断，交给下方 err != nil 分支发 Anthropic 规范 error 事件
+		// （修复前该帧被 parseChatSSELine 丢弃 → 走到正常收尾分支 → 客户端看到
+		// end_turn + message_stop，把半截回答当完整回答）。
+		if c.Err != nil {
+			return c.Err
+		}
 		if c.Usage != nil {
 			usage = c.Usage
 		}
@@ -154,11 +160,33 @@ func (g *Gateway) streamAnthropic(w http.ResponseWriter, r *http.Request, res *i
 		return nil
 	})
 	if err != nil {
-		// 流中途失败：补一个收尾事件，避免客户端永久等待
-		_ = emit("error", map[string]any{"type": "error", "error": map[string]any{"type": "api_error", "message": err.Error()}})
+		// 流中途失败：发 Anthropic 规范 error 事件即终止，**不发 message_stop**。
+		//
+		// message_stop 在 Anthropic 协议里等同「正常结束」，客户端会把半截回答
+		// 当成完整回答继续跑（如 agent 拿着截断的 tool_call arguments 去执行）。
+		// error 事件本身就是终止信号，故不再补 message_stop。
+		// 块仍需关闭（协议要求成对），但关闭不会让客户端误判成功。
 		_ = closeThinking()
 		_ = closeText()
-		_ = emit("message_stop", map[string]any{"type": "message_stop"})
+		// error.type 必须是 Anthropic 规范的固定枚举，**不得自造**。
+		//
+		// SDK 的 ErrorObject 是 9 元判别联合（type 为 Literal 标签）：
+		// invalid_request_error / authentication_error / billing_error / permission_error /
+		// not_found_error / rate_limit_error / gateway_timeout_error / api_error / overloaded_error。
+		// 填内层私有码（如 upstream_rate_limited）会让严格客户端判为未知类型；
+		// 官方文档明确「客户端应优雅处理未知 type」——反过来说服务端不得自造。
+		// 内层码保留在 message 里，信息不丢。
+		errType := "api_error"
+		if streamErrKind(err) == streamErrRateLimit {
+			errType = "rate_limit_error" // 限流语义对等的枚举值
+		}
+		_ = emit("error", map[string]any{
+			"type": "error",
+			"error": map[string]any{
+				"type":    errType,
+				"message": err.Error(),
+			},
+		})
 		return
 	}
 

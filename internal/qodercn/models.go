@@ -12,6 +12,7 @@ import (
 	"io"
 	"log"
 	"net/http"
+	"sort"
 	"strings"
 	"sync"
 	"time"
@@ -66,11 +67,82 @@ func (cc contextConfig) windows() []int64 {
 	return out
 }
 
-// modelWire 上游模型表条目：在 ModelEntry 之外带上 context_config。
+// modelWire 上游模型表条目：在 ModelEntry 之外带上 context_config / thinking_config。
 // ModelEntry.ContextWindow 是 json:"-"（上游不直接下发该字段名），只能由此处解析后回填。
 type modelWire struct {
 	ModelEntry
-	ContextConfig json.RawMessage `json:"context_config"`
+	ContextConfig  json.RawMessage `json:"context_config"`
+	ThinkingConfig json.RawMessage `json:"thinking_config"`
+}
+
+// thinkingConfig 上游思考能力声明：{"disabled":{...},"enabled":{"efforts":{档位:{...}},"is_default":bool}}。
+// 档位表决定「客户端能选哪些值」，is_default 标出上游默认档。
+type thinkingConfig struct {
+	Enabled *struct {
+		Efforts map[string]struct {
+			IsDefault bool `json:"is_default"`
+		} `json:"efforts"`
+		IsDefault bool `json:"is_default"`
+	} `json:"enabled"`
+}
+
+// parseThinkingConfig 解析 thinking_config → (全部档位, 默认档)。
+// 与 context_config 同策略：RawMessage 承接，形状不符只损失本字段，不让整批模型解析失败。
+// 档位顺序按「低→高」的固定优先级排序（上游是 map，无序）。
+func (w modelWire) parseThinkingConfig() ([]string, string) {
+	if len(w.ThinkingConfig) == 0 {
+		return nil, ""
+	}
+	var tc thinkingConfig
+	if err := json.Unmarshal(w.ThinkingConfig, &tc); err != nil || tc.Enabled == nil {
+		return nil, ""
+	}
+	if len(tc.Enabled.Efforts) == 0 {
+		return nil, ""
+	}
+	efforts := make([]string, 0, len(tc.Enabled.Efforts))
+	def := ""
+	for name, cfg := range tc.Enabled.Efforts {
+		if name == "" {
+			continue
+		}
+		efforts = append(efforts, name)
+		if cfg.IsDefault {
+			def = name
+		}
+	}
+	if len(efforts) == 0 {
+		return nil, ""
+	}
+	sortEfforts(efforts)
+	// 档位表未标 is_default 时，回退到 enabled.is_default 指向的档（上游两处会同时标）。
+	if def == "" {
+		def = efforts[len(efforts)-1]
+	}
+	return efforts, def
+}
+
+// effortRank 档位由低到高的固定序：上游 efforts 是 map，解析顺序随机，
+// 必须按语义排序才能给客户端稳定的下拉框顺序。未知档位排在已知档位之后（按字典序）。
+var effortRank = map[string]int{
+	"minimal": 0, "low": 1, "medium": 2, "high": 3, "xhigh": 4, "max": 5, "ultra": 6,
+}
+
+func sortEfforts(efforts []string) {
+	sort.SliceStable(efforts, func(i, j int) bool {
+		ri, iok := effortRank[efforts[i]]
+		rj, jok := effortRank[efforts[j]]
+		switch {
+		case iok && jok:
+			return ri < rj
+		case iok:
+			return true
+		case jok:
+			return false
+		default:
+			return efforts[i] < efforts[j]
+		}
+	})
 }
 
 // parseContextConfig 解析 context_config → (默认档, 全部档位)。
@@ -84,12 +156,6 @@ func (w modelWire) parseContextConfig() (int64, []int64) {
 		return 0, nil
 	}
 	return cc.tokenCount(), cc.windows()
-}
-
-// contextWindow 解析 context_config 得到默认档上下文窗口（兼容旧调用点）。
-func (w modelWire) contextWindow() int64 {
-	def, _ := w.parseContextConfig()
-	return def
 }
 
 // parseDynamicModels 解析模型列表响应：assistant→developer→chat 三级回退。
@@ -110,6 +176,7 @@ func parseDynamicModels(apiResp map[string]json.RawMessage) ([]ModelEntry, error
 			}
 			m := w.ModelEntry
 			m.ContextWindow, m.AvailableWindows = w.parseContextConfig() // 默认档 + 全档位
+			m.ReasoningEfforts, m.DefaultReasoningEffort = w.parseThinkingConfig()
 			enabled = append(enabled, m)
 		}
 		if len(enabled) > 0 {
@@ -212,7 +279,10 @@ func (c *Client) FetchModels(a *auth.Auth) ([]provider.ModelInfo, error) {
 	return toModelInfos(dyn), nil
 }
 
-// toModelInfos 动态表 → provider.ModelInfo（含 context_config 解析与 max_output 推导）。
+// toModelInfos 动态表 → provider.ModelInfo（含 context_config 解析）。
+// 旧注释声称的「max_output 推导」系遗留失实：上游模型接口从不下发输出上限字段
+// （2026-10-13 COSY 实测 9 场景全部条目仅有 max_input_tokens，无任何 max_output 类键），
+// 故 MaxTokens 恒为 0——这是「不编造」原则下的正确行为，非缺陷。
 func toModelInfos(dyn []ModelEntry) []provider.ModelInfo {
 	mm := make(map[string]string, len(dyn))
 	out := make([]provider.ModelInfo, 0, len(dyn))
@@ -229,6 +299,10 @@ func toModelInfos(dyn []ModelEntry) []provider.ModelInfo {
 			// is_vl 即上游的视觉能力声明；is_reasoning 为思考模式。
 			SupportsImages:    m.IsVL,
 			SupportsReasoning: m.IsReasoning,
+			// 思考档位：上游 thinking_config.enabled.efforts 声明什么就透什么，
+			// 未声明则留空（客户端不显示档位选择器）。
+			ReasoningEfforts:       m.ReasoningEfforts,
+			DefaultReasoningEffort: m.DefaultReasoningEffort,
 		}
 		// 上下文窗口：广告宁高勿低——max(档位表) > is_default 档 > max_input_tokens
 		// （与 resolveContextWindow 默认档一致，对齐 workbuddy2api 口径）

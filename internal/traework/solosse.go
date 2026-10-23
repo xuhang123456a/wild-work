@@ -28,16 +28,18 @@ import (
 	"encoding/json"
 	"fmt"
 	"io"
+	"log"
 	"net/http"
 	"strings"
 	"time"
 
+	"wild-work/internal/loopguard"
 	"wild-work/internal/provider"
 )
 
 // SOLOEvent 单条 SOLO SSE 事件（归一化）。
 type SOLOEvent struct {
-	Event        string          // metadata | timing_cost | output | extra_info | token_usage | done | error
+	Event        string          // metadata | timing_cost | output | extra_info | token_usage | done | error | queue_begin | request_wait_in_queue
 	Response     string          // output: content 增量
 	Reasoning    string          // output: 思考链增量
 	ToolCalls    json.RawMessage // output: 工具调用（null 或对象/数组）
@@ -45,6 +47,7 @@ type SOLOEvent struct {
 	FinishReason string          // done
 	ErrorCode    int64           // error
 	ErrorMessage string          // error
+	QueuePos     int64           // request_wait_in_queue: 上游排队位置（拥塞观测用）
 }
 
 // SOLOStreamError 上游 SSE 流内的业务错误（event:error）。非流式聚合时返回，
@@ -58,10 +61,26 @@ func (e *SOLOStreamError) Error() string {
 	return fmt.Sprintf("solo error code=%d msg=%s", e.Code, e.Msg)
 }
 
-// Kind 将 SSE 流内错误分类。1005 → provider.ErrHardCredit；其余归 provider.ErrClient。
+// Kind 将 SSE 流内错误分类。
+//
+//	1005 → provider.ErrHardCredit（权益/余额不足 → 长冷却）
+//	3004 / 9074 → provider.ErrSoftRate（限流 → 短冷却）
+//	其余 → provider.ErrClient
+//
+// 3004 归软限流的依据（**按 R23b：这是待强化的假设，不是既成事实**）：
+// 2026-09-29 09:00 checkin 路径的观察——同一秒、同一 IP 下 8 个 traework 账号中
+// 仅 1 个（1606848467182378）返回 3004，其余 7 个 ok。该观察**足以排除 IP/全局级**
+// 限流，但**不足以证明是账号级**：样本仅 1 例、且是 checkin 路径（非本修复作用的
+// 对话流）。要坐实需补「同号连续 N 次稳定 3004 + 换号立即成功」的配对观测。
+//
+// 之所以仍按「账号级」处置：软冷却只有 60 秒，即使判据不成立，最坏影响也只是
+// 某账号闲置一分钟（风险不对称），不会造成危害。详见 AGENTS.md R39。
 func (e *SOLOStreamError) Kind() provider.ErrKind {
-	if e.Code == 1005 {
+	switch e.Code {
+	case 1005:
 		return provider.ErrHardCredit
+	case 3004, 9074:
+		return provider.ErrSoftRate
 	}
 	return provider.ErrClient
 }
@@ -99,6 +118,12 @@ func ParseSOLOLine(eventName, dataLine string) (*SOLOEvent, error) {
 		}
 		if v, ok := raw["message"].(string); ok {
 			ev.ErrorMessage = v
+		}
+	case "queue_begin", "request_wait_in_queue":
+		// 上游拥塞排队心跳：position 递减。透传给日志观测（限频由消费方控制）。
+		// queue_begin 帧无 position 字段（QueuePos=0），消费方应跳过或等首条心跳。
+		if v, ok := raw["position"].(float64); ok {
+			ev.QueuePos = int64(v)
 		}
 	}
 	return ev, nil
@@ -140,10 +165,6 @@ func scanLine(st *sseState, line string) *SOLOEvent {
 	return nil
 }
 
-// Aggregate 读取完整 SOLO SSE，聚合 response + reasoning + tool_calls + usage，
-// 产出单个 OpenAI chat.completion（非流式）。model 为回填的客户端模型名。
-func Aggregate(r io.Reader) (map[string]any, error) { return AggregateWithModel(r, "") }
-
 // AggregateWithModel 同 Aggregate，额外把 model 回填到响应（上游 SOLO 事件不带模型名）。
 func AggregateWithModel(r io.Reader, model string) (map[string]any, error) {
 	br := bufio.NewReaderSize(r, 64*1024)
@@ -158,6 +179,20 @@ func AggregateWithModel(r io.Reader, model string) (map[string]any, error) {
 		upstreamErr  error
 	)
 	st := &sseState{}
+	// 排队心跳限频：首条 + 每 30s 一条（与 streamOpts 同策略）。
+	var lastQueueLog time.Time
+	queueFirst := true
+	logQueue := func(pos int64) {
+		if pos <= 0 {
+			return // queue_begin 无 position，跳过，等首条真实心跳
+		}
+		now := time.Now()
+		if queueFirst || now.Sub(lastQueueLog) >= 30*time.Second {
+			log.Printf("solo queue congested model=%s position=%d", model, pos)
+			queueFirst = false
+			lastQueueLog = now
+		}
+	}
 	for {
 		line, err := br.ReadString('\n')
 		if err != nil && err != io.EOF {
@@ -181,6 +216,8 @@ func AggregateWithModel(r io.Reader, model string) (map[string]any, error) {
 				}
 			case "error":
 				upstreamErr = &SOLOStreamError{Code: ev.ErrorCode, Msg: ev.ErrorMessage}
+			case "queue_begin", "request_wait_in_queue":
+				logQueue(ev.QueuePos)
 			}
 		}
 		if err == io.EOF {
@@ -222,6 +259,11 @@ func AggregateWithModel(r io.Reader, model string) (map[string]any, error) {
 		},
 	}
 	if usage != nil {
+		// 缓存计量归一化（issue #104）：trae 上游下发的是 Anthropic 字段名
+		// （cache_read_input_tokens / cache_creation_input_tokens），下游按 OpenAI 规范
+		// 解析（prompt_tokens_details.cached_tokens ?? prompt_cache_hit_tokens）两条都读不到
+		// ⇒ 命中率恒 0%、费用高估。此处补 OpenAI 形状子字段，原始字段保留。
+		provider.NormalizeUsageShape(usage)
 		resp["usage"] = usage
 	}
 	return resp, nil
@@ -307,23 +349,9 @@ func sortInts(a []int) {
 	}
 }
 
-// Stream 流式转换：SOLO SSE → OpenAI SSE chunk，每 chunk flush，保证至少一个 [DONE]。
-// 调用方必须先设置过 status 200；本函数自设 SSE headers。
-func Stream(w http.ResponseWriter, r io.Reader) error {
-	_, err := streamOpts(w, r, nil, "", nil)
-	return err
-}
-
 // StreamWithModel 同 Stream，额外把 model 回填到每个 chunk（上游 SOLO 事件不带模型名）。
 func StreamWithModel(w http.ResponseWriter, r io.Reader, model string) (map[string]any, error) {
 	return streamOpts(w, r, nil, model, nil)
-}
-
-// StreamWithError 同 Stream，额外在遇到上游 event:error 时回调 onErr（非 nil），
-// 供调用方冷却账号/记录日志；错误信息同时注入 SSE 事件流。
-func StreamWithError(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)) error {
-	_, err := streamOpts(w, r, onErr, "", nil)
-	return err
 }
 
 // streamOpts Stream 的可选参数版本；onUsage 非 nil 时回调 token_usage 事件的 usage。
@@ -340,6 +368,25 @@ func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)
 	var pendingUsage map[string]any
 	sawDone := false
 	st := &sseState{}
+	// 思考链死循环守卫（发癫检测）：仅在全局启用时创建。命中即中断、不罚账号。
+	var guard *loopguard.Guard
+	if loopguard.Enabled() {
+		guard = loopguard.NewDefault()
+	}
+	// 排队心跳限频：首条 + 每 30s 一条，避免长时间拥塞时刷屏。
+	var lastQueueLog time.Time
+	queueFirst := true
+	logQueue := func(pos int64) {
+		if pos <= 0 {
+			return // queue_begin 无 position，跳过，等首条真实心跳
+		}
+		now := time.Now()
+		if queueFirst || now.Sub(lastQueueLog) >= 30*time.Second {
+			log.Printf("solo queue congested model=%s position=%d", model, pos)
+			queueFirst = false
+			lastQueueLog = now
+		}
+	}
 	writeChunk := func(delta map[string]any, finish string) error {
 		chunk := map[string]any{
 			"id":      id,
@@ -389,6 +436,20 @@ func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)
 		if ev := scanLine(st, strings.TrimRight(line, "\r\n")); ev != nil {
 			switch ev.Event {
 			case "output":
+				// 思考链死循环守卫：只在 reasoning_content 非空时喂入（无思维链的
+				// 模型/配置不经过守卫，零开销零误伤）。命中即中断、不罚账号。
+				if guard != nil && ev.Reasoning != "" {
+					if hit := guard.Push(ev.Reasoning); hit != nil {
+						gerr := &loopguard.Error{Hit: *hit}
+						frame := "data: " + loopguard.ErrorFrameJSON(hit) + "\n\n"
+						if _, werr := io.WriteString(w, frame); werr != nil {
+							log.Printf("traework reasoning loop error frame write failed: %v", werr)
+						} else if fl != nil {
+							fl.Flush()
+						}
+						return usage, gerr
+					}
+				}
 				delta := map[string]any{}
 				if ev.Response != "" {
 					delta["content"] = ev.Response
@@ -420,11 +481,25 @@ func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)
 					}
 				}
 			case "token_usage":
+				// 缓存计量归一化（issue #104）放在**捕获点**而非写出点：这样
+				// onUsage 回调、返回给调用方的 usage、以及「不含 done 的异常收尾」
+				// 三条路径都拿到 OpenAI 形状（trae 上游给的是 Anthropic 字段名）。
+				// （本地旧 mirrorCacheReadToOpenAI 是其子集，合并时摘除。）
+				if ev.Usage != nil {
+					provider.NormalizeUsageShape(ev.Usage)
+				}
 				pendingUsage = ev.Usage
 				if onUsage != nil && ev.Usage != nil {
 					onUsage(ev.Usage)
 				}
+			case "queue_begin", "request_wait_in_queue":
+				logQueue(ev.QueuePos)
 			case "done":
+				// 必须先取再写：writeChunk 会消费 pendingUsage（附加进 chunk 后置
+				// nil），SOLO 协议 token_usage 先于 done 到达，先 writeChunk 再
+				// 取值会永远拿到 nil → 记账流水丢失 token（客户端不受影响，
+				// usage 已透传；仅网关自身统计为空）。
+				usage = pendingUsage
 				if err := writeChunk(map[string]any{}, ev.FinishReason); err != nil {
 					return usage, err
 				}
@@ -432,23 +507,48 @@ func streamOpts(w http.ResponseWriter, r io.Reader, onErr func(*SOLOStreamError)
 					return usage, err
 				}
 				sawDone = true
-				usage = pendingUsage
 			case "error":
-				// 上游 SOLO 业务错误（1005 权益/1001 模型不可用等）：
-				// 以标准 OpenAI SSE chunk 的 delta.content 返回错误描述，
-				// finish_reason 设为 error 避免客户端持续等待。
+				// 上游 SOLO 业务错误（1005 权益 / 1001 模型不可用 / 3004 限流 …）。
+				//
+				// 旧实现把它写成 delta.content 文本 + finish_reason:"stop" + 补 [DONE]，
+				// 客户端看到的是「正常结束、内容莫名其妙」，agent 会拿着半截回答继续跑；
+				// 且函数返回 nil，调用方无从得知失败。这与上游 issue #42 修的是同一类
+				// 「把失败伪装成成功收尾」问题（当时只覆盖了 qwenwork/qoder 系，漏了 traework）。
+				//
+				// 现改为（对齐 #42）：发一帧 OpenAI 规范 error，**不补 [DONE]**，
+				// 并把错误返回给调用方 —— 由 handler 据此冷却账号、打破粘性路由，
+				// 使客户端重试时能挑到别的账号（3004 是账号级限流，换号有效）。
 				se := &SOLOStreamError{Code: ev.ErrorCode, Msg: ev.ErrorMessage}
 				if onErr != nil {
 					onErr(se)
 				}
-				msg := fmt.Sprintf("solo error code=%d msg=%s", ev.ErrorCode, ev.ErrorMessage)
-				if err := writeChunk(map[string]any{"content": msg}, "stop"); err != nil {
-					return usage, err
+				// 防御分支：若 done 已发过 [DONE]，流在本客户端看来已正常终止，
+				// 此时再写 error 帧会造成「两个终止信号」（严格客户端行为未定义）。
+				// 故只记日志并把错误返回给调用方（账号照常冷却），不再写第二帧。
+				// 上游理论上不会 done→error，此处纯防御。
+				if sawDone {
+					log.Printf("traework stream error after done code=%d msg=%s（已终止，不再发 error 帧）",
+						se.Code, se.Msg)
+					return usage, se
 				}
-				if err := writeDONE(); err != nil {
-					return usage, err
+				code := "upstream_error"
+				if se.Kind() == provider.ErrSoftRate {
+					code = "upstream_rate_limited"
 				}
-				sawDone = true
+				frame := fmt.Sprintf(`{"error":{"message":%s,"type":"upstream_error","code":%s}}`,
+					jsonEscape(se.Error()), jsonEscape(code))
+				// 写入失败（客户端已断开）时**仍返回业务错误**：调用方要据此冷却账号，
+				// 若改成返回 werr 会丢掉 *SOLOStreamError，errors.As 取不到分类，
+				// 账号就不会被冷却——本次修复的目标链路恰好断在这里。
+				if _, werr := io.WriteString(w, "data: "+frame+"\n\n"); werr != nil {
+					log.Printf("traework stream error frame write failed uid-less code=%d: %v", se.Code, werr)
+				} else if fl != nil {
+					fl.Flush()
+				}
+				// 刻意不写 [DONE]：终止信号交给 error 帧，避免被当成正常收尾。
+				// （若上游在本帧之前已发过 done，则 [DONE] 已写出、此处不再补第二个——
+				// 两个终止信号会让严格客户端行为未定义。此顺序上游理论上不会发，仅防御。）
+				return usage, se
 			}
 		}
 		if err == io.EOF {

@@ -11,17 +11,19 @@ import (
 	"time"
 
 	"wild-work/internal/auth"
+	"wild-work/internal/idle"
 	"wild-work/internal/provider"
 )
 
 var sessionDeadMarkers = []string{"login", "token 失效", "token invalid", "session", "unauthorized", "401"}
 
 // Classify 按 HTTP 状态码 + body 判定错误类别。
+// 状态码优先于 body 硬余额标记：429/401 的响应体也会携带业务码 1005
+// （上游报错格式不受本端控制），先判 1005 会把限流/登录失效误判成硬余额、
+// 触发 12h 硬冷却，且 401 会绕过自愈重登——对齐 qodercn/qodercom/qwenwork
+// 的「状态码 → hard 标记」判定顺序。
 func Classify(status int, body string) provider.ErrKind {
 	lower := strings.ToLower(body)
-	if strings.Contains(body, `"code":1005`) || (strings.Contains(body, "1005") && strings.Contains(lower, "plan")) {
-		return provider.ErrHardCredit
-	}
 	if status == http.StatusUnauthorized {
 		for _, m := range sessionDeadMarkers {
 			if strings.Contains(lower, strings.ToLower(m)) {
@@ -32,6 +34,9 @@ func Classify(status int, body string) provider.ErrKind {
 	}
 	if status == http.StatusTooManyRequests {
 		return provider.ErrSoftRate
+	}
+	if strings.Contains(body, `"code":1005`) || (strings.Contains(body, "1005") && strings.Contains(lower, "plan")) {
+		return provider.ErrHardCredit
 	}
 	if status == http.StatusNotFound {
 		return provider.ErrNotFound
@@ -57,6 +62,9 @@ type Client struct {
 	PricingHost       string
 	ClientID          string
 	CheckinRetryDelay time.Duration // 9074 限流后的重试等待；生产默认 8s
+	// IdleTimeout 聊天 SSE 流中空闲超时（StreamHTTP 无总时长上限，靠本字段兜底
+	// 「上游中途卡死」）。<=0 表示禁用（测试用）。
+	IdleTimeout time.Duration
 
 	// Function 对话/模型列表接口的 function 值（solo_work_lite / solo_agent）。
 	Function string
@@ -70,7 +78,7 @@ type Client struct {
 
 func New() *Client {
 	tr := &http.Transport{MaxIdleConns: 100, MaxIdleConnsPerHost: 20, IdleConnTimeout: 90 * time.Second, ResponseHeaderTimeout: 120 * time.Second}
-	return &Client{HTTP: &http.Client{Timeout: 120 * time.Second, Transport: tr}, StreamHTTP: &http.Client{Transport: tr}, AgentHost: AgentHost, UgHost: UgHost, OAuthHost: OAuthHost, PricingHost: WorkHost, ClientID: ClientID, CheckinRetryDelay: 8 * time.Second, Function: Function, PricingFunctions: PricingFunctionsWork, PricingChannel: "traework", PricingPrimary: PricingPrimaryWork}
+	return &Client{HTTP: &http.Client{Timeout: 120 * time.Second, Transport: tr}, StreamHTTP: &http.Client{Transport: tr}, AgentHost: AgentHost, UgHost: UgHost, OAuthHost: OAuthHost, PricingHost: WorkHost, ClientID: ClientID, CheckinRetryDelay: 8 * time.Second, IdleTimeout: idle.DefaultTimeout, Function: Function, PricingFunctions: PricingFunctionsWork, PricingChannel: "traework", PricingPrimary: PricingPrimaryWork}
 }
 
 // NewTraeCode 返回 TraeCode（代码版）专用 Client：function=solo_agent。
@@ -201,30 +209,85 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status
 		return nil, 0, nil, err
 	}
 	SOLOHeaders(req, a, true)
+	req, cancel := idle.WithCancel(req)
 	hc := c.HTTP
 	if c.StreamHTTP != nil {
 		hc = c.StreamHTTP
 	}
 	resp, err := hc.Do(req)
 	if err != nil {
+		cancel()
 		log.Printf("traework chat_stream uid=%s: transport error: %v", a.UID, err)
 		return nil, 0, nil, err
 	}
 	if resp.StatusCode >= 400 {
+		cancel()
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
 		kind := Classify(resp.StatusCode, string(raw))
 		log.Printf("traework chat_stream uid=%s: upstream %d %s body=%s", a.UID, resp.StatusCode, kind, truncate(string(raw), 200))
 		return nil, resp.StatusCode, raw, nil
 	}
-	return resp.Body, resp.StatusCode, nil, nil
+	// 成功分支：cancel 所有权交给 idle.Monitor（其 Close 会 cancel；静默超时也会 cancel）。
+	return idle.Monitor(resp.Body, c.IdleTimeout, cancel), resp.StatusCode, nil, nil
 }
 
 func (c *Client) FetchModels(a *auth.Auth) ([]provider.ModelInfo, error) {
 	// traework 上游 llm_utils_chat 强制 stream=true（见 PrepareBody），
 	// 所有模型均为流式模式；非流式请求由本地 Aggregate() 缓冲 SSE 后聚合。
-	// mode_type=nil 返回全部配置，按 config_name 去重避免流式/非流式重复。
-	body := map[string]any{"function": c.Function, "config_names": nil, "need_prompt": false, "current_config_info": nil, "poly_prompt": true, "mode_type": nil, "agent_type": nil}
+	//
+	// 双池合并：get_detail_param 的目录不保证按 function 过滤，而 chat 按
+	// function 选池——只拉本渠道池会出现「列表里有、调用 4001」的错位。
+	// 故两个池都拉一遍（先本渠道池、后另一池），按 config_name 先到先得
+	// 去重，并把每个模型记入其实际归属池（PrepareBody 据此覆盖 function）。
+	// 本渠道池失败照旧报错；另一池失败只记日志、用本渠道池结果继续。
+	seen := make(map[string]bool, 64)
+	out := make([]provider.ModelInfo, 0, 64)
+	// 顺序固定：本渠道池先到先得（归属登记与去重都吃顺序），不能用 map 遍历。
+	pools := []string{c.Function, otherFunction(c.Function)}
+	for i, fn := range pools {
+		primary := i == 0
+		list, err := c.fetchModelsForPool(a, fn)
+		if err != nil {
+			if primary {
+				return nil, err
+			}
+			log.Printf("traework models: %s 池拉取失败（继续用 %s 池结果）: %v", fn, c.Function, err)
+			continue
+		}
+		for _, cfg := range list {
+			name := strings.TrimSpace(cfg.ConfigName)
+			if name == "" || seen[name] {
+				continue
+			}
+			// 跳过自定义模型：部分模型上游不返回 is_custom_model，直接用前缀匹配兜底
+			if cfg.DisplayConfig.IsCustomModel || strings.HasPrefix(name, "custom_model_") {
+				log.Printf("traework skip custom model: %s", name)
+				continue
+			}
+			seen[name] = true
+			recordModelFunc(name, fn)
+			ctx, maxTok, images, fromAPI := cfg.metaOf()
+			out = append(out, provider.ModelInfo{
+				ID:             name,
+				Name:           cfg.DisplayConfig.DisplayName,
+				ContextWindow:  ctx,
+				MaxTokens:      maxTok,
+				SupportsImages: images,
+				ContextFromAPI: fromAPI,
+			})
+		}
+	}
+	if len(out) == 0 {
+		return nil, fmt.Errorf("models api returned empty list")
+	}
+	return out, nil
+}
+
+// fetchModelsForPool 拉取单个 function 池的模型配置（mode_type=nil 返回全部，
+// 按 config_name 去重避免流式/非流式重复——池内去重，跨池去重在 FetchModels）。
+func (c *Client) fetchModelsForPool(a *auth.Auth, function string) ([]poolEntry, error) {
+	body := map[string]any{"function": function, "config_names": nil, "need_prompt": false, "current_config_info": nil, "poly_prompt": true, "mode_type": nil, "agent_type": nil}
 	raw, _ := json.Marshal(body)
 	req, err := http.NewRequest(http.MethodPost, c.agentBase()+EpModels, bytes.NewReader(raw))
 	if err != nil {
@@ -236,38 +299,72 @@ func (c *Client) FetchModels(a *auth.Auth) ([]provider.ModelInfo, error) {
 		return nil, err
 	}
 	var resp struct {
-		ConfigInfoList []struct {
-			ConfigName    string `json:"config_name"`
-			DisplayConfig struct {
-				DisplayName   string `json:"display_name"`
-				IsCustomModel bool   `json:"is_custom_model"` // 自定义模型（第三方代理）需额外授权
-			} `json:"display_config"`
-		} `json:"config_info_list"`
+		ConfigInfoList []poolEntry `json:"config_info_list"`
 	}
 	if err := json.Unmarshal(data, &resp); err != nil {
 		return nil, fmt.Errorf("models parse: %w", err)
 	}
-	// 按 config_name 去重：上游可能为同一模型返回流式/非流式两条配置。
-	// 过滤掉 is_custom_model=true 或 config_name 以 custom_model_ 开头的自定义模型（第三方代理，需额外授权）
-	seen := make(map[string]bool, len(resp.ConfigInfoList))
-	out := make([]provider.ModelInfo, 0, len(resp.ConfigInfoList))
-	for _, cfg := range resp.ConfigInfoList {
-		name := strings.TrimSpace(cfg.ConfigName)
-		if name == "" || seen[name] {
-			continue
-		}
-		// 跳过自定义模型：部分模型上游不返回 is_custom_model，直接用前缀匹配兜底
-		if cfg.DisplayConfig.IsCustomModel || strings.HasPrefix(name, "custom_model_") {
-			log.Printf("traework skip custom model: %s", name)
-			continue
-		}
-		seen[name] = true
-		out = append(out, provider.ModelInfo{ID: name, Name: cfg.DisplayConfig.DisplayName})
+	return resp.ConfigInfoList, nil
+}
+
+// poolEntry 单池目录条目（get_detail_param）。
+//
+// 上游实测（2026-10-13，HTTP 200/1.35MB/71 条）下发的元数据远多于本工具此前的解析：
+//   - context_window_tokens.dev / .max —— 上下文档位（两档；部分模型 max 缺省甚至 dev 缺省）
+//   - display_config.multimodal         —— 图像输入能力
+//   - model_detail_list[].max_tokens    —— 输出上限
+//   - display_config.model_capability   —— reasoning_model / chat_model
+//
+// 此前只取 config_name + display_name，导致 traework/traecode 全部 118 个模型在
+// /v1/models 上既无 context_length 也无 max_output_tokens、图片能力恒为 false。
+// 与官方池「模型面绑死上游」的口径一致：这里只补元数据，不增删模型。
+//
+// 两个容量字段用 json.RawMessage 承接（同 qodercn.parseContextConfig 的手法）：它们
+// 只是展示用元数据，若上游把形状从对象改成标量/数组，强类型结构会让**整张目录**
+// 解析失败（fetchModelsForPool 报错 → 本渠道池整体拉不到）。形状突变时只丢元数据。
+type poolEntry struct {
+	ConfigName    string          `json:"config_name"`
+	ContextWindow json.RawMessage `json:"context_window_tokens"` // 形状 {"dev":n,"max":n}
+	DisplayConfig struct {
+		DisplayName   string `json:"display_name"`
+		IsCustomModel bool   `json:"is_custom_model"` // 自定义模型（第三方代理）需额外授权
+		Multimodal    bool   `json:"multimodal"`      // 图像输入能力（上游声明）
+	} `json:"display_config"`
+	ModelDetailList json.RawMessage `json:"model_detail_list"` // 形状 [{"max_tokens":n},...]
+}
+
+// metaOf 把上游池条目的元数据折算为 ModelInfo 的容量/能力字段。
+//
+// 口径（对齐 provider.ModelInfo 的「不编造」原则）：
+//  1. ContextWindow 取 max 档；max 为 0 时回落 dev；两者皆 0 则**不填**（保持未知，
+//     消费方据 ContextFromAPI 判断来源，面板不把未知当确定值展示）。
+//  2. MaxTokens 取 model_detail_list[0].max_tokens（上游每条模型组只有一组参数）；
+//     为 0 则**不填**。
+//  3. SupportsImages 直接取 display_config.multimodal —— 上游明确声明的布尔值，
+//     与 workbuddyai 的 imageOK() 同源语义（已确认 true 才置 true）。
+//  4. ContextFromAPI 仅在确实解析到上游容量字段时置 true。
+//
+// 两处 Unmarshal 失败（含字段缺失/为 null/形状突变）一律静默跳过：元数据是增量信息。
+func (e *poolEntry) metaOf() (ctx, maxTok int64, images, fromAPI bool) {
+	var cw struct {
+		Dev int64 `json:"dev"` // 开发档（通常 200000）
+		Max int64 `json:"max"` // 最大档（可能缺省为 0）
 	}
-	if len(out) == 0 {
-		return nil, fmt.Errorf("models api returned empty list")
+	if json.Unmarshal(e.ContextWindow, &cw) == nil {
+		ctx = cw.Max
+		if ctx == 0 {
+			ctx = cw.Dev
+		}
 	}
-	return out, nil
+	var dl []struct {
+		MaxTokens int64 `json:"max_tokens"`
+	}
+	if json.Unmarshal(e.ModelDetailList, &dl) == nil && len(dl) > 0 && dl[0].MaxTokens > 0 {
+		maxTok = dl[0].MaxTokens
+	}
+	images = e.DisplayConfig.Multimodal
+	fromAPI = ctx > 0 || maxTok > 0
+	return
 }
 
 // FetchModelPricing 从 /api/remote/v1/models 拉取模型积分倍率。
@@ -290,9 +387,14 @@ func (c *Client) FetchModelPricing(a *auth.Auth) ([]provider.ModelPricing, error
 		return nil, err
 	}
 	defer resp.Body.Close()
-	raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
+	// 8MB 上限（本地补丁 0005）：与 doJSON 同步放宽——模型定价列表随模型数膨胀，防同类截断。
+	// 多读 1 字节判定超限：超限时显式报错，而非截成半截后由 json.Unmarshal 误报语法错误（对齐 doJSON）。
+	raw, _ := io.ReadAll(io.LimitReader(resp.Body, maxJSONBody+1))
 	if resp.StatusCode >= 400 {
 		return nil, fmt.Errorf("trae pricing api status %d: %s", resp.StatusCode, truncate(string(raw), 120))
+	}
+	if len(raw) > maxJSONBody {
+		return nil, fmt.Errorf("traework: pricing response body exceeds %d bytes", maxJSONBody)
 	}
 	var env struct {
 		Code int `json:"code"`
@@ -651,11 +753,19 @@ func (c *Client) UserResourceDetail(a *auth.Auth) (int64, []provider.ResourceIte
 }
 
 // unixDate 把上游 Unix 秒转为 UTC+8 的 YYYY-MM-DD；0/负值（上游未下发到期时间）返回空串。
+// unixDate 把 Unix 秒转为 **RFC3339 精确时刻**（UTC+8）；sec<=0（上游表示无到期）返回空串。
+//
+// 历史：旧实现返回 "YYYY-MM-DD"，丢了时分秒。traework 的每日签到 expire_time
+// 实测是次日 "00:00:0x"（零点后几秒），而每月登录积分是 "23:59:59"——两种都有。
+// 截断成日期后两者长得一样，面板无法区分「今晚就死」和「明晚才死」
+// （2026-10-19 实测）。现在保留完整时刻供剩余时长分桶。
+//
+// 注：ledger 伪键用 entitlement_id（真 ID，不含日期），故本改动零抖动。
 func unixDate(sec int64) string {
 	if sec <= 0 {
 		return ""
 	}
-	return time.Unix(sec, 0).In(softRateResetLoc).Format("2006-01-02")
+	return time.Unix(sec, 0).In(softRateResetLoc).Format(time.RFC3339)
 }
 
 func (c *Client) GetUserInfo(a *auth.Auth) (uid, nickname, enterpriseID string, err error) {

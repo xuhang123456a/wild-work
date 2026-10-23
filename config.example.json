@@ -16,11 +16,16 @@
   },
   "schedule": {
     "checkin_times": ["09:00", "21:00"],
-    "keepalive_hours": [22],
-    "expiring_threshold_hours": 24
+    "keepalive_hours": [22]
   },
   "upstream": {
     "timeout_seconds": 120
+  },
+  "server": {
+    "max_request_body_mb": 128
+  },
+  "login": {
+    "lobsterai_callback_port": 0
   },
   "compat": {
     "default_channel": "workbuddy",
@@ -30,6 +35,11 @@
       "gpt-5*": "workbuddy/deepseek-v4-pro"
     }
   },
-  "proxies": {
+  "backup_proxy": "",
+  "reasoning_efforts": {},
+  "model_fallback": [],
+  "custom_channels": [],
+  "features": {
+    "loop_guard": true
   }
 }

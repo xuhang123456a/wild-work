@@ -107,6 +107,11 @@ func (g *Gateway) streamResponses(w http.ResponseWriter, r *http.Request, res *i
 	}
 
 	err := iterateChatSSE(res.Body, func(c chatChunk) error {
+		// 流内错误帧：直接中断（修复前被 parseChatSSELine 丢弃 → 走到正常收尾，
+		// 客户端看到 response.completed + [DONE]，把半截回答当完整回答）。
+		if c.Err != nil {
+			return c.Err
+		}
 		if c.Usage != nil {
 			usage = c.Usage
 		}
@@ -136,10 +141,37 @@ func (g *Gateway) streamResponses(w http.ResponseWriter, r *http.Request, res *i
 	})
 	if err != nil {
 		if err != io.EOF {
+			// 自由码：流内错误（*StreamError）带内层私有码；IO/读错误没有码，
+			// 必须兜底为非空串——否则真实中断场景（内层写到一半断开 → 读端 ErrClosedPipe）
+			// 会发出 "code":""，把原来（固定 "stream_error"）的诊断信息丢掉。
+			freeCode := streamErrCode(err)
+			if freeCode == "" {
+				freeCode = "stream_error"
+			}
 			_ = emit("error", map[string]any{
-				"type": "error", "code": "stream_error", "message": err.Error(),
+				"type": "error", "code": freeCode, "message": err.Error(),
 				"sequence_number": seq,
 			})
+			// 失败终态：响应式 API 的规范做法是 response.failed，
+			// **不补 response.completed、不补 [DONE]**——否则客户端把失败的流
+			// 当成功收尾（半截内容视为完整回答），正是流内错误要消灭的症状。
+			//
+			// response.error.code 官方是 Literal 枚举（server_error / rate_limit_exceeded …），
+			// 故此处**映射到枚举内**；内层私有码只放在上面 error 事件的 code 字段
+			// （该字段规范上就是 Optional[str]，是自由码的合规载体）。
+			errCode := "server_error"
+			if streamErrKind(err) == streamErrRateLimit {
+				errCode = "rate_limit_exceeded"
+			}
+			failedResp := map[string]any{
+				"id": respID, "object": "response", "created_at": createdAt,
+				"model": clientModel, "status": "failed", "output": []any{},
+				"error": map[string]any{"code": errCode, "message": err.Error()},
+			}
+			_ = emit("response.failed", map[string]any{"type": "response.failed", "response": failedResp})
+			flush()
+			time.Sleep(20 * time.Millisecond)
+			return
 		}
 	}
 

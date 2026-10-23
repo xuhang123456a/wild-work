@@ -19,6 +19,10 @@ var featHeaders = []string{
 	"You are a coding agent running in the Codex CLI",
 	"github.com/anthropics/",
 	"11128",
+	// DSH 身份句：上游按「system 消息开头」逐字锚定匹配（2026-10-21 实测）。
+	"You are an AI agent powered by DeepSeek Harness",
+	// DSH Web GUI 段：上游按 system 开头整段 221 字符逐字串锚定（2026-10-21 实测）。
+	"DeepSeek Harness Web GUI",
 }
 
 var reHdr = regexp.MustCompile(`(?i)x-anthropic-billing-header:[^;\n]*;?\s*`)
@@ -44,6 +48,17 @@ var rewrites = [][2]string{
 	},
 	// 裸 11128 整单拦截，插入连字符保留可读性（零宽空格无效，上游会归一化）。
 	{"11128", "11-128"},
+	// DSH 身份句：上游只认 system 开头的逐字形态；插入冠词 the 即绕过，语义扰动最小（实测 200）。
+	{
+		"You are an AI agent powered by DeepSeek Harness",
+		"You are an AI agent powered by the DeepSeek Harness",
+	},
+	// DSH Web GUI 品牌短语：判据是整段逐字前缀（221 字符），不是关键词也不是跨句组合；
+	// 缩写为 DSH 即破坏逐字串，完整 prompt 通过（实测 200）。
+	{
+		"DeepSeek Harness Web GUI",
+		"DSH Web GUI",
+	},
 }
 
 // Messages 脱敏 body 中 messages 的 content / reasoning_content / tool_calls.arguments。

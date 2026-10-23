@@ -12,6 +12,8 @@ import (
 	"fmt"
 	"net/http"
 	"strings"
+
+	"wild-work/internal/provider"
 )
 
 // handleAnthropicMessages 处理 POST /v1/messages。
@@ -197,7 +199,7 @@ func convertAnthropicMessage(role string, content any, idx int) ([]any, error) {
 			}
 		case "image":
 			if url := anthropicImageURL(bm); url != "" {
-				imgBlocks = append(imgBlocks, map[string]any{"type": "image_url", "image_url": map[string]any{"url": url}})
+				imgBlocks = append(imgBlocks, imageURLBlock(url, ""))
 			}
 		case "tool_use":
 			// assistant 侧的工具调用 → Chat 的 tool_calls
@@ -218,12 +220,13 @@ func convertAnthropicMessage(role string, content any, idx int) ([]any, error) {
 		case "tool_result":
 			// user 侧的 tool_result → 独立的 role=tool 消息（Chat 要求工具结果单独成条）
 			callID := firstNonEmpty(asString(bm["tool_use_id"]), asString(bm["tool_call_id"]))
-			res := flattenText(bm["content"])
-			if res == "" {
-				res = stringifyOutput(bm["content"])
-			}
+			// tool_result 里的图片必须保留成 image_url 块（走 vision），
+			// 不能 stringify 成 base64 文本（见 toolContentValue 注释）。
+			res := toolContentValue(bm["content"])
 			if isTruthy(bm["is_error"]) {
-				res = "ERROR: " + res
+				if txt, ok := res.(string); ok {
+					res = "ERROR: " + txt
+				}
 			}
 			out = append(out, map[string]any{"role": "tool", "tool_call_id": callID, "content": res})
 		case "thinking", "redacted_thinking":
@@ -391,17 +394,56 @@ func anthropicStopReason(finish string, hasToolCalls bool) string {
 	return "end_turn"
 }
 
-// anthropicUsage 把 Chat usage 映射为 Anthropic usage（字段名不同）。
+// anthropicUsage 把 Chat usage 映射为 Anthropic usage（字段名与**语义都不同**）。
+//
+// 字段名差异：
+//
+//	OpenAI prompt_tokens    → Anthropic input_tokens（见下，语义需换算）
+//	OpenAI completion_tokens→ Anthropic output_tokens
+//	OpenAI details.cached_tokens → Anthropic cache_read_input_tokens（命中）
+//	OpenAI details.cache_write_tokens → Anthropic cache_creation_input_tokens（写入）
+//
+// ⚠️ **语义差异（issue #104 的关键陷阱）**：
+// Anthropic 的 `input_tokens` 是**未命中、也未写入缓存**的那部分输入，
+// 客户端用 `input_tokens + cache_read_input_tokens + cache_creation_input_tokens`
+// 还原总输入；而内层的 `prompt_tokens` **已经是总输入**（命中是其子集，见
+// internal/server/cacheusage.go 语义 1）。
+// 因此必须 `input_tokens = prompt_tokens − cached − write`，否则：
+//   - 不填 cache 字段 → Claude Code 把全部输入按未缓存计价（issue #104 的「费用高估」）；
+//   - 填了却不减 → 客户端求和得到近两倍总输入（同样错，且方向相反）。
+//
+// 三者相加恒等于 `prompt_tokens`，与原实现的总量口径一致（只是拆成三段）。
 func anthropicUsage(usage map[string]any) map[string]any {
 	if usage == nil {
 		return nil
 	}
-	in := usageInt(usage, "prompt_tokens", "input_tokens")
+	in := int64(usageInt(usage, "prompt_tokens", "input_tokens"))
 	outTok := usageInt(usage, "completion_tokens", "output_tokens")
 	if in == 0 && outTok == 0 {
 		return nil
 	}
-	return map[string]any{"input_tokens": in, "output_tokens": outTok}
+	u := map[string]any{"input_tokens": in, "output_tokens": outTok}
+	// 缓存计量：与 /v1/responses、面板同源（internal/provider 唯一真源）。
+	c := provider.ExtractUsageCache(usage)
+	if c.CachedReported {
+		u["cache_read_input_tokens"] = c.Cached
+		// 从 input_tokens 里扣除命中部分（Anthropic 口径），钳 0 防坏数据
+		if in >= c.Cached {
+			u["input_tokens"] = in - c.Cached
+		} else {
+			u["input_tokens"] = int64(0)
+		}
+	}
+	if c.WriteReported {
+		u["cache_creation_input_tokens"] = c.Write
+		// 写入部分同样不属于 `input_tokens`（它计在总输入里，但不是「未缓存输入」）
+		if cur, _ := u["input_tokens"].(int64); cur >= c.Write {
+			u["input_tokens"] = cur - c.Write
+		} else {
+			u["input_tokens"] = int64(0)
+		}
+	}
+	return u
 }
 
 // anthropicMessageID 生成 Anthropic 风格的 msg_ id。

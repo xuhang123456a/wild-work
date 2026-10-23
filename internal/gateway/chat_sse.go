@@ -13,6 +13,7 @@ package gateway
 import (
 	"bufio"
 	"encoding/json"
+	"errors"
 	"io"
 	"strings"
 )
@@ -30,6 +31,64 @@ type chatChunk struct {
 	FinishReason string
 	// Usage 上游用量（部分渠道在末 chunk 提供；为 nil 表示未提供）。
 	Usage map[string]any
+	// Err 非空表示这是一帧**流内错误**（内层发出的 OpenAI 规范 error 帧，
+	// 如 upstream_rate_limited / upstream_truncated）。转换器必须把它转成
+	// 对应协议的 error 事件，**不得静默丢弃**——否则客户端会把失败的流
+	// 当成正常结束（转成 end_turn / response.completed），半截内容被当完整回答。
+	Err *StreamError
+}
+
+// StreamError 内层转发的流内错误（来自 OpenAI 形状的 error 帧）。
+type StreamError struct {
+	Message string
+	Type    string
+	Code    string
+}
+
+func (e *StreamError) Error() string {
+	if e == nil {
+		return ""
+	}
+	if e.Code != "" {
+		return e.Code + ": " + e.Message
+	}
+	return e.Message
+}
+
+// streamErrCode 从流内错误里取出协议层错误码（供 Responses 的 response.failed 用）。
+// 非流内错误（IO 等）返回空串，由调用方回落到通用码。
+//
+// ⚠️ 该码是**内层私有码**，只可用于「非判别字段」（如 ResponseError.code、
+// error 事件的自定义 code）。**不得**用作 Anthropic error.type —— 那是 9 元
+// 判别联合的 Literal 标签，自造值会让严格客户端判为未知类型（见 streamErrKind）。
+func streamErrCode(err error) string {
+	var se *StreamError
+	if errors.As(err, &se) && se.Code != "" {
+		return se.Code
+	}
+	return ""
+}
+
+// streamErrKind 把内层私有码归到「协议语义类别」，供各协议选择**规范内**的错误类型。
+// 刻意用本地枚举而非 provider.ErrKind：gateway 是纯协议转换层，
+// 不应为一个小映射引入对 provider 包的依赖。
+type streamErrClass int
+
+const (
+	// streamErrOther 未知码与上游故障（如 upstream_truncated）**同处理**：
+	// 都落各协议的通用错误类型（Anthropic api_error / Responses server_error）。
+	// 刻意不为截断单列一类——它没有更贴切的枚举值可映射，
+	// 单列只会形成一个无人消费的「死区分」（复核曾指出过这点）。
+	streamErrOther streamErrClass = iota
+	// streamErrRateLimit 限流 → Anthropic rate_limit_error / Responses rate_limit_exceeded
+	streamErrRateLimit
+)
+
+func streamErrKind(err error) streamErrClass {
+	if streamErrCode(err) == "upstream_rate_limited" {
+		return streamErrRateLimit
+	}
+	return streamErrOther
 }
 
 // toolCallDelta 单个工具调用的增量片段。
@@ -76,9 +135,19 @@ func parseChatSSELine(line string) (chatChunk, bool) {
 		return chatChunk{}, false
 	}
 	var raw struct {
-		ID      string `json:"id"`
-		Model   string `json:"model"`
-		Usage   map[string]any
+		ID    string `json:"id"`
+		Model string `json:"model"`
+		Usage map[string]any
+		// Error 内层转发的流内错误帧（OpenAI 规范形状）。
+		// 修复前这里被忽略：error 帧解析成空 chunk 后**静默丢弃**，
+		// 而内层错误路径不写 [DONE]，gateway 读到 EOF 便当正常结束
+		// （Anthropic 转成 end_turn、Responses 转成 response.completed），
+		// 客户端拿着半截回答继续跑——正是要消灭的症状。
+		Error *struct {
+			Message string `json:"message"`
+			Type    string `json:"type"`
+			Code    string `json:"code"`
+		} `json:"error"`
 		Choices []struct {
 			Delta struct {
 				Content          string `json:"content"`
@@ -97,6 +166,15 @@ func parseChatSSELine(line string) (chatChunk, bool) {
 	}
 	if json.Unmarshal([]byte(payload), &raw) != nil {
 		return chatChunk{}, false
+	}
+
+	// 流内错误帧优先：它没有 choices，必须单独识别，否则会被当成"空分片"丢掉。
+	if raw.Error != nil {
+		return chatChunk{Err: &StreamError{
+			Message: raw.Error.Message,
+			Type:    raw.Error.Type,
+			Code:    raw.Error.Code,
+		}}, true
 	}
 
 	c := chatChunk{ID: raw.ID, Model: raw.Model, Usage: raw.Usage}

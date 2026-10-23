@@ -28,21 +28,6 @@ func TestNormalizeModelName(t *testing.T) {
 	}
 }
 
-func TestEncodeDecodeRoundtrip(t *testing.T) {
-	plain := []byte(`{"a":1,"b":"中文内容 😀","c":[true,null,3.14]}`)
-	enc := qoderEncode(plain)
-	if enc == "" {
-		t.Fatal("empty encode")
-	}
-	dec, err := qoderDecode(enc)
-	if err != nil {
-		t.Fatalf("decode: %v", err)
-	}
-	if string(dec) != string(plain) {
-		t.Fatalf("roundtrip mismatch")
-	}
-}
-
 // TestParseDynamicModelsScenesFallback 验证 assistant→developer→chat 三级回退。
 func TestParseDynamicModelsScenesFallback(t *testing.T) {
 	// chat 缺失 → developer 回退
@@ -140,7 +125,7 @@ func TestBuildAgentBodyFormatSourceFromUpstream(t *testing.T) {
 	body, err := buildAgentBody(
 		[]map[string]any{{"role": "user", "content": "hi"}},
 		&ModelEntry{Key: "k1", DisplayName: "D1", Format: "up-format", Source: "up-source"},
-		nil, false, 0, "", 0)
+		nil, false, "", 0, "", 0)
 	if err != nil {
 		t.Fatalf("buildAgentBody: %v", err)
 	}
@@ -159,7 +144,7 @@ func TestBuildAgentBodyFormatSourceFromUpstream(t *testing.T) {
 
 	// 上游未下发时才走兜底常量
 	body, err = buildAgentBody([]map[string]any{{"role": "user", "content": "hi"}},
-		&ModelEntry{Key: "k2"}, nil, false, 0, "", 0)
+		&ModelEntry{Key: "k2"}, nil, false, "", 0, "", 0)
 	if err != nil {
 		t.Fatalf("buildAgentBody(fallback): %v", err)
 	}
@@ -444,7 +429,7 @@ func TestBuildAgentBodyShape(t *testing.T) {
 	mc := &ModelEntry{Key: "gmodel", DisplayName: "GLM-5.3", MaxInputTokens: 180000}
 	raw, err := buildAgentBody(
 		[]map[string]any{{"role": "developer", "content": "sys"}, {"role": "user", "content": "hi"}},
-		mc, nil, true, 0, "personal_standard", 0)
+		mc, nil, true, "", 0, "personal_standard", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -529,7 +514,7 @@ func TestBuildAgentBodyContextLength(t *testing.T) {
 	mc := &ModelEntry{Key: "k", DisplayName: "K", MaxInputTokens: 180000}
 	// 指定档位
 	raw, err := buildAgentBody([]map[string]any{{"role": "user", "content": "hi"}},
-		mc, nil, false, 0, "", 400000)
+		mc, nil, false, "", 0, "", 400000)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -548,7 +533,7 @@ func TestBuildAgentBodyContextLength(t *testing.T) {
 	}
 	// 不指定 → 不注入 context_length
 	raw, err = buildAgentBody([]map[string]any{{"role": "user", "content": "hi"}},
-		mc, nil, false, 0, "", 0)
+		mc, nil, false, "", 0, "", 0)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -582,5 +567,132 @@ func TestParseContextWindowHint(t *testing.T) {
 	}
 	if got := parseContextWindowHint([]byte(`{"model":"x"}`)); got != 0 {
 		t.Errorf("absent: got %d", got)
+	}
+}
+
+// TestParseThinkingConfigEfforts 验证 thinking_config.enabled.efforts 的档位解析：
+// 真实上游形状（2026-10-20 实测 dfmodel/qfmodel）→ 档位名 + is_default 档。
+func TestParseThinkingConfigEfforts(t *testing.T) {
+	raw := map[string]json.RawMessage{
+		"assistant": json.RawMessage(`[
+			{"key":"dfmodel","display_name":"DeepSeek-Flash","enable":true,"is_reasoning":false,
+			 "thinking_config":{"disabled":{"description":"Disable thinking"},
+			   "enabled":{"description":"Enable thinking",
+			     "efforts":{"high":{"description":"High thinking intensity"},
+			                "low":{},
+			                "max":{"description":"Maximum thinking intensity","is_default":true}},
+			     "is_default":true}}},
+			{"key":"qfmodel","display_name":"Qwen3.8-Flash","enable":true,"is_reasoning":true,
+			 "thinking_config":{"disabled":{},
+			   "enabled":{"efforts":{"low":{},"medium":{"is_default":true},"xhigh":{}},"is_default":true}}},
+			{"key":"plain","display_name":"Plain","enable":true,"is_reasoning":false},
+			{"key":"bad","display_name":"Bad","enable":true,"thinking_config":[1,2]},
+			{"key":"empty","display_name":"Empty","enable":true,"thinking_config":{"disabled":{}}}
+		]`),
+	}
+	ms, err := parseDynamicModels(raw)
+	if err != nil {
+		t.Fatalf("parseDynamicModels: %v", err)
+	}
+	// ① 档位按低→高排序（上游是 map，解析序随机），默认档取 is_default
+	wantEfforts := []string{"low", "high", "max"}
+	if len(ms[0].ReasoningEfforts) != len(wantEfforts) {
+		t.Fatalf("dfmodel efforts = %v, want %v", ms[0].ReasoningEfforts, wantEfforts)
+	}
+	for i, w := range wantEfforts {
+		if ms[0].ReasoningEfforts[i] != w {
+			t.Errorf("dfmodel efforts[%d] = %q, want %q (order low→high)", i, ms[0].ReasoningEfforts[i], w)
+		}
+	}
+	if ms[0].DefaultReasoningEffort != "max" {
+		t.Errorf("dfmodel default effort = %q, want max", ms[0].DefaultReasoningEffort)
+	}
+	// ② Qwen 的 xhigh 必须排在 medium 之后（effortRank 语义序，不是字典序）
+	if got := ms[1].ReasoningEfforts; len(got) != 3 || got[2] != "xhigh" {
+		t.Errorf("qfmodel efforts = %v, want [low medium xhigh]", got)
+	}
+	if ms[1].DefaultReasoningEffort != "medium" {
+		t.Errorf("qfmodel default = %q, want medium", ms[1].DefaultReasoningEffort)
+	}
+	// ③ 无 thinking_config → 空档位表（客户端不显示档位选择器）
+	if len(ms[2].ReasoningEfforts) != 0 || ms[2].DefaultReasoningEffort != "" {
+		t.Errorf("absent thinking_config should yield no efforts: %+v", ms[2])
+	}
+	// ④ 形状不符只损失本字段，不让整批模型解析失败
+	if ms[3].Key != "bad" || len(ms[3].ReasoningEfforts) != 0 {
+		t.Errorf("malformed thinking_config should degrade to empty: %+v", ms[3])
+	}
+	// ⑤ 只有 disabled 没有 enabled → 无档位
+	if len(ms[4].ReasoningEfforts) != 0 {
+		t.Errorf("disabled-only should yield no efforts: %+v", ms[4])
+	}
+	// ⑥ 一路透到对外 ModelInfo
+	infos := toModelInfos(ms)
+	if len(infos[0].ReasoningEfforts) != 3 || infos[0].DefaultReasoningEffort != "max" {
+		t.Errorf("toModelInfos[0] efforts not exposed: %+v", infos[0])
+	}
+}
+
+// TestBuildAgentBodyReasoningEffort 验证 reasoning_effort 透传到 parameters，
+// 以及 none 档的三件套（reasoning_effort=none + max_thinking_tokens=0 + is_reasoning=false）。
+func TestBuildAgentBodyReasoningEffort(t *testing.T) {
+	mc := &ModelEntry{Key: "dfmodel", DisplayName: "DeepSeek-Flash", MaxInputTokens: 180000}
+	type parsed struct {
+		Parameters  map[string]any `json:"parameters"`
+		ModelConfig map[string]any `json:"model_config"`
+	}
+
+	// ① 非 none 档位 → 写 reasoning_effort，强制 is_reasoning=true，不写 max_thinking_tokens
+	raw, err := buildAgentBody([]map[string]any{{"role": "user", "content": "hi"}},
+		mc, nil, false, "max", 0, "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var b parsed
+	if err := json.Unmarshal(raw, &b); err != nil {
+		t.Fatal(err)
+	}
+	if b.Parameters["reasoning_effort"] != "max" {
+		t.Errorf("parameters.reasoning_effort = %v, want max", b.Parameters["reasoning_effort"])
+	}
+	if b.ModelConfig["is_reasoning"] != true {
+		t.Errorf("explicit tier must force is_reasoning=true, got %v", b.ModelConfig["is_reasoning"])
+	}
+	if _, ok := b.Parameters["max_thinking_tokens"]; ok {
+		t.Errorf("non-none tier must not write max_thinking_tokens: %+v", b.Parameters)
+	}
+
+	// ② none 档 → 三件套齐活
+	raw, err = buildAgentBody([]map[string]any{{"role": "user", "content": "hi"}},
+		mc, nil, true, "none", 0, "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b = parsed{}
+	if err := json.Unmarshal(raw, &b); err != nil {
+		t.Fatal(err)
+	}
+	if b.Parameters["reasoning_effort"] != "none" {
+		t.Errorf("none tier: reasoning_effort = %v", b.Parameters["reasoning_effort"])
+	}
+	if b.Parameters["max_thinking_tokens"] != float64(0) {
+		t.Errorf("none tier: max_thinking_tokens = %v, want 0", b.Parameters["max_thinking_tokens"])
+	}
+	if b.ModelConfig["is_reasoning"] != false {
+		t.Errorf("none tier: is_reasoning = %v, want false", b.ModelConfig["is_reasoning"])
+	}
+
+	// ③ 未指定档位 → 不注入 reasoning_effort（让上游走自己声明的 is_default 档）
+	raw, err = buildAgentBody([]map[string]any{{"role": "user", "content": "hi"}},
+		mc, nil, true, "", 0, "", 0)
+	if err != nil {
+		t.Fatal(err)
+	}
+	b = parsed{}
+	if err := json.Unmarshal(raw, &b); err != nil {
+		t.Fatal(err)
+	}
+	if _, ok := b.Parameters["reasoning_effort"]; ok {
+		t.Errorf("absent effort must not inject reasoning_effort: %+v", b.Parameters)
 	}
 }

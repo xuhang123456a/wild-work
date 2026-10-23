@@ -16,11 +16,12 @@ import (
 //   - mc：model_config 条目（来自动态模型表；nil 时用 auto 兜底）
 //   - tools：客户端传来的 OpenAI tools 数组；为空则不注入 tools 字段
 //   - enableReasoning：是否启用思考模式
+//   - effort：客户端选定的思考档位（low/high/max 等）；空 = 未指定，不注入
 //   - maxTokens：客户端请求的 max_tokens，<=0 时用模板默认 32768
 //   - contextWindow：选定的上下文档位（200K/400K/1M）；<=0 时不注入 context_length
 //
 // 注意：developer 角色必须改写为 system。
-func buildAgentBody(messages []map[string]any, mc *ModelEntry, tools []any, enableReasoning bool, maxTokens int, userType string, contextWindow int64) ([]byte, error) {
+func buildAgentBody(messages []map[string]any, mc *ModelEntry, tools []any, enableReasoning bool, effort string, maxTokens int, userType string, contextWindow int64) ([]byte, error) {
 	// developer → system（浅拷贝消息避免污染调用方数据）
 	msgs := make([]map[string]any, len(messages))
 	for i, m := range messages {
@@ -58,6 +59,22 @@ func buildAgentBody(messages []map[string]any, mc *ModelEntry, tools []any, enab
 	if contextWindow > 0 {
 		params["context_length"] = contextWindow
 		modelCfg["max_input_tokens"] = contextWindow
+	}
+	// 思考档位透传（对齐官方客户端与 EchoPing07/Qoder-2API-Go 的 verbatim 策略）：
+	// 上游网关认 parameters.reasoning_effort，档位取值来自 thinking_config.enabled.efforts。
+	// 空串=客户端未指定，不注入（让上游走自己声明的 is_default 档）。
+	// effort=="none" 是关闭思考的开关，与官方客户端一致：同时置 max_thinking_tokens=0 与 is_reasoning=false。
+	if effort != "" {
+		params["reasoning_effort"] = effort
+		if effort == "none" {
+			params["max_thinking_tokens"] = 0
+			enableReasoning = false
+			modelCfg["is_reasoning"] = false
+		} else {
+			// 显式非 none 档位强制开启思考（覆盖上游 is_reasoning 与 thinking_config 矛盾的情形）。
+			enableReasoning = true
+			modelCfg["is_reasoning"] = true
+		}
 	}
 
 	now := time.Now()
@@ -124,6 +141,11 @@ type ModelEntry struct {
 	ContextWindow  int64   `json:"-"`      // context_config 默认档（is_default）的 token_count
 	// AvailableWindows context_config 全部档位（升序）；空表示无档位表。
 	AvailableWindows []int64 `json:"-"`
+
+	// ReasoningEfforts thinking_config.enabled.efforts 的档位名（低→高排序）；空表示上游未声明档位。
+	// DefaultReasoningEffort 是上游标 is_default 的那一档（不传档位时上游实际走的档位）。
+	ReasoningEfforts       []string `json:"-"`
+	DefaultReasoningEffort string   `json:"-"`
 }
 
 // 上游未下发时的兜底值（实测两渠道 204/204 条目均下发，此处仅防御）。

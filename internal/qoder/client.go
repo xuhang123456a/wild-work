@@ -16,6 +16,7 @@ import (
 	"time"
 
 	"wild-work/internal/auth"
+	"wild-work/internal/idle"
 	"wild-work/internal/provider"
 )
 
@@ -27,6 +28,9 @@ type Client struct {
 	// StreamHTTP 用于对话流（SSE）：不设整体 Timeout，避免长回答在超时点被掐断
 	// 且无终止帧（R35 / issue #42）。
 	StreamHTTP *http.Client
+	// IdleTimeout 聊天 SSE 流中空闲超时（StreamHTTP 无总时长上限，靠本字段兜底
+	// 「上游中途卡死」）。<=0 表示禁用（测试用）。
+	IdleTimeout time.Duration
 
 	// modelMap 客户端名（display_name 规范化）→ 上游 model key。
 	// entries 上游 model key → 模型条目（供 ChatStream 取 format/source 等上游真值）。
@@ -50,32 +54,20 @@ func NewWithTimeout(timeout time.Duration) *Client {
 		TLSNextProto:        map[string]func(string, *tls.Conn) http.RoundTripper{}, // 强制 HTTP/1.1
 	}
 	return &Client{
-		HTTP:       &http.Client{Timeout: timeout, Transport: tr},
-		StreamHTTP: &http.Client{Transport: tr}, // 共用 Transport，不设 Timeout
-		Base:       OpenAPIBase,
-		Gateway:    GatewayBase,
+		HTTP:        &http.Client{Timeout: timeout, Transport: tr},
+		StreamHTTP:  &http.Client{Transport: tr}, // 共用 Transport，不设 Timeout
+		IdleTimeout: idle.DefaultTimeout,         // 流中空闲监控兜底（见 internal/idle）
+		Base:        OpenAPIBase,
+		Gateway:     GatewayBase,
 	}
 }
 
-// NewWithBase 测试用：覆盖 base/gateway。
-func NewWithBase(base, gateway string) *Client {
-	c := New()
-	c.Base = base
-	c.Gateway = gateway
-	return c
-}
-
-// setModelMap 记录动态模型映射（客户端名 → key）。
-func (c *Client) setModelMap(m map[string]string) {
-	c.modelMu.Lock()
-	c.modelMap = m
-	c.modelMu.Unlock()
-}
-
 // setModelEntries 记录 上游 key → 模型条目 表（与 setModelMap 同批写入）。
-func (c *Client) setModelEntries(entries map[string]DynamicModel) {
+// setModelEntries 同批写入 上游 key→条目表 与 客户端名→key 映射（一把锁，防中间态）。
+func (c *Client) setModelEntries(entries map[string]DynamicModel, nameToKey map[string]string) {
 	c.modelMu.Lock()
 	c.entries = entries
+	c.modelMap = nameToKey
 	c.modelMu.Unlock()
 }
 
@@ -112,18 +104,6 @@ func billingHeaders(req *http.Request, dt string) {
 
 func (c *Client) get(path, dt string) (*http.Response, error) {
 	req, err := http.NewRequest(http.MethodGet, c.base()+path, nil)
-	if err != nil {
-		return nil, err
-	}
-	billingHeaders(req, dt)
-	return c.HTTP.Do(req)
-}
-
-func (c *Client) post(path, dt string, body []byte) (*http.Response, error) {
-	if body == nil {
-		body = []byte("{}")
-	}
-	req, err := http.NewRequest(http.MethodPost, c.base()+path, bytes.NewReader(body))
 	if err != nil {
 		return nil, err
 	}
@@ -274,19 +254,23 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status
 	if err := sess.ApplyHeaders(req, encoded, url, a.UID, true, modelKey); err != nil {
 		return nil, 0, nil, fmt.Errorf("cosy headers: %w", err)
 	}
+	req, cancel := idle.WithCancel(req)
 	resp, err := c.streamHTTP().Do(req)
 	if err != nil {
+		cancel()
 		log.Printf("qoder chat_stream uid=%s model=%s: transport error: %v", a.UID, modelKey, err)
 		return nil, 0, nil, err
 	}
 	if resp.StatusCode >= 400 {
+		cancel()
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
 		log.Printf("qoder chat_stream uid=%s model=%s: upstream %d body=%s",
 			a.UID, modelKey, resp.StatusCode, truncate(string(raw), 200))
 		return nil, resp.StatusCode, raw, nil
 	}
-	return resp.Body, resp.StatusCode, nil, nil
+	// 成功分支：cancel 所有权交给 idle.Monitor（其 Close 会 cancel；静默超时也会 cancel）。
+	return idle.Monitor(resp.Body, c.IdleTimeout, cancel), resp.StatusCode, nil, nil
 }
 
 // UserResource 查询账号当前可花费积分（基础 + 赠送聚合）。
@@ -406,8 +390,31 @@ func Classify(status int, body string) provider.ErrKind {
 	if status == http.StatusUnauthorized {
 		return provider.ErrSessionDead
 	}
+	// 排队提示（10605 isQueued）：就算外层是 4xx，语义也是「等一会儿再来」，
+	// 换号可能命中不同队列 ⇒ 独立类别，冷却「号×模型」而不是罚整号。
+	if strings.Contains(body, "10605") || strings.Contains(body, "isQueued") {
+		return provider.ErrQueued
+	}
 	// 429 优先于 hardRule：限流 body 高频带 "quota exceeded"。
 	if status == http.StatusTooManyRequests {
+		return provider.ErrSoftRate
+	}
+	// 账号额度耗尽（qodercom 实测 110「Billing daily count exceeded」/ 112 付费墙）：
+	// 文案不含 hardMarkers 的 "quota exceeded"，必须显式列码，否则会被归成普通
+	// ErrClient 只换号不冷却，下次请求又撞同一堵墙。
+	if strings.Contains(body, `"code":"110"`) || strings.Contains(body, `"code":"112"`) ||
+		strings.Contains(body, `\"code\":\"110\"`) || strings.Contains(body, `\"code\":\"112\"`) ||
+		strings.Contains(body, "pricingUrl") || strings.Contains(body, `"isQuotaExceeded":true`) {
+		return provider.ErrHardCredit
+	}
+	// 上游以 HTTP 200 包裹的排队/限流拒绝：内嵌 403 + subCode:RESOURCE_LIMIT
+	// （业务码 10605，带 retryAfterSeconds/waitTime/serviceAvailable:false）。
+	// 必须排在「403 且 body 为空 → ErrWafBlock」与 4xx 兜底之前，否则落 ErrClient
+	// ——既不罚账号也不进流错误分类（R108）。
+	// 10605 走 provider.CodeMarker 而非裸 Contains：错误文本里的 trace_id/requestId
+	// 常含五位数字，裸匹配会把无关失败误判成限流（与 11115 同一教训）。
+	if strings.Contains(body, "RESOURCE_LIMIT") ||
+		(strings.Contains(body, "serviceAvailable") && provider.CodeMarker(lower, "10605")) {
 		return provider.ErrSoftRate
 	}
 	for _, m := range hardMarkers {
