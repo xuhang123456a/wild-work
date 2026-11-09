@@ -5,6 +5,7 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"log"
 	"net"
 	"os"
 	"path/filepath"
@@ -133,9 +134,20 @@ type Config struct {
 		CheckinHours   []int    `json:"checkin_hours,omitempty"` // 旧格式：[9,21]
 		CheckinTimes   []string `json:"checkin_times,omitempty"` // 新格式：["09:00","21:30"]
 		KeepaliveHours []int    `json:"keepalive_hours"`         // [22]
-		// 临期阈值已于 2026-10-20 删除（R112）：选号改用「最早到期时刻升序」，
-		// 不再需要「N 天内算临期」这个开关；面板临期额度固定按 provider.ExpiringDays 算。
-		// 旧配置里的 expiring_threshold_hours 字段会被静默忽略（json 未知字段不报错）。
+		// ExpiringDays 面板「积分汇总」里「临期」的计算口径（自然日，1/2/7）。
+		//
+		// 历史：2026-10-20 的 R112 曾把该设置项**整体删除**（选号改按「最早到期时刻
+		// 升序」后，窗口大小不再是路由参数）；但删除同时也把「临期」展示固定成 1 天，
+		// 于是「明早 05:47 到期」这类每日包（还剩 20.8h）按自然日归「明日」⇒ 汇总条
+		// 一天里大部分时间恒不显示临期（2026-11-04 用户实测，见 R112b）。
+		//
+		// 现在恢复为**纯展示口径**的可选项，与运行统计三桶同源（provider.ExpiringWithinDays）：
+		//   1 = 今日到期（= 运行统计「今日到期」列）
+		//   2 = 今日+明日
+		//   7 = 7 日内到期（= 运行统计「7 日内到期」列）
+		// **仍然不参与选号**——选号判据只有一个：provider.EarliestExpire。
+		// 旧配置残留的 expiring_threshold_hours（小时粒度）已被本字段取代，静默忽略。
+		ExpiringDays int `json:"expiring_days,omitempty"`
 	} `json:"schedule"`
 
 	Upstream struct {
@@ -149,6 +161,10 @@ type Config struct {
 		// 多张截图的 base64 会线性累积；gateway 转发前会把图缩到 1568px/JPEG，
 		// 所以这个上限只需容纳**客户端原始体**，不代表上游会收到这么大的包（issue #176）。
 		MaxRequestBodyMB int `json:"max_request_body_mb,omitempty"`
+
+		// StickyMaxRequests 同一渠道粘性账号连续成功使用多少次后轮换。
+		// 默认 50；非法值回退默认值，不阻断启动。
+		StickyMaxRequests int `json:"sticky_max_requests"`
 	} `json:"server"`
 
 	// Login 登录流程的可调项。
@@ -164,6 +180,15 @@ type Config struct {
 		// 随机端口无法预建隧道，故允许写死一个端口。留空/0 保持随机（更省心，
 		// 但异地浏览器只能用面板的「粘贴回调地址」兜底）。
 		LobsterAICallbackPort int `json:"lobsterai_callback_port,omitempty"`
+
+		// ComateBrowserCDP 「用本机浏览器登录 WPS」的 CDP 调试地址，
+		// 形如 http://127.0.0.1:9222。留空 = 面板不显示该入口。
+		//
+		// 为什么需要配置而不能自动探测：调试端口是**用户自己**给浏览器开的
+		// （chrome --remote-debugging-port=9222），端口与是否开启都归用户决定；
+		// 自动扫描本机端口既不可靠也越权。配置好之后，用户在熟悉的浏览器里
+		// 登录一次，wild-work 直接读到 wps_sid，不必再复制粘贴 Cookie。
+		ComateBrowserCDP string `json:"comate_browser_cdp,omitempty"`
 	} `json:"login"`
 
 	// Compat 三接口兼容层（OpenAI Responses / Anthropic Messages）配置。
@@ -243,9 +268,72 @@ type Config struct {
 // ModelFallbackRule 单条模型降级规则：From（"channel/model" 全路径）在其渠道内
 // 全部账号上限流冷却时，按 To 顺序找第一个仍有可用账号的备胎模型顶上。
 // 约束：From 全局唯一；To 内不含 From（不自环）；To 至少一项。
+//
+// Name 是这条链的**可选别名**（R129）：别名是主力模型（From）的另一个名字，
+// 客户端请求别名等同于请求 From——同样的粘性路由、容量判定、降级链与冷却。
+// 别名只在**入口**解析，不参与备胎链（To 里不得写别名，From 也不得写别名）；
+// 空串 = 无别名（旧配置零迁移）。生命周期绑定规则：删规则别名一起消失，
+// 改 From 别名自动跟随（无需任何级联改写）。
 type ModelFallbackRule struct {
 	From string   `json:"from"`
 	To   []string `json:"to"`
+	Name string   `json:"name,omitempty"`
+}
+
+// AliasIndex 从降级链规则列表派生「别名 → 主力模型全路径」索引。
+//
+// **单一来源**：内层 handler（Chat）与兼容层（Responses/Anthropic）各自持有该 map 的
+// 副本，但派生只在这里发生一次，避免两边各写一套清洗逻辑而漂移（R129）。
+//
+// 跳过不合规的名字（保存时已硬拒，这里再兜底一次——手改 config.json 造出的脏数据
+// 不得导致崩溃或误路由）：空名、含 `/`、含空白/逗号/`*`、以及重复别名（先到先得）。
+func AliasIndex(rules []ModelFallbackRule) map[string]string {
+	out := map[string]string{}
+	for _, r := range rules {
+		name := strings.TrimSpace(r.Name)
+		if !ValidAliasName(name) {
+			continue
+		}
+		from := strings.TrimSpace(r.From)
+		if from == "" {
+			continue
+		}
+		if _, dup := out[name]; dup {
+			continue
+		}
+		out[name] = from
+	}
+	return out
+}
+
+// ValidAliasName 报告 name 是否是可用的别名（空串 = 无别名，也返回 false）。
+// 规则：不含 `/`（避免与 channel/model 前缀语义打架）、不含空白、逗号、`*`
+// （避免输入框里被切碎 / 与 model_map 通配语义混淆）。大小写敏感（R129）。
+func ValidAliasName(name string) bool {
+	if name == "" {
+		return false
+	}
+	if strings.ContainsAny(name, "/ \t\r\n,*\u3000\uff0c") {
+		return false
+	}
+	return true
+}
+
+// DefaultStickyMaxRequests 粘性路由的默认轮换阈值。
+const DefaultStickyMaxRequests = 50
+
+// 临期展示口径（自然日）：面板「积分汇总」的「临期」用几天窗口，
+// 与运行统计的「今日到期 / 明日到期 / 7 日内到期」同源（provider.ExpiringWithinDays）。
+// 只影响**展示**，不参与选号（选号判据只有 provider.EarliestExpire，见 R112/R112b）。
+const (
+	DefaultExpiringDays = 1 // 今日到期
+	ExpiringDaysTwoDays = 2 // 今日 + 明日
+	ExpiringDaysSeven   = 7 // 7 日内到期
+)
+
+// IsExpiringDays 报告 days 是否为面板允许的临期口径（1/2/7）。
+func IsExpiringDays(days int) bool {
+	return days == DefaultExpiringDays || days == ExpiringDaysTwoDays || days == ExpiringDaysSeven
 }
 
 // Default 默认配置。
@@ -268,7 +356,9 @@ func Default() *Config {
 	c.Schedule.CheckinHours = []int{9, 21}
 	c.Schedule.CheckinTimes = []string{"09:00", "21:00"}
 	c.Schedule.KeepaliveHours = []int{22}
+	c.Schedule.ExpiringDays = DefaultExpiringDays
 	c.Upstream.TimeoutSeconds = 120
+	c.Server.StickyMaxRequests = DefaultStickyMaxRequests
 	c.Compat.DefaultChannel = "workbuddy"
 	c.Compat.MaxTokensCap = 32000
 	c.Features.LoopGuard = true // 思考链死循环检测默认开启（面板可关）
@@ -506,6 +596,17 @@ func (c *Config) normalize() error {
 	if c.Upstream.TimeoutSeconds <= 0 {
 		c.Upstream.TimeoutSeconds = 120
 	}
+	// 临期展示口径：只接受 1/2/7（面板下拉框限定）。非法值（含老配置缺字段的 0）
+	// 回退默认 1 天并记 WARN——只在内存回退，**加载时不写盘**（不变量 5：老配置
+	// 缺字段用默认值即可，不因读一次配置就改写文件，否则配置漂移会让用户看不出
+	// 哪些是默认值；与 sticky_max_requests 同一纪律）。
+	if !IsExpiringDays(c.Schedule.ExpiringDays) {
+		if c.Schedule.ExpiringDays != 0 {
+			log.Printf("WARN config: schedule.expiring_days=%d invalid, fallback=%d",
+				c.Schedule.ExpiringDays, DefaultExpiringDays)
+		}
+		c.Schedule.ExpiringDays = DefaultExpiringDays
+	}
 	if c.Compat.MaxTokensCap < 0 {
 		c.Compat.MaxTokensCap = 0 // 负数视为「不限制」，避免误用导致 max_tokens 被置 0
 	}
@@ -519,6 +620,11 @@ func (c *Config) normalize() error {
 	}
 	if c.Server.MaxRequestBodyMB > 1024 {
 		c.Server.MaxRequestBodyMB = 1024
+	}
+	if c.Server.StickyMaxRequests <= 0 {
+		log.Printf("WARN config: server.sticky_max_requests=%d invalid, fallback=%d",
+			c.Server.StickyMaxRequests, DefaultStickyMaxRequests)
+		c.Server.StickyMaxRequests = DefaultStickyMaxRequests
 	}
 	if c.Listen.Port <= 0 {
 		c.Listen.Port = 7863

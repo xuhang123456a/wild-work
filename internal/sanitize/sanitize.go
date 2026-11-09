@@ -1,8 +1,17 @@
-// Package sanitize 出站请求体指纹脱敏：清除 Claude Code / Codex CLI 注入的模板句，
-// 防止上游 CodeBuddy 内容审核按逐字精确匹配拦截（HTTP 400 code=11128 / content_blocked）。
+// internal/sanitize/sanitize.go 出站请求体指纹脱敏：清除 Claude Code / Codex CLI / DSH 注入的
+// 模板句，防止上游渠道内容审核按逐字精确匹配拦截（HTTP 400 code=11128）。
 //
-// 策略：键值型指纹整段删除，承载语义的模板句最小改写（换一词），语义不变。
-// content 值为 null 的 assistant 消息不会跳过——其 tool_calls arguments 仍需净化。
+// 背景：客户端（Claude Code / DSH 等）在 system prompt 注入若干固定模板句，
+// 上游内容审核按逐字精确匹配拦截（非语义审核），一字改动即可绕过。
+//
+// 判据快照（2026-11-02 真机探针 + 2026-11-07 线上被拦体重放，见 internal/upstream/sanitize_workbuddy_test.go）：
+// 仍在拦: DSH 身份句（大小写不敏感）、DSH 品牌串（2026-11-07 恢复：implementation checkout 段原样即 400）、
+// DSH 跨句 @ 路径、CC 身份句、Main branch、Codex 首段（前缀锚定）、反馈句、billing 键值。
+// 已失效（已注释停用）——裸 11128、DSH WebGUI 段单独出现、billing 裸键名、tools 字段品牌串。上游判据会漂移，改动须探针重验。
+//
+// 策略：键值型指纹整段删除，模板句最小改写（缩写/冠词/换词，不跨品牌替换）。
+//
+// 本文件与 internal/upstream/sanitize.go 是平行实现，必须同步改。
 package sanitize
 
 import (
@@ -11,25 +20,41 @@ import (
 	"strings"
 )
 
-var featHeaders = []string{
+// sanitizeFeatures 特征预检：任一命中才进入净化。全部小写，配合 asciiContainsFold
+// 做大小写不敏感匹配（上游判据大小写不敏感，2026-10-28 真机实测小写变体同样 400，
+// 大小写敏感的 Contains 会让小写变体连净化都进不去）。
+var sanitizeFeatures = []string{
+	"x-anthropic-billing-hdr",
 	"x-anthropic-billing-header",
 	"cc_entrypoint=",
-	"You are Claude Code",
-	"Main branch (",
-	"You are a coding agent running in the Codex CLI",
+	"you are claude code",
+	"main branch (",
+	"you are a coding agent running in the codex cli",
 	"github.com/anthropics/",
-	"11128",
-	// DSH 身份句：上游按「system 消息开头」逐字锚定匹配（2026-10-21 实测）。
-	"You are an AI agent powered by DeepSeek Harness",
-	// DSH Web GUI 段：上游按 system 开头整段 221 字符逐字串锚定（2026-10-21 实测）。
-	"DeepSeek Harness Web GUI",
+
+	// 上游反探测：裸数字错误码
+	// 2026-11-02 停用：(探针 sanitize_workbuddy_test.go 实测结果正常且未被拦截)
+	// "11128",
+
+	// DSH 身份句：上游按 system 开头逐字锚定
+	"you are an ai agent powered by deepseek harness",
+
+	// DSH Web GUI 段：上游按 system 开头整段
+	// 2026-11-02 停用: (探针 sanitize_workbuddy_test.go 实测结果正常且未被拦截)
+	// "deepseek harness web gui",
+
+	// DSH 品牌串（超集，兜住 "DeepSeek Harness CLI" 等变体触发预检）
+	// 2026-11-07 恢复（2026-11-02 曾停用）：线上被拦的真实 DSH Web 请求体里
+	// "DeepSeek Harness implementation checkout" 原样上送即 400；重放实验逐项还原证实
+	// 仅该段品牌串是触发项，缩写为 "DSH implementation checkout" 后 200。
+	"deepseek harness",
+
+	// DSH @ 路径句（跨句指纹后半，2026-10-28 实测, 2026-11-02 复现仍拦）
+	"relative paths resolve from the workspace root",
 }
 
-var reHdr = regexp.MustCompile(`(?i)x-anthropic-billing-header:[^;\n]*;?\s*`)
-var reBareHdr = regexp.MustCompile(`(?i)x-anthropic-billing-header`)
-var reKv = regexp.MustCompile(`(?i)\bcc_[a-z0-9_]+=[^;\n]*;?\s*`)
-
-var rewrites = [][2]string{
+// sanitizeStringRewrites 字符串匹配改写表
+var sanitizeStringRewrites = [][2]string{
 	{
 		"You are Claude Code, Anthropic's official CLI for Claude",
 		"You are Claude Code, Anthropic's official CLI tool for Claude",
@@ -40,29 +65,94 @@ var rewrites = [][2]string{
 	},
 	{
 		"You are a coding agent running in the Codex CLI, a terminal-based coding assistant.",
-		"You are a coding agent running in the Codex CLI tool, a terminal-based coding assistant.",
+		"You are a coding agent running within the Codex CLI, a terminal-based coding assistant.",
 	},
 	{
+		// 反馈句：整句带 Anthropic 仓库链接，上游按整句拦截（只留链接或只留半边均不拦，
+		// 实测需整句同时出现）。give→provide 一词之差即可绕过，语义不变。
 		"To give feedback, users should report the issue at https://github.com/anthropics/claude-code/issues",
 		"To provide feedback, users should report the issue at https://github.com/anthropics/claude-code/issues",
 	},
-	// 裸 11128 整单拦截，插入连字符保留可读性（零宽空格无效，上游会归一化）。
-	{"11128", "11-128"},
-	// DSH 身份句：上游只认 system 开头的逐字形态；插入冠词 the 即绕过，语义扰动最小（实测 200）。
+
+	// 2026-11-02 停用: (探针 sanitize_workbuddy_test.go 实测结果正常且未被拦截)
+	// {
+	// 	"11128",
+	// 	"11\u2011128"
+	// },
+
+	// 2026-11-02 改动: 关键词替换 , (探针 sanitize_workbuddy_test.go 实测结果正常且未被拦截)
 	{
 		"You are an AI agent powered by DeepSeek Harness",
-		"You are an AI agent powered by the DeepSeek Harness",
+		// "You are an AI agent powered by the DeepSeek Harness",
+		"You are an AI agent powered by DSH",
 	},
-	// DSH Web GUI 品牌短语：判据是整段逐字前缀（221 字符），不是关键词也不是跨句组合；
-	// 缩写为 DSH 即破坏逐字串，完整 prompt 通过（实测 200）。
+
+	// 2026-11-02 停用: (探针 sanitize_workbuddy_test.go 实测结果正常且未被拦截)
+	// {
+	// 	"DeepSeek Harness Web GUI",
+	// 	"DSH Web GUI",
+	// },
+}
+
+// 宽松键名正则：键名内部允许夹任意非字母序列（全角/Unicode 连字符、空格、零宽等），
+// 且 h/e/a/d/e/r 逐字母容忍分隔——header 全形态与 hdr 缩写形态都命中。
+// 注意不能简单写 `hdr`：原始键名 "header" 不含连续 "hdr"，会漏掉键值整段剥离。
+const hdrKeyRe = `x[^a-z]*anthropic[^a-z]*billing[^a-z]*h[^a-z]*(?:e[^a-z]*)?(?:a[^a-z]*)?d[^a-z]*(?:e[^a-z]*)?r`
+
+// sanitizeHdrRe 剥离层：header 键名即触发（与值无关），整段删除。
+var sanitizeHdrRe = regexp.MustCompile(`(?i)` + hdrKeyRe + `\s*:[^;\n]*;?\s*`)
+
+// sanitizeBareHdrRe 裸键名（无冒号）兜底：是 sanitizeHdrRe 的超集，
+// 两者并用——先删键值形态，再处理残留裸键名（改写已停用，仅预检兜底用）。
+var sanitizeBareHdrRe = regexp.MustCompile(`(?i)` + hdrKeyRe)
+
+// sanitizeKvRe 剥离层：尾随裸键值（cc_xxx=...;）循环清理。
+var sanitizeKvRe = regexp.MustCompile(`(?i)\bcc_[a-z0-9_]+=[^;\n]*;?\s*`)
+
+// regexpRewriteStruct 正则改写对：regexp = 匹配正则，replace = 替换串。
+type regexpRewriteStruct struct {
+	regexp  *regexp.Regexp
+	replace string
+}
+
+// sanitizeRegexpRewrites 正则匹配改写表
+// 左 = *regexp.Regexp    右 = 替换串
+var sanitizeRegexpRewrites = []regexpRewriteStruct{
+	// 2026-11-02 重要改动: deepseek harness 替换为 DSH
+	// 不得换成他身份串如 claude code, 因为dsh的系统提示词后文大量出现 DSH 这种关键词，
+	// 此前的错误做法(自称 claude code) 只会让模型自我认知错乱。
 	{
-		"DeepSeek Harness Web GUI",
-		"DSH Web GUI",
+		regexp.MustCompile(`(?i)you\s+are\s+an\s+ai\s+agent\s+powered\s+by\s+(?:the\s+)?deepseek[\s\-_]*harness`),
+		"You are an AI agent powered by DSH",
+	},
+
+	// 2026-11-02 停用: (探针 sanitize_workbuddy_test.go 实测结果正常且未被拦截)
+	// {
+	// 	regexp.MustCompile(`(?i)deepseek[\s\-_]*harness\s+web\s+gui`),
+	// 	"DSH Web GUI",
+	// },
+
+	// 2026-11-07 新增：品牌串全量缩写为 DSH（含 implementation checkout / Web GUI 等
+	// 段落内出现，不只身份句）。上游判据按 "DeepSeek Harness" 品牌串+新模板句组合拦截，
+	// 保留任一原样品牌串即可能 400；统一缩写后实测 200（同品牌缩写，非跨品牌替换）。
+	// 必须排在身份句规则之后：身份句先落成 "powered by DSH"，本条不会二次命中。
+	{
+		regexp.MustCompile(`(?i)deepseek[\s\-_]*harness`),
+		"DSH",
+	},
+
+	// 2026-11-02 改动: 换一种更稳妥的写法且语义不变。 (探针 sanitize_workbuddy_test.go 实测结果正常且未被拦截)
+	{
+		regexp.MustCompile(`(?i)relative\s+paths\s+resolve\s+from\s+the\s+workspace\s+root`),
+		"Relative paths are resolved from the workspace root",
 	},
 }
 
+// Messages 已停用，改用 MessagesInPlace。
+/*
 // Messages 脱敏 body 中 messages 的 content / reasoning_content / tool_calls.arguments。
 // body 不可解析时原样返回，绝不阻塞请求（降级语义：宁可发指纹原文也不丢消息）。
+// 只动结构化字段，不做整包替换。
 func Messages(body []byte) []byte {
 	if len(body) == 0 {
 		return body
@@ -79,7 +169,7 @@ func Messages(body []byte) []byte {
 	if len(msgs) == 0 {
 		return body
 	}
-	if cleanMessages(msgs) {
+	if sanitizeMessages(msgs) {
 		if out, err := json.Marshal(obj); err == nil {
 			return out
 		}
@@ -88,42 +178,103 @@ func Messages(body []byte) []byte {
 }
 
 func toString(b []byte) string { return string(b) }
+*/
 
-func hasFingerprint(s string) bool {
-	for _, f := range featHeaders {
-		if strings.Contains(s, f) {
-			return true
-		}
+// MessagesInPlace 对已解码的 body 做脱敏，返回是否有改动。
+func MessagesInPlace(obj map[string]any) bool {
+	msgs, _ := obj["messages"].([]any)
+	if len(msgs) == 0 {
+		return false
 	}
-	// 大小写变体 + 裸键名形态由正则兜底
-	return reBareHdr.MatchString(s)
+	return sanitizeMessages(msgs)
 }
 
-func cleanText(text string) string {
+// sanitizeText 单段文本净化：预检不中 → 返回原串（零分配）。
+func sanitizeText(text string) string {
 	if !hasFingerprint(text) {
 		return text
 	}
-	for _, rw := range rewrites {
+	orig := text
+	// 字符串匹配改写表
+	for _, rw := range sanitizeStringRewrites {
 		text = strings.ReplaceAll(text, rw[0], rw[1])
 	}
-	if reHdr.MatchString(text) {
-		text = reHdr.ReplaceAllString(text, "")
+	// 正则匹配改写表: (2026-11-02 改动: 改成遍历该表而非代码写死)
+	for _, rw := range sanitizeRegexpRewrites {
+		text = rw.regexp.ReplaceAllString(text, rw.replace)
+	}
+	if sanitizeHdrRe.MatchString(text) {
+		text = sanitizeHdrRe.ReplaceAllString(text, "")
 	}
 	if strings.Contains(text, "cc_") {
 		prev := ""
 		for prev != text {
 			prev = text
-			text = reKv.ReplaceAllString(text, "")
+			text = sanitizeKvRe.ReplaceAllString(text, "")
 		}
 	}
-	text = reBareHdr.ReplaceAllString(text, "x-anthropic-billing-hdr")
+	// 2026-11-02 停用: (探针 sanitize_workbuddy_test.go 实测结果正常且未被拦截)
+	// text = sanitizeBareHdrRe.ReplaceAllString(text, "x-anthropic-billing-hdr")
+
+	// 预检可能因裸键名变体命中、却没有任何规则生效；此时原样返回，
+	// 不能让末尾 TrimSpace 白白改掉首尾空白。
+	if text == orig {
+		return text
+	}
 	return strings.TrimSpace(text)
 }
 
-func cleanContent(v any) (any, bool) {
+// hasFingerprint 特征预检：sanitizeFeatures 全小写 + ASCII 折叠匹配（上游判据大小写
+// 不敏感），再以 sanitizeBareHdrRe 兜住键名形态。asciiContainsFold 命中与否都零分配，
+// 守住「预检不命中零分配原样通过」的不量（不能整串 ToLower，会逐请求拷贝）。
+func hasFingerprint(s string) bool {
+	for _, f := range sanitizeFeatures {
+		if asciiContainsFold(s, f) {
+			return true
+		}
+	}
+	return sanitizeBareHdrRe.MatchString(s)
+}
+
+// lowerASCII ASCII 大写折小写（仅特征表需要的折叠范围）。
+func lowerASCII(b byte) byte {
+	if b >= 'A' && b <= 'Z' {
+		return b + ('a' - 'A')
+	}
+	return b
+}
+
+// asciiContainsFold 大小写不敏感（ASCII 折叠）子串查找，零分配。
+// 特征表全为 ASCII，ASCII 折叠已覆盖上游的大小写判据；不能用 strings.ToLower
+// ——它对每个请求体整串拷贝一次，破坏零分配预检。
+func asciiContainsFold(s, f string) bool {
+	n := len(f)
+	if n == 0 {
+		return true
+	}
+	first := lowerASCII(f[0])
+	for i := 0; i+n <= len(s); i++ {
+		if lowerASCII(s[i]) != first {
+			continue
+		}
+		j := 1
+		for ; j < n; j++ {
+			if lowerASCII(s[i+j]) != lowerASCII(f[j]) {
+				break
+			}
+		}
+		if j == n {
+			return true
+		}
+	}
+	return false
+}
+
+// sanitizeContent 兼容字符串与多模态数组；只动 text part，image 等 part 不动。
+func sanitizeContent(v any) (any, bool) {
 	switch c := v.(type) {
 	case string:
-		s := cleanText(c)
+		s := sanitizeText(c)
 		return s, s != c
 	case []any:
 		changed := false
@@ -133,7 +284,7 @@ func cleanContent(v any) (any, bool) {
 				continue
 			}
 			if t, ok := m["text"].(string); ok {
-				if s := cleanText(t); s != t {
+				if s := sanitizeText(t); s != t {
 					m["text"] = s
 					changed = true
 				}
@@ -144,26 +295,29 @@ func cleanContent(v any) (any, bool) {
 	return v, false
 }
 
-func cleanToolCalls(v any) bool {
-	calls, _ := v.([]any)
-	if len(calls) == 0 {
+func sanitizeToolCalls(v any) bool {
+	calls, ok := v.([]any)
+	if !ok {
 		return false
 	}
 	changed := false
 	for _, c := range calls {
-		call, _ := c.(map[string]any)
-		if call == nil {
+		call, ok := c.(map[string]any)
+		if !ok {
 			continue
 		}
-		fn, _ := call["function"].(map[string]any)
-		if fn == nil {
+		fn, ok := call["function"].(map[string]any)
+		if !ok {
 			continue
 		}
-		args, _ := fn["arguments"].(string)
-		if args == "" {
+		args, ok := fn["arguments"].(string)
+		if !ok || args == "" {
 			continue
 		}
-		if s := cleanText(args); s != args {
+		if s := sanitizeText(args); s != args {
+			if !json.Valid([]byte(s)) { // 自定义替换可能破坏字符串化 JSON，不能把坏参数发上游
+				continue
+			}
 			fn["arguments"] = s
 			changed = true
 		}
@@ -171,30 +325,85 @@ func cleanToolCalls(v any) bool {
 	return changed
 }
 
-func cleanMessages(msgs []any) bool {
+// sanitizeMessages 净化 messages 中的 content、reasoning_content 与 tool_calls；任一命中返回 true。
+// 2026-11-02 改动: 跳过 role=user/tool/function (探针 sanitize_workbuddy_test.go 实测结果正常且未被拦截)
+// role=system/assistant 实测仍拦截，继续保持清洗。无 role 等未知角色继续保持清洗。
+func sanitizeMessages(msgs []any) bool {
 	changed := false
 	for _, m := range msgs {
 		msg, _ := m.(map[string]any)
 		if msg == nil {
 			continue
 		}
+		role, _ := msg["role"].(string)
+		switch strings.ToLower(strings.TrimSpace(role)) {
+		case "user", "tool", "function":
+			continue
+		}
 		if v, ok := msg["content"]; ok {
-			if nc, ch := cleanContent(v); ch {
+			if nc, ch := sanitizeContent(v); ch {
 				msg["content"] = nc
 				changed = true
 			}
 		}
 		if rc, ok := msg["reasoning_content"].(string); ok {
-			if s := cleanText(rc); s != rc {
+			if s := sanitizeText(rc); s != rc {
 				msg["reasoning_content"] = s
 				changed = true
 			}
 		}
 		if tc, ok := msg["tool_calls"]; ok {
-			if cleanToolCalls(tc) {
+			if sanitizeToolCalls(tc) {
 				changed = true
 			}
 		}
 	}
 	return changed
+}
+
+// SystemHead 提取 body 中首条 system/developer 消息 content 的前 n 个字符（rune
+// 截断），用于拦截诊断——上游只看 system 开头做逐字指纹，user 内容与本诊断无关、
+// 绝不返回。解析失败或无 system 消息返回 ""。多模态 content 取首个 text part。
+func SystemHead(b []byte, n int) string {
+	if len(b) == 0 || n <= 0 {
+		return ""
+	}
+	var obj struct {
+		Messages []struct {
+			Role    string          `json:"role"`
+			Content json.RawMessage `json:"content"`
+		} `json:"messages"`
+	}
+	if err := json.Unmarshal(b, &obj); err != nil {
+		return ""
+	}
+	for _, m := range obj.Messages {
+		if m.Role != "system" && m.Role != "developer" {
+			continue
+		}
+		var s string
+		if err := json.Unmarshal(m.Content, &s); err == nil {
+			return truncateRunes(s, n)
+		}
+		var parts []map[string]any
+		if err := json.Unmarshal(m.Content, &parts); err == nil {
+			for _, p := range parts {
+				if t, ok := p["text"].(string); ok {
+					return truncateRunes(t, n)
+				}
+			}
+		}
+		return ""
+	}
+	return ""
+}
+
+// truncateRunes 按 rune 截断（多字节内容不得切出半个字符），去除截断残留的首尾空白
+// （日志不应带尾随空格；TrimSpace 只影响诊断展示，不回写请求体）。
+func truncateRunes(s string, n int) string {
+	r := []rune(s)
+	if len(r) <= n {
+		return strings.TrimSpace(s)
+	}
+	return strings.TrimSpace(string(r[:n]))
 }

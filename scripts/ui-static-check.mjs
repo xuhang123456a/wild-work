@@ -43,13 +43,49 @@ const FAKE_STATE = {
       last_checkin_at: "2026-10-02 09:00",
       last_checkin_ok: true,
     },
-    // 「不适用」账号（场景 1.7）：无积分概念的渠道（oczen/kilo/cline/自定义）。
-    // 两张卡只靠后端下发的 credits_na 区分 —— 这是「默认收起」的唯一判据，
-    // 前端不再另维护渠道名单（否则新增自定义渠道时会被漏收起）。
+    // 虚拟账号（场景 1.7）：oczen/kilo 这类「没有账号概念」的通道，账号不是用户添加的，
+    // 卡片上一串「不适用」纯噪声，故默认收起。**收起判据是「虚拟账号」而不是 credits_na**：
+    // credits_na 只表达「上游没有余额接口」，与「该不该收起」正交 —— 用户亲手粘凭据
+    // 加进来的 cline/comate/自定义渠道账号同样 credits_na，但必须立即可见
+    // （曾按 credits_na 收起，表现为「贴完 wps_sid 账号没刷出来」）。
     {
       uid: "oczen-anon",
       group: "oczen",
       nickname: "匿名",
+      credits: 0,
+      expiring_credits: 0,
+      unusable_credits: 0,
+      credits_na: true,
+      cooling: false,
+      until: "",
+      reason: "",
+      disabled: false,
+      last_checkin_at: "",
+      last_checkin_ok: false,
+    },
+    // 有真实积分的渠道（R136）：comate 一份 wps_sid = 一个 WPS 账号，
+    // 额度来自 /llmproxy/v1/user/token-usage（每日额度 2000，剩余 1857.37），
+    // 故 credits_na 为 false、卡片主数字是真实剩余，与 cline（真查不到）区分开。
+    {
+      uid: "sid-0123456789abcdef",
+      group: "comate",
+      nickname: "粘错sid的号",
+      credits: 1857,
+      expiring_credits: 0,
+      unusable_credits: 0,
+      cooling: false,
+      until: "",
+      reason: "",
+      disabled: false,
+      last_checkin_at: "",
+      last_checkin_ok: false,
+    },
+    // 真·无积分但用户添加的账号（cline）：上游确无余额端点 ⇒ credits_na=true。
+    // 留着它才能持续验证「credits_na 不决定收起、也不决定固定账号」（R130/R131 的护栏）。
+    {
+      uid: "cline-abcdef123456",
+      group: "cline",
+      nickname: "cline无积分号",
       credits: 0,
       expiring_credits: 0,
       unusable_credits: 0,
@@ -193,9 +229,14 @@ const patched =
   // 只能在源码作用域内赋值，故由改写注入 setter 而不是靠 globalThis）。
   // ⚠️ cache 必须按 uid 建键：真实代码是 detailCache[detailState.uid]，
   //    直接塞「响应对象」会让 detailCache[uid] 为 undefined（静默走空明细分支）。
+  // 降级链别名（R129）前端即时校验：fbRules / fbAliasValidate 是 `let` 与模块内函数，
+  // 由改写注入 setter + 校验入口，供「硬拒分支 + 软警告不阻止保存」的断言直接调用。
+  + ", fbAliasValidate, __setFbRules: (rs) => { fbRules = rs; }"
   + ", renderCreditDetail, showCreditDetail, __setCreditDetailState: (st, resp) => { detailState = st; detailCache = { [st.uid]: resp }; }"
   // 「不适用」默认收起（R103）：showNoCredit / acctFilter 都是 `let`，toggle 也要直接调
   + ", applyAcctFilter, toggleNoCredit, __setShowNoCredit: (v) => { showNoCredit = v; }, __setAcctFilter: (v) => { acctFilter = v; }"
+  // 停用原因徽标（R135）：需要临时把一条 fixture 账号改成「已停用 + 指定原因」再重渲染。
+  + ", __setAccount: (uid, patch) => { const a = (state.accounts || []).find((x) => x.uid === uid); if (a) Object.assign(a, patch); }"
   + " };";
 
 new Function("document", "window", "localStorage", "fetch", "location", "navigator", patched)(
@@ -225,6 +266,57 @@ check(
   (cards.match(/冷却至/g) || []).length === 1,
   `实际 ${(cards.match(/冷却至/g) || []).length} 个`
 );
+
+// ---- 场景 1.9：无签到渠道不得渲染成红色「签到失败」（issue #210）----
+// 现场：qwenwork / kilo / oczen 卡片长期红「签到失败」，但积分照常到账。
+// 根因是 checkinTag 的三元判断顺序反了——旧写法先看 `a.last_checkin_at`，只要
+// 巡检写过一次时间戳就走红/绿分支，`noCheckin` 的灰分支**永不可达**。
+// 变异点：把三元改回「先判 last_checkin_at」→ 本节前两条立刻变红。
+{
+  const cardOf = (name) =>
+    document.getElementById("acctList").innerHTML
+      .split('<div class="acct-card').find((seg) => seg.includes(name)) || "";
+  // 复现现场：无签到渠道被写过一次失败时间戳（巡检 / 用户改过签到时间的旧版本都会造成）。
+  T.__setAccount("cline-abcdef123456", { last_checkin_at: "2026-10-30 09:00", last_checkin_ok: false });
+  T.renderAccounts();
+  const clineCard = cardOf("cline无积分号");
+  check("无签到渠道即使有失败时间戳也不显示「签到失败」",
+    clineCard !== "" && !clineCard.includes("签到失败"), clineCard.slice(0, 300));
+  check("无签到渠道显示灰标「无签到」", /tag neutral"[^>]*>无签到</.test(clineCard), clineCard.slice(0, 300));
+  check("灰标的 title 说明原因（不是空白徽标）",
+    /tag neutral" title="Cline 不支持手动签到"/.test(clineCard));
+  // 反向护栏：真正有签到活动的渠道失败时必须照旧报红（别把红标一起治没了）。
+  T.__setAccount("4298452267967801", { last_checkin_at: "2026-10-30 09:00", last_checkin_ok: false });
+  T.renderAccounts();
+  const trCard = cardOf("健康号");
+  check("有签到活动的渠道失败仍显示「签到失败」红标",
+    /tag bad"[^>]*>签到失败</.test(trCard), trCard.slice(0, 300));
+  // 复位，避免污染后续场景。
+  T.__setAccount("cline-abcdef123456", { last_checkin_at: "", last_checkin_ok: false });
+  T.__setAccount("4298452267967801", { last_checkin_at: "2026-10-02 09:00", last_checkin_ok: true });
+  T.renderAccounts();
+  // 源码级锁：顺序必须写成「先判 noCheckin」，否则下一次重构很容易又调回来。
+  check("checkinTag 先判 noCheckin 再判时间戳（issue #210 顺序锁）",
+    /const checkinTag = noCheckin\n/.test(raw));
+}
+
+// ---- 场景 1.8：停用原因徽标（R135）----
+// 为什么需要：账号被「自动停用」时（R135 的典型场景——这个 WPS 账号在 Comate 侧
+// 一个模型都没有），卡片原先只有灰底 + ▶，用户既不知道为什么被停，也不知道点 ▶ 有没有用。
+// 变异点：删掉 disabledTag 的模板拼接，本节立刻变红。
+T.__setAccount("1606848467182378", {
+  cooling: false, until: "", until_ts: 0,
+  disabled: true, reason: "该账号没有可用模型（未开通 Comate），已自动停用",
+});
+T.renderAccounts();
+const disCards = document.getElementById("acctList").innerHTML;
+check("停用账号卡片显示「已停用 · 原因」徽标", /已停用 · 该账号没有可用模型/.test(disCards));
+check("停用原因完整写进 title（不被截断）",
+  disCards.includes('title="该账号没有可用模型（未开通 Comate），已自动停用"'));
+check("停用徽标只出现在被停用的账号上（健康号不带）",
+  (disCards.match(/已停用 · /g) || []).length === 1,
+  `实际 ${(disCards.match(/已停用 · /g) || []).length} 个`);
+T.__setAccount("1606848467182378", { disabled: false, reason: "" });
 check("健康号仍在（未被过滤）", cards.includes("健康号"));
 
 // ---- 场景 1.5：OfficeAce「缺 refresh_token」持久徽标（2026-10-17 用户实测要求）----
@@ -287,6 +379,38 @@ check("非 officeace 账号不带「缺续期凭据」（渠道限定，避免�
     `实际 ${(cards.match(/需重新登录/g) || []).length} 个`);
 }
 
+// ---- 场景 1.75：真实账号可删可停 + 有积分才有「刷新积分」（R130/R136，comate/cline）----
+// 独立缺陷：旧判据 `fixedAcct = noCredits && !isCustomGroup(...)` 把 comate 当成
+// 「固定账号」⇒ 卡片只剩 🔒，无删除/停用/改名入口；而 comate 是真多账号池
+// （一份 wps_sid = 一个 WPS 账号，后端 RemoveAccount/DisableAccount 只硬拒 oczen/kilo）
+// ⇒ 粘错 sid 就永久卡死。这里锁住「无积分≠固定账号」两个维度必须分开。
+// R136 起 comate 有真实额度端点，「无积分」这一侧改由 cline 承担护栏。
+{
+  const cardOf = (name) =>
+    cards.split('<div class="acct-card').find((seg) => seg.includes(name)) || "";
+  const comateCard = cardOf("粘错sid的号");
+  check("comate 卡片渲染出来了", comateCard !== "");
+  check("comate 卡片**不得**是固定账号（无 🔒）", !comateCard.includes("固定账号，不可停用/删除"), comateCard.slice(0, 200));
+  check("comate 卡片有删除入口（粘错 sid 能删）", /onclick="removeAcct\('sid-/.test(comateCard), comateCard.slice(0, 400));
+  check("comate 卡片有停用入口", /onclick="toggleDisable\('sid-/.test(comateCard));
+  check("comate 卡片名字可改（非固定账号才可编辑）", /class="acct-name editable"/.test(comateCard));
+  // R136：comate 额度查得到（token-usage）⇒ 必须给「刷新积分」入口，不再是「不适用」。
+  check("comate 有积分 ⇒ 给「刷新积分」按钮", comateCard.includes("refreshOne('sid-"));
+  // 反向护栏：真查不到余额的 cline 仍不得给刷新入口（点下去只会报错）。
+  const clineCard = cardOf("cline无积分号");
+  check("cline 卡片渲染出来了", clineCard !== "");
+  check("cline 无积分 ⇒ 不给「刷新积分」按钮", !clineCard.includes("refreshOne('cline-"));
+  check("cline 同样**不得**是固定账号（无积分≠固定账号）",
+    !clineCard.includes("固定账号，不可停用/删除") && /onclick="removeAcct\('cline-/.test(clineCard),
+    clineCard.slice(0, 300));
+  // 反向护栏：虚拟账号（oczen）必须仍然只有 🔒（否则「解耦」就解过头了）
+  const oczenCard = cardOf("匿名");
+  check("oczen 仍是固定账号（🔒 + 无删除入口）",
+    oczenCard.includes("固定账号，不可停用/删除") && !oczenCard.includes("removeAcct('oczen"));
+  check("VIRTUAL_ACCOUNTS 只含 oczen/kilo（与无积分名单是两个维度）",
+    /const VIRTUAL_ACCOUNTS = new Set\(\["oczen", "kilo"\]\)/.test(raw));
+}
+
 // ---- 场景 1.7：「不适用」账号默认收起 + 一键展开（R103，2026-10-19 用户要求）----
 // 需求原话：「把不适用的默认隐藏掉，但是有时候又得看一下」。
 // 难点不在隐藏，而在「默认值 + 可逆 + 状态不丢」三件事同时成立：
@@ -299,13 +423,29 @@ check("非 officeace 账号不带「缺续期凭据」（渠道限定，避免�
   const healthyCardOf = () => cards.split('<div class="acct-card').find((seg) => seg.includes("健康号")) || "";
   // 注意：按 '<div class="acct-card' 切分后，段内已不含 `class="acct-card`，
   // 故断言从 `hidden" data-group=` 这一段开始匹配（直接拿 class= 开头会永远不命中）。
-  check("默认收起：「不适用」账号卡片带 hidden 且 data-na=1",
+  check("默认收起：虚拟账号卡片带 hidden 且 data-na=1",
     /^ hidden" data-group="oczen" data-na="1"/.test(naCardOf()),
     naCardOf().slice(0, 120));
   check("默认收起：有余额的卡片不带 hidden（防「一刀切全收起」）",
     !/^[^"]*hidden/.test(healthyCardOf()), healthyCardOf().slice(0, 120));
-  check("data-na 由后端 credits_na 驱动（非前端渠道名单）",
-    /data-na="\$\{isNoCreditAcct\(a\) \? 1 : 0\}"/.test(raw));
+  // 收回合判据必须是「虚拟账号」：曾用 credits_na，导致用户粘完凭据（cline/comate/
+  // 自定义渠道）后卡片带 hidden，表现为「账号没刷出来」（R131）。
+  check("data-na 由虚拟账号名单驱动（isVirtualAcct），不是 credits_na",
+    /data-na="\$\{isVirtualAcct\(a\) \? 1 : 0\}"/.test(raw)
+      && !/naHiddenClass = \(!showNoCredit && isNoCreditAcct\(a\)\)/.test(raw));
+  {
+    // 反例护栏：fixture 里的 cline 账号（credits_na=true，用户亲手粘 sk_ key 加的）
+    // 必须默认可见 —— 这就是用户报的「贴进去 wps_sid 后账号没刷出来」的同款形态。
+    const clineCard = cards.split('<div class="acct-card').find((seg) => seg.includes("cline无积分号")) || "";
+    const head = clineCard.slice(0, clineCard.indexOf(">"));
+    check("用户添加的无积分账号（cline）默认不收起",
+      clineCard !== "" && !head.includes("hidden") && head.includes('data-na="0"'),
+      head.slice(0, 160));
+    // R136：有真实额度的 comate 同样默认可见。
+    const comateCard2 = cards.split('<div class="acct-card').find((seg) => seg.includes("粘错sid的号")) || "";
+    const head2 = comateCard2.slice(0, comateCard2.indexOf(">"));
+    check("comate 账号默认不收起", comateCard2 !== "" && !head2.includes("hidden"), head2.slice(0, 160));
+  }
 
   // 汇总条：收起态下不渲染 oczen 的「不适用」chip，只留一枚可点的开关。
   T.__setShowNoCredit(false);
@@ -314,7 +454,12 @@ check("非 officeace 账号不带「缺续期凭据」（渠道限定，避免�
   check("收起时汇总条不出现 oczen 的渠道 chip", !/data-wg="oczen"/.test(sumOff), sumOff.slice(0, 200));
   check("收起时汇总条保留「不适用」开关 chip（入口在原地）",
     /data-na-toggle="1"/.test(sumOff) && sumOff.includes("不适用"));
-  check("开关 chip 标出被收起的账号数（1号）", /<span class="cs-num">1号<\/span>/.test(sumOff));
+  // 被收起的只有虚拟账号（oczen 匿名）→ 1 号。comate 虽同样 credits_na，
+  // 但它是用户添加的真实账号，不进「被收起」计数（否则数字会误导人去「展开找回」）。
+  check("开关 chip 只统计被收起的虚拟账号（1号）", /<span class="cs-num">1号<\/span>/.test(sumOff), sumOff.slice(0, 300));
+  // 反向护栏：用户添加的无积分渠道 chip 常驻汇总条（贴完就能看见渠道 N 号）。
+  check("收起时 comate 渠道 chip 仍在（用户添加的渠道不被收起）",
+    /data-wg="comate"/.test(sumOff), sumOff.slice(0, 400));
   check("收起态开关不亮 on 高亮", !/cs-chip clickable cs-na on"/.test(sumOff));
 
   // 展开态：chip 回来、开关变 on、账号卡片不再 hidden。
@@ -370,6 +515,47 @@ check("汇总条渲染了 traework", sum.includes("TraeWork"));
 check("汇总可用 = 2050+2686 = 4736", sum.includes("4,736"), sum.slice(0, 160));
 check("汇总临期 = 100", sum.includes("临期100"));
 check("汇总含合计", sum.includes("合计"));
+
+// ---- 场景 2.1：临期口径可配（R112b）----
+// 背景：R112 把临期展示固定成 1 个自然日并删掉设置项，导致「明早 05:47 到期」
+// （剩 20.8h，按自然日归「明日」）一天里大部分时间在汇总条上不显示临期。
+// 这里锁住三个不变量：
+//   ① 口径只认 1/2/7，非法值回退默认 1；
+//   ② 前端窗口天数与后端 provider.ExpireWithinDays 逐位同口径（今天算第 1 天），
+//      **不得**再用旧的 `todayUtc + expDays*24h`（那会把 1 天当成 2 天）；
+//   ③ 设置里的下拉框、state 字段与端点三处名字必须一致。
+// ① 非法值回退
+const reExpDefault = /const EXPIRING_DEF = 1;/;
+check("临期默认口径 = 1 天", reExpDefault.test(raw));
+check("前端只接受 1/2/7（其它一律回退默认）",
+  /EXPIRING_DAYS = \(n === 1 \|\| n === 2 \|\| n === 7\) \? n : EXPIRING_DEF/
+    .test(raw.replace(/\s+/g, " ").replace(/\(n === 1\)/g, "(n === 1)"))
+  || /n === 1 \|\| n === 2 \|\| n === 7/.test(raw));
+// ② 自然日口径（今天算第 1 天）：旧写法 `todayUtc + expDays * 24 * 3600 * 1000` 必须消失
+check("临期判据为「今天算第 1 天」（todayUtc + (expDays-1) 天，R112b）",
+  /todayUtc \+ \(expDays - 1\) \* 24 \* 3600 \* 1000/.test(raw));
+check("临期判据不得保留旧口径（todayUtc + expDays*24h）",
+  !/todayUtc \+ expDays \* 24 \* 3600 \* 1000/.test(raw));
+// ③ 三处名字一致：index.html 的 selExpiring、state.expiring_days、端点 /api/config/expiring_days
+const idxHtml2 = readFileSync(new URL("../cmd/wild-work/web/index.html", import.meta.url), "utf8");
+check("设置里有临期口径下拉框（三选项 1/2/7）",
+  /id="selExpiring"/.test(idxHtml2) &&
+  /<option value="1">1 日/.test(idxHtml2) &&
+  /<option value="2">2 日/.test(idxHtml2) &&
+  /<option value="7">7 日/.test(idxHtml2));
+check("下拉框只有 1/2/7 三个选项（不得回退到旧的 3 天）",
+  (idxHtml2.match(/<option value="[0-9]+">[0-9]+ 日/g) || []).length === 3 &&
+  !/<option value="3">3 日/.test(idxHtml2));
+check("前端读 state.expiring_days 并回显到下拉框",
+  /setExpiringDays\(state\.expiring_days\)/.test(raw) && /\("selExpiring"\)\.value = String\(EXPIRING_DAYS\)/.test(raw));
+check("保存时调 /api/config/expiring_days", /\/api\/config\/expiring_days/.test(raw));
+// ④ 文案不得再写死「今日到期」：三处 title 必须走 expiringLabel(天数)
+check("汇总条临期 title 随口径变化（走 expiringLabel）",
+  /expiringLabel\(EXPIRING_DAYS\)/.test(raw));
+check("明细临期章 title 随口径变化（走 expiringLabel）",
+  /expiringLabel\(expDays\)/.test(raw));
+check("不再有写死的「今日到期（次日 00:00 失效算今日）」硬文案",
+  !/今日到期（次日 00:00 失效算今日），选号时优先消耗/.test(raw));
 
 // ---- 场景 2.5：模型查找面板（纯前端过滤，全量渲染 + 列表滚动） ----
 // 假缓存共 17 个模型：qodercn 2 + workbuddy 2 + loomy 12 + cline 1（含 13 个 qwen* 用于滚动断言）
@@ -451,7 +637,7 @@ const FAKE_STATS = {
     group: "lobsterai", accounts: 0, credits: 0, credit_in: 0, credit_out: 0,
     credit_expired: 0, credit_used: 0, tokens: 0, expire_7d: 0, expire_today: 0, expire_tomorrow: 0,
   }],
-  models: [{ model: "traework/DeepSeek-V4", reqs: 3, tokens: 5000, credit: 12.5, avg_ttfb_ms: 800, avg_tok_per_sec: 45.2, perf_samples: 3 }],
+  models: [{ model: "traework/DeepSeek-V4", reqs: 3, tokens: 5000, credit: 12.5, avg_ttfb_ms: 800, tok_per_sec: 45.2, tput_window_sec: 60, perf_samples: 3 }],
   // hours_left 与 days_left 故意不同步（5.7h ⇒ days_left=0）：断言「剩余」列优先用
   // 精确小时数。若接成 days_left，会渲染成「今日到期」而看不出还剩 5.7 小时。
   // 两行：① 能外推（forecast=45，预计作废 55）；② **无法外推**（forecast=-1，
@@ -460,11 +646,14 @@ const FAKE_STATS = {
   //   ① today → 红；② tomorrow → 黄；③ later → 不上色。
   // 注意 ③ 的 risk 故意给 true：颜色必须跟 urgency 走，不跟 risk 走——
   // 此前用 risk 上色导致 7 天内的行全红（135h 后到期的也红，用户实测反馈）。
+  // 「花费」取净花费 today_spent，不取含作废的 today_out：
+  //   ① 健康号 today_out=30 里含 10 分到期作废 ⇒ 花费 20 · 已作废 10；
+  //   ② 远期号故意**不写** today_spent/today_expired（老后端形态）⇒ 必须退回 today_out=7。
   expiry: [
-    { uid: "4298452267967801", nickname: "健康号", group: "traework", expire_at: "2026-10-20T00:00:00+08:00", hours_left: 5.7, days_left: 0, amount: 100, today_out: 30, burn_forecast: 45, risk: true, urgency: "today" },
-    { uid: "4298452267967802", nickname: "闲置号", group: "qwenwork", expire_at: "2026-10-20T08:45:21+08:00", hours_left: 4.7, days_left: 0, amount: 100, today_out: 0, burn_forecast: -1, risk: true, urgency: "today" },
-    { uid: "4298452267967803", nickname: "明日号", group: "traework", expire_at: "2026-10-21T09:32:32+08:00", hours_left: 19.5, days_left: 1, amount: 115, today_out: 10, burn_forecast: 400, risk: false, urgency: "tomorrow" },
-    { uid: "4298452267967804", nickname: "远期号", group: "workbuddyai", expire_at: "2026-10-25T12:06:19+08:00", hours_left: 135.7, days_left: 5, amount: 249, today_out: 0, burn_forecast: -1, risk: true, urgency: "later" },
+    { uid: "4298452267967801", nickname: "健康号", group: "traework", expire_at: "2026-10-20T00:00:00+08:00", hours_left: 5.7, days_left: 0, amount: 100, today_out: 30, today_spent: 20, today_expired: 10, burn_forecast: 45, risk: true, urgency: "today" },
+    { uid: "4298452267967802", nickname: "闲置号", group: "qwenwork", expire_at: "2026-10-20T08:45:21+08:00", hours_left: 4.7, days_left: 0, amount: 100, today_out: 0, today_spent: 0, today_expired: 0, burn_forecast: -1, risk: true, urgency: "today" },
+    { uid: "4298452267967803", nickname: "明日号", group: "traework", expire_at: "2026-10-21T09:32:32+08:00", hours_left: 19.5, days_left: 1, amount: 115, today_out: 10, today_spent: 10, today_expired: 0, burn_forecast: 400, risk: false, urgency: "tomorrow" },
+    { uid: "4298452267967804", nickname: "远期号", group: "workbuddyai", expire_at: "2026-10-25T12:06:19+08:00", hours_left: 135.7, days_left: 5, amount: 249, today_out: 7, burn_forecast: -1, risk: true, urgency: "later" },
   ],
   rotation: [{
     group: "traework",
@@ -544,17 +733,30 @@ check("到期时刻渲染为完整标准时间（含时分秒，无 T、无时�
   stExpiry.includes("2026-10-20 00:00:00") &&
   !stExpiry.includes("2026-10-20T00:00:00"));
 // forecast<0（今日没消耗、无法外推）时按「全部额度作废」显示，
-// 不能出现「预计作废 -1分」这种反数。
-// forecast<0 的号（今日没消耗）必须显示「预计作废 100分」（全部额度），
-// 而不是「预计作废 -1分」这种反数。
-check("预计作废不为负（forecast<0 按全部额度）",
-  stExpiry.includes("预计作废 100分") &&
-  !/预计作废\s*-\d/.test(stExpiry));
-check("预计作废量 = 额度−外推消耗（55分）", stExpiry.includes("预计作废 55分"));
+// 必须出「到期前还会废 100分」，不能出现「到期前还会废 -1分」这种反数。
+check("到期前还会废不为负（forecast<0 按全部额度）",
+  stExpiry.includes("到期前还会废 100分") &&
+  !/到期前还会废\s*-\d/.test(stExpiry));
+check("到期前还会废量 = 额度−外推消耗（55分）", stExpiry.includes("到期前还会废 55分"));
+// 今日花费必须取净花费（today_spent=20，已扣掉 10 分作废），不能显示差值 30：
+// 这正是用户报的「都消耗完了怎么还有作废」——差值把作废算成消耗，才会自相矛盾。
+check("今日花费取净花费而非差值（花费 20，非 30）",
+  stExpiry.includes("花费 20") && !stExpiry.includes("花费 30"));
+// 「今日已废」与「到期前还会废」是两个不同的包，文案必须带批次限定词，
+// 否则并排显示会被读成「废了两次」（实测用户观感）。
+check("今日作废额带批次限定词（今日已废 10）", stExpiry.includes("今日已废 10"));
+// 无 today_spent/today_expired 的老后端载荷必须退回 today_out，不能渲染空白或 NaN。
+check("老后端无 today_spent 时退回差值（花费 7）",
+  stExpiry.includes("花费 7") && !stExpiry.includes("NaN"));
 
 const stModels = document.getElementById("stModels").innerHTML;
 check("Trae 系模型积分为估算（≈ 前缀）", stModels.includes("≈12.50"));
-check("模型平均速度含 tok/s 与 TTFB", stModels.includes("45.2 tok/s") && stModels.includes("800ms"));
+check("模型当前速度含 tok/s 与 TTFB（滑动窗口口径）", stModels.includes("45.2 tok/s") && stModels.includes("800ms"));
+// R147：窗口内无投递（tok_per_sec=0）必须显示「—」，绝不允许渲染 "0 tok/s"
+// ——0 会被读成「模型卡死」，而实际含义是「最近窗口内没有流式请求」。
+T.renderModels([{ model: "x/y", reqs: 1, tokens: 10, credit: 0, avg_ttfb_ms: 0, tok_per_sec: 0, tput_window_sec: 60, perf_samples: 1 }]);
+const stModelsEmpty = document.getElementById("stModels").innerHTML;
+check("窗口无样本显示「—」而非 0 tok/s", stModelsEmpty.includes("—") && !stModelsEmpty.includes("0 tok/s"), stModelsEmpty.slice(0, 300));
 
 T.renderAbnormal(FAKE_STATS.abnormal);
 const stAbnormal = document.getElementById("stAbnormal").innerHTML;
@@ -678,6 +880,31 @@ check("用量卡片 5 列同行（.usage-cards repeat(5)）", /\.usage-cards \{[
   check("模型表渲染平均速度列（无速度样本显示「—」）", (rowsHtml.match(/—/g) || []).length >= 2, rowsHtml.slice(0, 300));
   T2.renderModelTable([], 1);
   check("模型表空态占位行跨 7 列", document.getElementById("tblModelstbody").innerHTML.includes('colspan="7"'));
+}
+
+const regexOk = (re) => re.test(raw);
+
+// ---- 场景 1.8：Comate 登录三条路径（R132）----
+// 起因：分支构建部署到 NAS 后，用户点「一键登录」什么也没发生 —— CDP 拉起的是
+// **运行 wild-work 那台机器**的浏览器，而 NAS 没有桌面。结论不是把报错写漂亮，
+// 而是换一条与部署环境无关的登录路径：服务端申请二维码（扫码），外加可选的
+// 「接管本机浏览器」（用户自己开调试端口时才有）。
+{
+  const html = readFileSync(new URL("../cmd/wild-work/web/index.html", import.meta.url), "utf8");
+  check("弹层带扫码区（服务端申请二维码）", html.includes('id="comateQrImg"') && html.includes('id="btnComateQrStart"'));
+  check("弹层带「用本机浏览器登录」区（默认隐藏，由能力探测决定是否显示）",
+    html.includes('id="comateBrowser"') && /<div class="cfg-section hidden" id="comateBrowser"/.test(html));
+  check("浏览器入口按钮由前端轮询后端状态", regexOk(/btnComateBrowserStart"\).onclick[\s\S]{0,120}startComateBrowser\(\)/));
+  check("打开弹层先探测浏览器能力，而不是先发登录请求",
+    /async function loadComateBrowserInfo/.test(raw) && /openComateDialog[\s\S]{0,400}loadComateBrowserInfo/.test(raw));
+  check("未配置调试端口时整块隐藏（不摆点了必失败的按钮）",
+    /function loadComateBrowserInfo[\s\S]{0,900}!info\.configured\) return/.test(raw));
+  check("配置了但端口不通时给出原因并禁用按钮",
+    /info\.available[\s\S]{0,300}disabled = !info\.available/.test(raw));
+  check("扫码轮询走后端状态接口", /comatePollPath = "\/api\/login\/comate_qr_status"/.test(raw));
+  check("关闭弹层同时取消扫码与浏览器两条会话",
+    /cancelComateLogin[\s\S]{0,400}comate_qr_cancel[\s\S]{0,200}comate_browser_cancel/.test(raw));
+  check("手工兜底仍在（整段 Cookie 也能粘）", html.includes('id="comateSidInput"') && html.includes('id="btnComateToggleManual"'));
 }
 
 // ---- 输出 ----
@@ -868,8 +1095,31 @@ for (const [label, re] of uniq) {
     // 响应式：断点是按实测溢出阈值卡位的，调宽会破坏桌面端逐像素一致性，调窄则手机仍溢出。
     ["渠道按钮基础为 6 列（消除孤行，按钮数变动时按行自然流）", css.includes("repeat(6, auto)")],
     ["渠道按钮摆位全归 CSS（index.html 不再内联 grid-column，否则窄屏无法重排）", !/btnAdd\w+" style="grid-column/.test(html)],
-    ["渠道按钮 DOM 顺序 = 列配对（同列上下 = 同渠道国内/国际版；自定义渠道垫底）",
-      /btnAddWB\b[\s\S]*?btnAddQoderCN\b[\s\S]*?btnAddTrae\b[\s\S]*?btnAddMonkeyCode\b[\s\S]*?btnAddLoomy\b[\s\S]*?btnAddCline\b[\s\S]*?btnAddWBAI\b[\s\S]*?btnAddQoderCOM\b[\s\S]*?btnAddQwen\b[\s\S]*?btnAddRaccoon\b[\s\S]*?btnAddGLM\b/.test(html)],
+    // R142（2026-10-30 用户拍板）：渠道展示序唯一规则 = 内建渠道按**显示名的 UTF-8 字节序**升序，
+    // 自定义渠道 / 自定义模型**硬编码钉在最末**。三处（面板按钮 / 汇总条 / 后端费率 tab）
+    // 必须同序，否则「账号卡片看到的顺序」与「费率 tab 的顺序」互相打脸。
+    // 下面不再硬编码一串按钮 id（旧的「列配对」写法与字母序规则冲突，已删除）：
+    // 把按钮的 `alt <短类名>` 还原成渠道 key，再断言「它确实按显示名字节序升序 + 自定义垫底」。
+    ["渠道按钮 DOM 顺序 = 按渠道显示名字节序升序，自定义模型垫底（R142）",
+      (() => {
+        const cls2keyOf = (() => {
+          const src = raw.match(/const CH_CLASS = (\{[^}]*\});/);
+          const m = src ? new Function("return (" + src[1] + ")")() : {};
+          const inv = {};
+          for (const [k, c] of Object.entries(m)) inv[c] = k;
+          return inv;
+        })();
+        const labelsOf = (() => {
+          const src = raw.match(/const CH_LABEL = (\{[^}]*\});/);
+          return src ? new Function("return (" + src[1] + ")")() : {};
+        })();
+        const btns = [...html.matchAll(/<button class="btn primary alt (\S+)" id="(btnAdd\w+|btnOpenCustomModels)"/g)]
+          .map((m) => ({ cls: m[1], id: m[2] }));
+        const keys = btns.filter((b) => b.id !== "btnOpenCustomModels").map((b) => cls2keyOf[b.cls]);
+        const sorted = keys.slice().sort((a, b) => (labelsOf[a] < labelsOf[b] ? -1 : labelsOf[a] > labelsOf[b] ? 1 : 0));
+        return btns.length > 0 && btns[btns.length - 1].id === "btnOpenCustomModels" && !keys.includes(undefined) &&
+          keys.join("|") === sorted.join("|");
+      })()],
     ["窄屏渠道按钮自适应列（auto-fit，118px 可在 320px 竖屏排出两列）", css.includes("repeat(auto-fit, minmax(118px, 1fr))")],
     ["按钮紧凑档字号（12px，PC 一行放下 6 个）", /\.panel-actions-wrap \.btn \{ font-size: 12px;/.test(css)],
     // Cline 实测元数据链路：Go 侧（measuredCaps 表 / ContextFromAPI=false / solar 不支持图像）
@@ -917,6 +1167,64 @@ for (const [label, re] of uniq) {
     ["降级链 hint 写明两种触发形态（模型全冷 / 整渠道全灭）",
       /无账号可承载[\s\S]{0,120}整渠道/.test(html)],
     ["降级记录区块标题不再写死「主模型全冷」", !html.includes("主模型全冷切备胎")],
+  ];
+  for (const [label, pass] of need) {
+    console.log(`  ${pass ? "✅" : "❌"} ${label}`);
+    if (!pass) failed++;
+  }
+}
+
+// ---- 降级链别名（R129）：head 行内输入框 + 只读 chip + 复制 + ? 说明 + 前端校验 ----
+// 与上面同族：别名是「后端有字段、面板没接线」就完全不生效的功能，故把接线一并锁死。
+{
+  const html = readFileSync(new URL("../cmd/wild-work/web/index.html", import.meta.url), "utf8");
+  const need = [
+    // 输入框必须在规则 head 行内（不额外占一行）——渲染模板里 .fb-rule-head 内出现 fb-name-edit
+    ["别名输入框渲染在规则 head 行内（不额外占行）",
+      /class="fb-rule-head">[\s\S]{0,600}fb-name-edit[\s\S]{0,400}fb-from-edit/.test(raw)],
+    ["别名输入框带 data-name-idx 与可选占位提示",
+      raw.includes("data-name-idx=") && raw.includes("别名（可选，如 fast）")],
+    ["卡片正文有只读别名 chip（「客户端可直接请求」）",
+      raw.includes("fb-alias-chip") && raw.includes("客户端可直接请求")],
+    ["chip 带复制按钮且接线到 copyText",
+      raw.includes("data-copy-alias") && /data-copy-alias\][\s\S]{0,200}copyText\(/.test(raw)],
+    ["无别名时 chip 不渲染（条件模板）",
+      /\$\{r\.name \?/.test(raw)],
+    ["? 说明写明别名语义（等同于主力模型 + 不参与备胎链 + 大小写敏感）",
+      html.includes("别名</b>是主力模型的另一个名字") && html.includes("别名不参与备胎链")
+      && html.includes("大小写敏感")],
+    ["别名输入框 change 提交接线（校验 + 回滚）",
+      raw.includes('classList.contains("fb-name-edit")') && raw.includes("不能含 / 、空白、逗号或 *")],
+    ["前端即时校验覆盖硬拒分支（斜杠 / 空白逗号星号 / 重名 / model_map / 渠道名）",
+      raw.includes("function fbAliasValidate()") && raw.includes("compat.model_map 的键重名")
+      && raw.includes("与渠道名重名") && raw.includes("别名不可重复")],
+    ["软警告（与真实裸名重合）只提示、不阻止保存",
+      html.includes('id="fbAliasWarn"') && /bareNames\.has\(nm\)[\s\S]{0,120}warns\.push/.test(raw)
+      && /const \[hardErr\] = fbAliasValidate\(\);[\s\S]{0,120}if \(hardErr\)/.test(raw)],
+    ["保存后端硬拒别名含 /（唯一真相在服务端）",
+      readFileSync(new URL("../internal/app/app.go", import.meta.url), "utf8").includes("不能含 /（别名是裸名")],
+    // 前端即时校验的**行为**断言（不只看代码里有几行）：逐条硬拒必须报错，
+    // 裸名重合必须只出软警告（否则用户被硬拦或根本不知情）。
+    ["前端即时校验：六条硬拒各一例都报错",
+      (() => {
+        const cases = [
+          [{ from: "a/b", to: ["c/d"], name: "x/y" }],
+          [{ from: "a/b", to: ["c/d"], name: "x y" }],
+          [{ from: "a/b", to: ["c/d"], name: "x,y" }],
+          [{ from: "a/b", to: ["c/d"], name: "x*" }],
+          [{ from: "a/b", to: ["c/d"], name: "dup" }, { from: "a/e", to: ["c/d"], name: "dup" }],
+          [{ from: "a/b", to: ["c/d"], name: "workbuddy" }],
+        ];
+        return cases.every((rs) => { T.__setFbRules(rs); return T.fbAliasValidate()[0] !== ""; });
+      })()],
+    ["前端即时校验：空别名合法（不报错不警告）",
+      (() => { T.__setFbRules([{ from: "a/b", to: ["c/d"], name: "" }]);
+        const [h, w] = T.fbAliasValidate(); return h === "" && w === ""; })()],
+    ["前端即时校验：与真实裸名重合只出软警告（不硬拦）",
+      (() => { T.__setFbRules([{ from: "a/b", to: ["c/d"], name: "glm-5.3" }]);
+        const [h, w] = T.fbAliasValidate(); return h === "" && w.includes("裸名重合"); })()],
+    ["软警告不阻止保存（saveModelFallback 只硬拦 hardErr）",
+      raw.includes(`if (hardErr) { $("fbErr").textContent = hardErr; return; }`)],
   ];
   for (const [label, pass] of need) {
     console.log(`  ${pass ? "✅" : "❌"} ${label}`);
@@ -1695,8 +2003,9 @@ for (const [label, re] of uniq) {
     raw.includes("for (let l = 42; l >= 22; l--)") &&
     raw.includes("1.05 / (relLuminance(hex) + 0.05) >= 4.5"));
 
-  // 内建 21 色两两可辨：完全同色会导致图上两条线重叠（原 zcode/qwenwork、
+  // 内建渠道色两两可辨：完全同色会导致图上两条线重叠（原 zcode/qwenwork、
   // gemini/wb、codearts/qoder、lobsterai/loomy 四对完全相同）
+  // 数量从 CH_CLASS 派生，不写死：写死时新增渠道（comate 是第 22 个）会让标签与实际脱节。
   const hexOf = {};
   for (const c of CH) {
     const m = css.match(new RegExp(`--ch-${c}:\\s*(#[0-9a-fA-F]{6})`));
@@ -1707,7 +2016,9 @@ for (const [label, re] of uniq) {
   for (let i = 0; i < names.length; i++)
     for (let j = i + 1; j < names.length; j++)
       if (hexOf[names[i]] === hexOf[names[j]]) dup.push(`${names[i]}=${names[j]}`);
-  checkPal("21 个内建渠道色两两不同（无完全同色）", dup.length === 0, dup.join(", "));
+  // 计数只报内建（hexOf 含 custom 兜底色，它不是一条渠道）
+  const builtinColorCount = Object.keys(hexOf).filter((k) => k !== "custom").length;
+  checkPal(`${builtinColorCount} 个内建渠道色两两不同（无完全同色）`, dup.length === 0, dup.join(", "));
 
   checkPal("渠道按钮配色全部走 var(--ch-*)，CSS 里无硬编码 hex",
     !/\.btn\.primary\.alt[^{]*\{[^}]*#[0-9a-fA-F]{6}/.test(css));
@@ -1778,14 +2089,65 @@ for (const [label, re] of uniq) {
     checkPal("前端 RESERVED_CHANNEL_NAMES 覆盖全部内建渠道（与 provider.BuiltinKinds 同集）",
       missingReserved.length === 0, `缺 ${missingReserved.join(", ")}`);
 
-    // 2) 积分汇总条顺序：漏渠道 → 该渠道被按字母序垫到最末（注释却说与按钮布局一致）。
-    const orderSrc = raw.match(/const CH_SUMMARY_ORDER = (\[[\s\S]*?\]);/);
-    const order = orderSrc ? new Function("return " + orderSrc[1])() : [];
-    const missingOrder = BUILTIN_CH
-      .map((cls) => Object.keys(CH_CLASS).find((k) => CH_CLASS[k] === cls))
-      .filter((k) => k && !order.includes(k));
-    checkPal("CH_SUMMARY_ORDER 覆盖全部内建渠道（漏项会按字母序垫到最末）",
-      missingOrder.length === 0, `缺 ${missingOrder.join(", ")}`);
+    const labelSrc = raw.match(/const CH_LABEL = (\{[^}]*\});/);
+    const labelMap = labelSrc ? new Function("return (" + labelSrc[1] + ")")() : {};
+
+    // 2) R142 起汇总条顺序**不再手写数组**：手写清单每加一个渠道都要人工同步一份，
+    //    漏改是静默降级（该渠道被垫到最末）。断言它确是由 CH_LABEL 派生 + 按显示名字节序排序。
+    const derivedOrder = /const CH_SUMMARY_ORDER = Object\.keys\(CH_LABEL\)[\s\S]{0,300}?chLabel\(/.test(raw);
+    const handWritten = /const CH_SUMMARY_ORDER = \[/.test(raw);
+    checkPal("CH_SUMMARY_ORDER 由 CH_LABEL 派生（不再手写渠道数组，漏改会静默垫到最末）",
+      derivedOrder && !handWritten, handWritten ? "仍是手写数组" : "未按 CH_LABEL 派生");
+
+    // 2b) 跨语言同序：JS 派生出的汇总条顺序必须与 Go 的 ChannelDisplayOrder 逐项相同。
+    //     Go 侧顺序 = builtinKindList 按 DisplayNames 的字节序（provider.sortedKindsByDisplayName
+    //     现算），这里按同一规则模拟一遍再比 —— 任一侧换了排序口径（例如 JS 用 localeCompare、
+    //     Go 换比较函数）都会红。
+    const labelOf = (k) => labelMap[k] || k;
+    const order = Object.keys(labelMap).sort((a, b) => (labelOf(a) < labelOf(b) ? -1 : labelOf(a) > labelOf(b) ? 1 : 0));
+    {
+      const goSrc = readFileSync(new URL("../internal/provider/provider.go", import.meta.url), "utf8");
+      const kindListSrc = goSrc.match(/var builtinKindList = \[\]Kind\{([\s\S]*?)\n\}/);
+      const kindList = kindListSrc
+        ? [...kindListSrc[1].replace(/\/[\/].*$/gm, "").matchAll(/\b([A-Z][A-Za-z]+)\b/g)].map((m) => m[1])
+        : [];
+      const constOf = {};
+      for (const m of goSrc.matchAll(/^\t([A-Za-z]+)\s+Kind = "([^"]+)"/gm)) constOf[m[1]] = m[2];
+      const goDisp = {};
+      for (const m of goSrc.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "")
+        .matchAll(/^\t([A-Za-z]+):\s*"([^"]*)",$/gm)) goDisp[m[1]] = m[2];
+      const goOrder = kindList.map((cn) => [constOf[cn], goDisp[cn]]).filter((p) => p[0] && p[1])
+        .sort((a, b) => (a[1] < b[1] ? -1 : a[1] > b[1] ? 1 : 0)).map((p) => p[0]);
+      const diff = [];
+      if (goOrder.length !== order.length) diff.push(`Go 内建渠道 ${goOrder.length} 个，JS CH_LABEL ${order.length} 个`);
+      for (let i = 0; i < Math.min(goOrder.length, order.length); i++)
+        if (goOrder[i] !== order[i]) diff.push(`第 ${i} 位 JS=${order[i]} Go=${goOrder[i]}`);
+      checkPal("汇总条顺序（JS 由 CH_LABEL 派生）与后端 ChannelDisplayOrder（Go 由 DisplayNames 派生）逐项同序（R142）",
+        diff.length === 0, diff.join("; "));
+    }
+
+    // 2c) Go/JS 显示名必须逐项一致（R142 起排序键就是显示名，漂移会让前后端排出两个顺序）。
+    //     provider.DisplayNames 是 Go 侧真源，CH_LABEL 是 JS 侧副本，两边任一改动都要同步。
+    {
+      const goSrc = readFileSync(new URL("../internal/provider/provider.go", import.meta.url), "utf8");
+      // 表形如：WorkBuddy: "WorkBuddyCN",  注释与空行不参与
+      const goDisp = {};
+      for (const m of goSrc.replace(/\/\*[\s\S]*?\*\//g, "").replace(/^\s*\/\/.*$/gm, "")
+        .matchAll(/^\t([A-Za-z]+):\s*"([^"]*)",$/gm)) goDisp[m[1]] = m[2];
+      // Go 常量名 → kind 字符串（常量定义行形如 `Cline Kind = "cline"`）
+      const constOf = {};
+      for (const m of goSrc.matchAll(/^\t([A-Za-z]+)\s+Kind = "([^"]+)"/gm)) constOf[m[1]] = m[2];
+      const drift = [];
+      for (const [cn, name] of Object.entries(goDisp)) {
+        const kindStr = constOf[cn];
+        if (!kindStr) { drift.push(`Go 常量 ${cn} 找不到对应 kind`); continue; }
+        if (labelMap[kindStr] !== name) drift.push(`${kindStr}: JS=${labelMap[kindStr] ?? "(无)"} Go=${name}`);
+      }
+      const missInGo = Object.keys(labelMap).filter((k) => !Object.values(goDisp).includes(labelMap[k]));
+      if (missInGo.length) drift.push(`Go 缺显示名: ${missInGo.join(", ")}`);
+      checkPal("渠道显示名 Go(provider.DisplayNames) 与 JS(CH_LABEL) 逐项一致（排序键漂移会让前后端排出两个顺序）",
+        Object.keys(goDisp).length > 0 && drift.length === 0, drift.join("; "));
+    }
 
     // 3) 无签到渠道必须有无签到文案：落兜底「无签到」会把「自动领日活」说错。
     const noExpSrc = raw.match(/const NO_EXPLICIT_CHECKIN = new Set\(\[([^\]]*)\]\)/);
@@ -1801,7 +2163,7 @@ for (const [label, re] of uniq) {
       !/const CH_NAMES\b/.test(raw) && /const chLabel = \(k\) => CH_LABEL\[k\]/.test(raw));
 
     // 5) 配色规范文档必须与 CSS 实际色值一致（R99 文档化）。
-    // 为什么需要：docs/渠道配色规范.md 把 21 个色值当「规范基线」公布，一旦有人改
+    // 为什么需要：docs/渠道配色规范.md 把全部内建色值当「规范基线」公布，一旦有人改
     // CSS 不改文档，文档就变成错误信息（比没文档更糟——后来者会按错的基线去改）。
     // 这里逐行比对 §3 色值表的 hex 与 :root 的 --ch-*，任一不一致即失败。
     {

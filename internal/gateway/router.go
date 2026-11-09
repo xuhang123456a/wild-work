@@ -8,6 +8,7 @@ package gateway
 
 import (
 	"fmt"
+	"log"
 	"sort"
 	"strings"
 
@@ -19,6 +20,10 @@ type Router struct {
 	Default  string            // 兜底渠道，如 "workbuddy"
 	Map      map[string]string // 裸名 → "channel/model"
 	Channels []string          // 已知渠道（校验前缀 + 报错提示）
+	// Aliases 降级链别名 → 主力模型全路径（R129）。与 Map 同层，但**优先级更高**：
+	// 别名是结构化配置、最具体；且它只在入口解析（不参与备胎链）。
+	// 派生只发生在 config.AliasIndex（单一来源），本字段只是它的副本。
+	Aliases map[string]string
 }
 
 // Resolve 解析模型名，返回 "channel/model"。返回的 model 值可能带前缀，调用方勿再重复拼接。
@@ -41,6 +46,13 @@ func (rt *Router) Resolve(model string) (string, error) {
 			prefix, m, strings.Join(rt.Channels, ", "))
 	}
 
+	// 别名（R129）：**先于** model_map / default_channel。别名恒为裸名（不含 `/`），
+	// 因此不会进入上面的「已带前缀」分支，那一支行为完全不变。
+	if target := strings.TrimSpace(rt.Aliases[m]); target != "" {
+		log.Printf("[compat] alias resolved: %s -> %s", m, target)
+		return target, nil
+	}
+
 	// model_map 精确匹配
 	if v := strings.TrimSpace(rt.Map[m]); v != "" {
 		return rt.resolveMapped(m, v)
@@ -56,8 +68,17 @@ func (rt *Router) Resolve(model string) (string, error) {
 		return provider.ModelIDPrefix(provider.Kind(rt.Default)) + "/" + m, nil
 	}
 	return "", fmt.Errorf("model %q needs an explicit channel prefix (e.g. %s/%s); "+
-		"or set compat.default_channel / compat.model_map in config.json",
-		m, firstOr(rt.Channels, "workbuddy"), m)
+		"or set compat.default_channel / compat.model_map in config.json%s",
+		m, firstOr(rt.Channels, "workbuddy"), m, rt.aliasHint())
+}
+
+// aliasHint 拼给「未知模型名」错误的可行动提示（未配置别名时为空串，不产生噪声）。
+// 文案必须让用户能自助纠正：打错别名时知道去哪里看可用清单（R129）。
+func (rt *Router) aliasHint() string {
+	if len(rt.Aliases) == 0 {
+		return ""
+	}
+	return "（可用别名见 /v1/models 中带 alias 标记的条目）"
 }
 
 // resolveMapped 校验映射目标：必须带已知渠道前缀或上游命名空间前缀，否则视为配置错误。

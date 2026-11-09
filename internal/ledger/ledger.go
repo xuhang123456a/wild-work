@@ -33,6 +33,10 @@ type UsageEntry struct {
 	CR    int64  `json:"cr,omitempty"`  // 缓存命中(prompt cache hit) tokens，PT 的子集
 	CRC   bool   `json:"crc,omitempty"` // 上游**是否上报**该维度（区分「未命中 0」与「不提供」）
 	Src   string `json:"src,omitempty"` // upstream=上游返回 | none=无 usage（token 记 0，仅计请求数）
+	// Credit 上游 usage 帧里的**单次精确积分**（comate 的 usage.credits，R130）。
+	// omitempty：不提供该维度的渠道（绝大多数）行里不带此字段，旧流水读出来就是 0
+	// ——符合不变量 5「只增不减」，且不把「不知道」写成「花了 0」。
+	Credit float64 `json:"credit,omitempty"`
 }
 
 // 关于 CR/CRC 的语义（**不可省**，否则面板会把「不知道」显示成「0%」）：
@@ -86,9 +90,20 @@ func New(dir string) (*Ledger, error) {
 	return l, nil
 }
 
+// monthTagShift 返回 t 往前 back 个月的月份标签（200601）。
+//
+// 必须先把日期归到「当月 1 号」再做月份减法：直接 t.AddDate(0,-back,0) 在月末会溢出——
+// 10 月 31 日减 1 个月得到「9 月 31 日」，Go 规整成 10 月 1 日，标签与本月**完全相同**。
+// 后果：保留期 cutoff 往后跳一格，启动清理时把本该保留的上月分段也删掉
+// （keepMonths=1 时，31 日启动会连当月之外的两个月一起删）。
+func monthTagShift(t time.Time, back int) string {
+	first := time.Date(t.Year(), t.Month(), 1, 0, 0, 0, 0, t.Location())
+	return first.AddDate(0, -back, 0).Format("200601")
+}
+
 // cleanup 删除保留窗口之外的月分段文件（失败静默：锦上添花功能不阻塞启动）。
 func (l *Ledger) cleanup() {
-	cutoff := time.Now().AddDate(0, -keepMonths, 0).Format("200601")
+	cutoff := monthTagShift(time.Now(), keepMonths)
 	ents, err := os.ReadDir(l.dir)
 	if err != nil {
 		return
@@ -374,6 +389,9 @@ type ModelStat struct {
 	CR     int64 `json:"cr,omitempty"`
 	CRCov  int64 `json:"cr_cov,omitempty"`
 	CRReqs int64 `json:"cr_reqs,omitempty"`
+	// Credit 窗口内逐请求精确积分小计（仅上游 usage 帧带回积分的渠道，如 comate，R130）。
+	// omitempty：无此维度的渠道整列不出现，前端据此判定「无样本」而非「花了 0」。
+	Credit float64 `json:"credit,omitempty"`
 }
 
 // RecentCredit 最近一条积分流水（展示用）。
@@ -508,6 +526,7 @@ func (l *Ledger) Query(days int, enrich func(uid string) (name, channel string))
 					ms.Requests++
 					ms.PT += e.PT
 					ms.CT += e.CT
+					ms.Credit += e.Credit
 					if e.CRC {
 						ms.CR += e.CR
 						ms.CRCov += e.PT

@@ -409,10 +409,24 @@ function attachEffortPicker(input, opts) {
 //   ② 触屏设备不派发 mouseenter/mouseleave，手机上既打不开也关不掉；
 //   ③ hover 模型把「翻页」与「移出即关」耦合成矛盾诉求（要翻页就得移进浮窗）。
 const DETAIL_PAGE_SIZE = 8;
-// EXPIRING_DAYS 面板「临期」标记的展示窗口（自然日）。
-// 与后端 provider.ExpiringDays 同值：2026-10-20 起阈值不再是设置项，
-// 选号看「最早到期时刻」（R112），这个窗口只影响明细里的红色「临期」章。
-const EXPIRING_DAYS = 1;
+// EXPIRING_DAYS 面板「临期」标记的**默认**展示窗口（自然日）。
+// 由后端 state.expiring_days 覆盖（1/2/7，设置里可选）；缺省 1 = 今日到期。
+// 它只影响展示：① 汇总条/卡片的「临期 X」；② 明细里的红色「临期」章。
+// 2026-10-20 起的 R112 曾把它固定成 1 且删掉设置项，导致「明早 05:47 到期」
+// （剩 20.8h，按自然日归明日）一天里大部分时间不显示临期；R112b 恢复为可配，
+// 口径与运行统计三桶一致（1=今日到期，2=今日+明日，7=7 日内到期）。
+const EXPIRING_DEF = 1;
+let EXPIRING_DAYS = EXPIRING_DEF;
+// setExpiringDays 应用后端下发的口径（只认 1/2/7，其它一律当默认）。
+function setExpiringDays(n) {
+  EXPIRING_DAYS = (n === 1 || n === 2 || n === 7) ? n : EXPIRING_DEF;
+}
+// expiringLabel 口径的中文说明（tooltip / 侧栏文案单一来源）。
+function expiringLabel(n) {
+  if (n === 2) return "2 个自然日（今日+明日，次日 00:00 失效算今日）";
+  if (n === 7) return "7 个自然日（含今日，次日 00:00 失效算今日）";
+  return "今日到期（次日 00:00 失效算今日）";
+}
 let detailCache = {};
 // detailState 当前浮窗的展示状态：{uid, page}。
 let detailState = null;
@@ -553,9 +567,9 @@ function renderCreditDetail() {
 
   const items = d.items.slice();
   // 临期判定与后端 provider.ExpireWithinDays 同口径：**自然日**（窗口内到期）。
-  // 判据 = 失效时刻 - 零点宽限 所属自然日 ≤ 今天+days（次日 00:00 失效算今日）。
-  // 窗口固定 1 天（= 后端 provider.ExpiringDays）：2026-10-20 起阈值不再可配，
-  // 选号改看「最早到期时刻」，这个窗口只决定明细里打不打「临期」红章。
+  // 判据 = 失效时刻 - 零点宽限 所属自然日 ≤ 今天 + (days-1) 天（次日 00:00 失效算今日）。
+  // 窗口由设置项选出（state.expiring_days，1/2/7），与后端 provider.ExpireWithinDays
+  // 逐位同口径（今天算第 1 天：days=1 只含今天）。
   const expDays = EXPIRING_DAYS;
   // expireInstantUtc 失效时刻的真实 UTC 毫秒，与后端 provider.ExpireInstant 同口径：
   //   日期粒度（YYYY-MM-DD）= 该日全天可用 ⇒ **次日 00:00（UTC+8）**才失效；
@@ -580,12 +594,12 @@ function renderCreditDetail() {
   };
   const nowCst = new Date(Date.now() + 8 * 3600 * 1000);
   const todayUtc = Date.UTC(nowCst.getUTCFullYear(), nowCst.getUTCMonth(), nowCst.getUTCDate()) - 8 * 3600 * 1000;
-  // 临期：失效自然日 ≤ 今天 + expDays 天（含），且尚未失效
+  // 临期：失效自然日 ≤ 今天 + (expDays-1) 天（含），且尚未失效
   const isExpiring = (s) => {
     const day = expireDayUtc(s), inst = expireInstantUtc(s);
     if (day === null || inst === null) return false;
     if (inst <= Date.now()) return false;
-    return day <= todayUtc + expDays * 24 * 3600 * 1000;
+    return day <= todayUtc + (expDays - 1) * 24 * 3600 * 1000;
   };
   // 排序：临期（可消耗、有剩余、窗口内到期）→ 可用 → 已用完/不可用/仅展示垫底；组内按到期日升序。
   const expUtcOf = (it) => {
@@ -647,7 +661,7 @@ function renderCreditDetail() {
       const expUtc = expireInstantUtc(it.expire_at);
       if (expUtc !== null) {
         if (isExpiring(it.expire_at)) {
-          expCell = `${esc(it.expire_at)}<span class="detail-exp-tag" title="今日到期（${expDays} 个自然日，次日 00:00 失效算今日），选号时优先消耗">临期</span>`;
+          expCell = `${esc(it.expire_at)}<span class="detail-exp-tag" title="${esc(expiringLabel(expDays))}，选号时优先消耗">临期</span>`;
           expCellCls = ' class="detail-exp"';
           cls = ' class="detail-exp-row"';
         } else {
@@ -733,8 +747,8 @@ function renderTopbar() {
 }
 
 // 渠道显示名与 CSS 短类名（后端 group / 费率 channel 均为 provider.Kind）。
-const CH_LABEL = { workbuddy: "WorkBuddyCN", workbuddyai: "WorkBuddyAI", traework: "TraeWork", traecode: "TraeCode", qoder: "Qoder", qodercn: "QoderCN", qodercom: "QoderCOM", qwenwork: "千问办公", glm: "智谱清言", monkeycode: "MonkeyCode", raccoon: "小浣熊", loomy: "Loomy", oczen: "OpenCodeZen", kilo: "Kilo", minimax: "MiniMax", lobsterai: "LobsterAI", zcode: "ZCode", gemini: "Gemini", codearts: "CodeArts", cline: "Cline", officeace: "OfficeAce" };
-const CH_CLASS = { workbuddy: "wb", workbuddyai: "wbai", traework: "trae", traecode: "traecode", qoder: "qoder", qodercn: "qodercn", qodercom: "qodercom", qwenwork: "qwenwork", glm: "glm", monkeycode: "monkeycode", raccoon: "raccoon", loomy: "loomy", oczen: "oczen", kilo: "kilo", minimax: "minimax", lobsterai: "lobsterai", zcode: "zcode", gemini: "gemini", codearts: "codearts", cline: "cline", officeace: "officeace" };
+const CH_LABEL = { workbuddy: "WorkBuddyCN", workbuddyai: "WorkBuddyAI", traework: "TraeWork", traecode: "TraeCode", qoder: "Qoder", qodercn: "QoderCN", qodercom: "QoderCOM", qwenwork: "千问办公", glm: "智谱清言", monkeycode: "MonkeyCode", raccoon: "小浣熊", loomy: "Loomy", oczen: "OpenCodeZen", kilo: "Kilo", minimax: "MiniMax", lobsterai: "LobsterAI", zcode: "ZCode", gemini: "Gemini", codearts: "CodeArts", cline: "Cline", officeace: "OfficeAce", comate: "WPS Comate", lingxi: "WPS 灵犀" };
+const CH_CLASS = { workbuddy: "wb", workbuddyai: "wbai", traework: "trae", traecode: "traecode", qoder: "qoder", qodercn: "qodercn", qodercom: "qodercom", qwenwork: "qwenwork", glm: "glm", monkeycode: "monkeycode", raccoon: "raccoon", loomy: "loomy", oczen: "oczen", kilo: "kilo", minimax: "minimax", lobsterai: "lobsterai", zcode: "zcode", gemini: "gemini", codearts: "codearts", cline: "cline", officeace: "officeace", comate: "comate", lingxi: "lingxi" };
 const chLabel = (k) => CH_LABEL[k] || k;
 const chClass = (k) => CH_CLASS[k] || "custom";
 // ---------- 图表配色：与徽章同源，但保证同图任意两条线颜色可辨 ----------
@@ -833,7 +847,7 @@ function varyColor(hex, i) {
 // Loomy 同样已实现签到（宠物每日打工奖励，见 internal/loomy/checkin.go），故也在名单外。
 // 注意：Loomy 的奖励判据是「当日有效对话轮次」（上游算），未在官方客户端用过该账号时
 // 领取结果会是「未达档位」——那是如实状态，不是按钮坏了。
-const NO_EXPLICIT_CHECKIN = new Set(["workbuddyai", "qwenwork", "oczen", "kilo", "zcode", "gemini", "cline"]);
+const NO_EXPLICIT_CHECKIN = new Set(["workbuddyai", "qwenwork", "oczen", "kilo", "zcode", "gemini", "cline", "comate"]);
 const noExplicitCheckin = (g) => NO_EXPLICIT_CHECKIN.has(g) || isCustomGroup(g); // 自定义渠道无签到活动（R66）
 // isCustomGroup 该分组是否为用户自定义 OpenAI 兼容渠道（R66）。
 // 以 state.custom_channels（后端 /api/state 下发，保存即热更新）为准，勿在前端另维护一份。
@@ -849,11 +863,15 @@ const isImportLocal = (ch) => IMPORT_LOCAL_CHANNELS.has(ch);
 // Loomy 也两个集合都命中，但机制不同：**不**拉浏览器、**不**用 CDP 捕获，而是起一个
 // 127.0.0.1 的本机登录引导页（手机号 + 短信验证码），由前端 window.open 打开
 // （见 internal/login_loomy）。故文案需按渠道区分，不能套用小浣熊那段。
-const WEB_LOGIN_CHANNELS = new Set(["raccoon", "loomy"]);
+// WPS 灵犀同走 CDP 捕获（internal/login_lingxi）：主按钮浏览器自动登录，
+// 等价入口「粘贴 wps_sid」保留在 promptLogin 的 lingxi 分支（弹 lingxiOverlay）。
+const WEB_LOGIN_CHANNELS = new Set(["raccoon", "loomy", "lingxi"]);
 const hasWebLogin = (ch) => WEB_LOGIN_CHANNELS.has(ch);
 // 粘贴凭据型渠道：没有浏览器登录编排，凭据由用户从官方站点自行创建后粘贴进来。
 // Cline：app.cline.bot → 注册账号 → Account / API Keys 建 sk_ Key（见 internal/cline）。
-const PASTE_KEY_CHANNELS = new Set(["cline"]);
+// Comate：WPS 账号 → 浏览器登录 www.wps.cn → 复制 Cookie 里的 wps_sid（见 internal/comate）。
+// Lingxi 的粘贴入口在 promptLogin 特例里（同 Comate 一样不占这个名单）。
+const PASTE_KEY_CHANNELS = new Set(["cline", "comate"]);
 const isPasteKey = (ch) => PASTE_KEY_CHANNELS.has(ch);
 // 无手动签到渠道的状态文案：每个在 NO_EXPLICIT_CHECKIN 里的渠道都要有一条
 // （漏写就落兜底的「无签到」，把「每日积分自动发放」说成「不支持」）。
@@ -865,17 +883,31 @@ const NO_CHECKIN_TAG = {
   zcode: "不支持",
   gemini: "不支持",
   cline: "无签到",
+  comate: "无签到",
 };
 const noCheckinText = (g) => NO_CHECKIN_TAG[g] || "无签到";
 // 无积分概念的渠道（匿名通道）：积分区域显示「不适用」，并隐藏刷新积分/明细入口。
-// 内建名单只有 oczen/kilo/cline；自定义渠道（R66）同样无积分，但渠道名是用户配置的、
+// 内建名单只有 oczen/kilo/cline/comate；自定义渠道（R66）同样无积分，但渠道名是用户配置的、
 // 运行期可增删，故运行时以后端下发的 custom_channels 动态判定（isCustomGroup）。
 const NO_CREDITS_BUILTIN = new Set(["oczen", "kilo", "cline"]);
+// 虚拟账号渠道：没有账号概念（oczen 匿名通道 / kilo 免费池），卡片只留 🔒 静态指示，
+// 不可停用/删除/改名（后端 RemoveAccount/DisableAccount 也硬拒）。
+// 与 NO_CREDITS_BUILTIN 是**两个维度**：cline 属「无积分但可删可停」，
+// 故不得用「无积分」推导「固定账号」（R130 修正）。
+const VIRTUAL_ACCOUNTS = new Set(["oczen", "kilo"]);
+// isVirtualAcct 「默认收起」（R103）的判据：只看是否虚拟账号，不看 credits_na。
+// 两者正交——credits_na 表达「上游没有余额接口」，虚拟账号表达「账号不是用户添加的」，
+// 而收起只该压掉后者（用户没有添加动作、永远存在的匿名通道）。
+// 曾拿 credits_na 当收起判据，结果用户粘完 wps_sid / cline key 后卡片带 hidden，
+// 表现为「账号没刷出来」（comate、cline、自定义渠道全中招）。
+const isVirtualAcct = (a) => VIRTUAL_ACCOUNTS.has(String((a && a.group) || "workbuddy"));
+const isVirtualCh = (g) => VIRTUAL_ACCOUNTS.has(String(g || "workbuddy"));
 // 支持跳转登录编排的渠道：登录态失效时卡片显示 ⟳ 重新登录入口（#134）。
 // officeace 一并纳入（2026-10-17）：它除了「登录态失效」，还有「缺 refresh_token」
 // 这种**不能自愈**的形态（客户端导入只拿得到不过期的网关 Basic），此时同样只能重新登录
 // 才能恢复积分/签到 —— 徽标与 ⟳ 入口由同一处逻辑驱动（见 renderAccounts 的 needRelogin）。
-const RELOGIN_CHANNELS = new Set(["workbuddy", "workbuddyai", "traework", "qoder", "qodercn", "qodercom", "qwenwork", "raccoon", "officeace"]);
+// Lingxi 纳入（灵犀登录态失效可 ⟳ 重登：CDP 自动登录流 login_lingxi）。
+const RELOGIN_CHANNELS = new Set(["workbuddy", "workbuddyai", "traework", "qoder", "qodercn", "qodercom", "qwenwork", "raccoon", "officeace", "lingxi"]);
 
 // creditsText 账号卡片的积分文案。
 // 拆成「可用 / 不可用 / 临期」三个数字：渠道（如 TraeWork）会下发官方客户端专用的
@@ -922,11 +954,14 @@ function creditsText(a) {
   return html;
 }
 
-// 渠道汇总固定顺序：与后端 feeChannelOrder（internal/app/app.go）同序，
+// 渠道汇总顺序（R142）：**直接由 CH_LABEL 派生** —— 内建渠道按显示名的 UTF-8 字节序升序，
+// 与后端 provider.ChannelDisplayOrder / feeChannelOrder、面板按钮序完全同源，
 // 保持「账号卡片 → 汇总条 → 费率 tab」三处看到同一个渠道顺序。
-// ⚠️ 新增渠道必须同步此表：漏项会被 renderSummary 按字母序垫到最末
-//   （ui-static-check 有覆盖度断言）。qoder 已下线，仅为存量账号兜底留位。
-const CH_SUMMARY_ORDER = ["oczen", "kilo", "workbuddy", "workbuddyai", "qodercn", "qodercom", "traework", "traecode", "qwenwork", "glm", "cline", "monkeycode", "raccoon", "loomy", "minimax", "lobsterai", "zcode", "gemini", "codearts", "officeace", "qoder"];
+// 纯 ASCII 名字自然在前，中文显示名（千问办公 / 小浣熊 / 智谱清言）因码位高自然垫底。
+// ⚠️ 不要再手写一份数组（手写必与后端漂移）；新增渠道只需补 CH_LABEL（ui-static-check
+//   有 Go/JS 显示名逐项一致 + 面板按钮同序两条断言兜住）。qoder 已下线，仍在表内供存量账号兜底。
+const CH_SUMMARY_ORDER = Object.keys(CH_LABEL)
+  .sort((a, b) => (chLabel(a) < chLabel(b) ? -1 : chLabel(a) > chLabel(b) ? 1 : 0));
 
 // renderSummary 渠道积分汇总条：每渠道一行「可用总积分 / 临期」，末尾合计。
 // 数据全部来自 state.accounts（pool 实时值），与账号卡片同源；
@@ -956,12 +991,14 @@ function renderSummary() {
   // 已知渠道按固定顺序，未知渠道（新增时）按字母序垫后，保证不丢行
   let chs = CH_SUMMARY_ORDER.filter((k) => byCh[k])
     .concat(Object.keys(byCh).filter((k) => !CH_SUMMARY_ORDER.includes(k)).sort());
-  // 「不适用」渠道（无积分概念：oczen/kilo/cline/自定义渠道）默认不进汇总条：
-  // 它们的 chip 只有一句「不适用」，既不反映余额也不参与合计，纯噪声。
-  // 收起时改由末尾一枚开关 chip 汇总提示（点它原地展开），账号卡片同步收起。
-  const naChs = chs.filter((k) => byCh[k].na);
+  // 「不适用」的虚拟渠道（oczen/kilo）默认不进汇总条：它们的 chip 只有一句「不适用」，
+  // 既不反映余额也不参与合计，纯噪声。收起时改由末尾一枚开关 chip 汇总提示（点它原地展开），
+  // 账号卡片同步收起。判据是「虚拟渠道」而不是「无积分」：cline/comate/自定义渠道虽然也
+  // 无积分，但 chip 上的「N号」是用户亲手添加的账号，属于有效信息，不该默认消失
+  // （否则用户粘完凭据只看得到一枚「不适用」开关，等于没刷出账号）。
+  const naChs = chs.filter((k) => isVirtualCh(k));
   const naAccts = naChs.reduce((n, k) => n + byCh[k].n, 0);
-  if (!showNoCredit) chs = chs.filter((k) => !byCh[k].na);
+  if (!showNoCredit) chs = chs.filter((k) => !isVirtualCh(k));
 
   let total = 0, totalExp = 0, staleChs = 0;
   let html = `<span class="cs-title">积分汇总</span>`;
@@ -980,12 +1017,12 @@ function renderSummary() {
       // Token 计数：以 tokens 为单位单列，明示它不是积分。
       body = `<span class="cs-num">${fmtTokens(c.tokens)}</span>`
         + `<span class="cs-tok" title="本渠道额度以 token 计量，不计入「合计」">tokens</span>`
-        + (c.expiring > 0 ? `<span class="cs-exp" title="今日到期（次日 00:00 失效算今日），选号时优先消耗">临期${fmtTokens(c.expiring)}</span>` : "");
+        + (c.expiring > 0 ? `<span class="cs-exp" title="${esc(expiringLabel(EXPIRING_DAYS))}，选号时优先消耗">临期${fmtTokens(c.expiring)}</span>` : "");
     } else if (allStale) {
       body = `<span class="credit-stale">待刷新</span>`;
     } else {
       body = `<span class="cs-num">${fmt(c.credits)}</span>`
-        + (c.expiring > 0 ? `<span class="cs-exp" title="今日到期（次日 00:00 失效算今日），选号时优先消耗">临期${fmt(c.expiring)}</span>` : "")
+        + (c.expiring > 0 ? `<span class="cs-exp" title="${esc(expiringLabel(EXPIRING_DAYS))}，选号时优先消耗">临期${fmt(c.expiring)}</span>` : "")
         + (c.unusable > 0 ? `<span class="cs-unu" title="账号名下、本工具不可消耗的额度（不计入合计）">不可用${fmt(c.unusable)}</span>` : "")
         + (c.stale > 0 ? `<span class="cs-stale" title="部分账号余额待刷新">${c.stale} 待刷新</span>` : "");
     }
@@ -1000,12 +1037,13 @@ function renderSummary() {
       + `<span class="cs-n">全部</span></span>`;
   }
   // 「不适用」开关：默认收起（只留这一枚），展开后上面会重新出现这些渠道的 chip。
+  // 只覆盖虚拟渠道（oczen/kilo）：用户添加的无积分渠道（cline/comate/自定义）chip 常驻。
   // 入口刻意放在被隐藏 chip 的原位，不额外占工具栏一格（R103）。
   if (naChs.length) {
     const names = naChs.map(chLabel).join("、");
     const naTitle = showNoCredit
       ? `收起「不适用」渠道（${names}）及其账号卡片`
-      : `展开「不适用」渠道（${names}）：这些渠道无积分概念，余额恒为「不适用」`;
+      : `展开「不适用」渠道（${names}）：这些是工具自带的匿名通道，无账号可添加，余额恒为「不适用」`;
     html += `<span class="cs-chip clickable cs-na${showNoCredit ? " on" : ""}" data-na-toggle="1"`
       + ` role="button" tabindex="0" title="${esc(naTitle)}">`
       + `<span class="cs-n">不适用</span><span class="cs-num">${naAccts}号</span>`
@@ -1036,16 +1074,17 @@ function persistShowNoCredit() {
 }
 // isNoCreditAcct 该账号是否「无积分概念」：以后端下发的 credits_na 为准（与汇总条同口径，
 // 含 R66 的自定义渠道动态判定），不在前端另维护一份渠道名单。
+// ⚠️ 它只决定「积分区显示不适用 + 隐藏刷新积分入口」，**不决定**是否默认收起（见 isVirtualAcct）。
 const isNoCreditAcct = (a) => Boolean(a && a.credits_na);
 
 // toggleNoCredit 展开/收起「不适用」渠道与账号卡片。
 function toggleNoCredit() {
   showNoCredit = !showNoCredit;
   persistShowNoCredit();
-  // 收起时若正筛选着某个「不适用」渠道，必须先清筛选：否则筛选态指向已隐藏的渠道，
+  // 收起时若正筛选着某个被收起的虚拟渠道，必须先清筛选：否则筛选态指向已隐藏的渠道，
   // 网格一片空白，而用来取消筛选的「全部」chip 也随汇总条一起消失了。
   if (!showNoCredit && acctFilter
-      && (state.accounts || []).some((a) => isNoCreditAcct(a) && (a.group || "workbuddy") === acctFilter)) {
+      && (state.accounts || []).some((a) => isVirtualAcct(a) && (a.group || "workbuddy") === acctFilter)) {
     acctFilter = null;
   }
   // 重渲染账号卡片而不只改 class：hidden 的直接来源是 renderAccounts 里的 naHiddenClass，
@@ -1081,7 +1120,7 @@ function applyAcctFilter() {
     const hide = total > 0 && shown === 0 && naTotal > 0;
     tip.classList.toggle("hidden", !hide);
     if (hide) {
-      tip.textContent = `已收起 ${naTotal} 个「不适用」账号（无积分概念的渠道）· 点汇总条末尾的「不适用」展开`;
+      tip.textContent = `已收起 ${naTotal} 个虚拟账号（oczen/kilo 匿名通道）· 点汇总条末尾的「不适用」展开`;
     }
   }
 }
@@ -1125,13 +1164,27 @@ function renderAccounts() {
       ? "无需手动签到：定时自动对话保活并领取日活奖励"
       : `${chLabel(a.group)} 不支持手动签到`;
 
-    const checkinTag = a.last_checkin_at
-      ? `<span class="tag ${a.last_checkin_ok ? "ok" : "bad"}">${a.last_checkin_ok ? "签到成功" : "签到失败"}</span>`
-      : (noCheckin ? `<span class="tag neutral" title="${esc(noCheckinTitle)}">${noCheckinText(a.group)}</span>` : '<span class="tag neutral">未签到</span>');
+    // 签到状态徽标。判断顺序：**先判「本渠道无签到」再判时间戳**（issue #210）。
+    // 反过来（旧实现）会让灰分支永不可达——无签到渠道被巡检写过一次时间戳后，
+    // 面板上就永远是红色「签到失败」，即使积分照常到账。
+    // 判据只看 noCheckin（不再叠加 !last_checkin_ok）：旧版本写下的 ok=true 也不该
+    // 让一个根本没有签到活动的渠道显示绿色「签到成功」。
+    const checkinTag = noCheckin
+      ? `<span class="tag neutral" title="${esc(noCheckinTitle)}">${noCheckinText(a.group)}</span>`
+      : a.last_checkin_at
+        ? `<span class="tag ${a.last_checkin_ok ? "ok" : "bad"}">${a.last_checkin_ok ? "签到成功" : "签到失败"}</span>`
+        : '<span class="tag neutral">未签到</span>';
 
     const disabledClass = a.disabled ? " disabled" : "";
     const disableIcon = a.disabled ? "▶" : "⏸";
     const disableTitle = a.disabled ? "启用" : "停用";
+    // 停用原因徽标（R135）：账号被「自动停用」时（典型：这个 WPS 账号在 Comate 侧
+    // 一个模型都没有），卡片原本只有灰底 + ▶，用户既不知道为什么被停，也不知道
+    // 点 ▶ 有没有用。后端 pool.Status 已带 reason（手工停用是「手动停用」）。
+    const disabledReason = String(a.reason || "");
+    const disabledTag = (a.disabled && disabledReason)
+      ? `<span class="tag neutral" title="${esc(disabledReason)}">已停用 · ${esc(disabledReason.length > 16 ? disabledReason.slice(0, 16) + "…" : disabledReason)}</span>`
+      : "";
 
     // 冷却标签（后端 pool.Status 已透出 cooling/until/reason，此前前端未渲染）。
     // 为什么需要：账号被冷却时挑号会跳过它，表现为「积分明明很多却报 503/上游限流」,
@@ -1148,17 +1201,22 @@ function renderAccounts() {
       ? `<span class="icon-op off" title="${esc(noCheckinTitle)}" onclick="return false">✓</span>`
       : `<span class="icon-op" title="签到" onclick="checkin('${a.uid}')">✓</span>`;
 
-    // 无积分账号分两类，处理不同：
-    // - oczen/cline（固定账号）：只保留「不可操作」的静态指示，
+    // 无积分账号分三类，处理不同：
+    // - oczen/kilo（虚拟账号）：根本没有账号概念，只保留「不可操作」的静态指示，
     //   不给刷新积分/停用/删除入口——后端也会硬拒，避免用户白点一次。
-    // - 自定义渠道（R66）：无积分/无签到，但账号可在设置里停用/删除，
-    //   故保留停用/删除/改名入口，只去掉签到/刷新积分两个无意义按钮。
+    // - cline/comate（真实账号但查不到积分）：账号可停用/删除/改名，只去掉
+    //   签到/刷新积分两个无意义按钮（comate 一份 wps_sid = 一个 WPS 账号，粘错就得能删）。
+    // - 自定义渠道（R66）：无积分/无签到，但账号可在设置里停用/删除，同上。
     // 判定优先用后端下发的 credits_na（单一真相），前端名单只作旧载荷的兜底。
     const noCredits = isNoCreditAcct(a) || hasNoCredits(a.group);
-    const fixedAcct = noCredits && !isCustomGroup(a.group);
+    // 「固定账号」只对**没有账号概念**的虚拟条目成立：
+    // 旧实现用 `noCredits && !isCustomGroup(...)`，把 cline/comate 这类「有真实账号但查不到积分」
+    // 的渠道也当成固定账号 ⇒ 卡片只剩 🔒，无法删除/停用/改名，而 comate 是真多账号池
+    // （后端 RemoveAccount/DisableAccount 只硬拒 Oczen/Kilo）⇒ 粘错 sid 就永久卡住（2026-10-28 修正）。
+    const fixedAcct = VIRTUAL_ACCOUNTS.has(a.group);
     // 默认收起的「不适用」卡片：渲染时就带上 hidden（而不是等 applyAcctFilter），
     // 首帧不会先闪一排「不适用」再消失；applyAcctFilter 后续负责保持同步。
-    const naHiddenClass = (!showNoCredit && isNoCreditAcct(a)) ? " hidden" : "";
+    const naHiddenClass = (!showNoCredit && isVirtualAcct(a)) ? " hidden" : "";
     // 问号图标：hover 展示 oczen 通道说明（免费反代范围/私有 Key/代理三项）。
     // 放在锁头左侧；用独立的 help 样式（正常亮度 + help 光标），不可点击但 tooltip 可用。
     // title 内换行用 &#10;（HTML 属性实体），字面 \n 会被部分浏览器吞掉导致无 tooltip。
@@ -1179,7 +1237,11 @@ function renderAccounts() {
       ? `<span class="tag warn" title="${esc(a.refresh_token_missing_reason || "凭据缺 refresh_token：积分/签到不可用，需重新登录或重新导入")}">缺续期凭据</span>`
       : "";
     const needRelogin = Boolean(a.session_dead) || missingRT;
-    const reloginTitle = missingRT
+    // lingxi 特例文案：重登弹的是双路径弹层（浏览器登录 / 粘贴 wps_sid 任选），
+    // 且 wps_sid 不回传身份字段——重登会落成新条目，旧失效卡需手动删。
+    const reloginTitle = a.group === "lingxi"
+      ? "重新登录（浏览器登录或重新粘贴 wps_sid 均可；重登会落成新条目，旧失效卡片请手动删除）"
+      : missingRT
       ? "重新登录（本账号缺 refresh_token，积分/签到不可用；登录成功后自动补签）"
       : "重新登录（跳转登录页换新凭据，成功后自动补签）";
     // 一键重新登录：沿用既有内联 onclick 形态（本仓无 CSP 头，全文件已有 10 处同款写法）。
@@ -1188,8 +1250,11 @@ function renderAccounts() {
     // 一次性的 POST /api/login/start。2026-10-18 修正：先前 OfficeAce 的 ⟳ 直接打
     // /api/login/start，而后端 StartLoginFor 未登记 officeace ⇒ 点了只弹
     // `unknown login provider officeace`（死按钮，独立复核抓出）。
+    // Lingxi 是完整登录流（login_lingxi CDP）：⟳ 统一走 startLogin、
+    // 进 RELOGIN_CHANNELS，登录弹窗里主按钮「浏览器登录」+ 次按钮「粘贴 wps_sid」。
+    const reloginAction = `startLogin('${a.group}')`;
     const reloginBtn = needRelogin && RELOGIN_CHANNELS.has(a.group)
-      ? `<span class="icon-op" title="${reloginTitle}" onclick="startLogin('${a.group}')">⟳</span>`
+      ? `<span class="icon-op" title="${reloginTitle}" onclick="${reloginAction}">⟳</span>`
       : "";
     const ops = fixedAcct
       ? `${channelHelp}<span class="icon-op off" title="固定账号，不可停用/删除" onclick="return false">🔒</span>`
@@ -1207,7 +1272,7 @@ function renderAccounts() {
       : `<span class="acct-name editable" title="点击修改显示名" onclick="openRename('${a.uid}','${esc(a.nickname || shortUid(a.uid)).replace(/'/g, "&#39;")}')">${esc(a.nickname || shortUid(a.uid))}</span>`;
 
     return `
-    <div class="acct-card${disabledClass}${coolingClass}${naHiddenClass}" data-group="${esc(a.group || "workbuddy")}" data-na="${isNoCreditAcct(a) ? 1 : 0}">
+    <div class="acct-card${disabledClass}${coolingClass}${naHiddenClass}" data-group="${esc(a.group || "workbuddy")}" data-na="${isVirtualAcct(a) ? 1 : 0}">
       <div class="acct-top">
         <div>
           ${chBadge(a.group)}
@@ -1220,7 +1285,7 @@ function renderAccounts() {
       <div class="acct-uid">UID: ${esc(shortUid(a.uid))}</div>
       <div class="acct-mid">
         <div class="acct-credits${noCredits ? "" : " clickable"}" data-uid="${a.uid}"${noCredits ? "" : ` onclick="showCreditDetail(event,'${a.uid}')" title="点击查看积分明细（含分页）" role="button" tabindex="0" onkeydown="if(event.key==='Enter'||event.key===' '){event.preventDefault();showCreditDetail(event,'${a.uid}')}"`}>${creditsText(a)}</div>
-        <div class="acct-checkin">${coolingTag}${sessionDeadTag}${missingRTTag}${checkinTag}</div>
+        <div class="acct-checkin">${coolingTag}${disabledTag}${sessionDeadTag}${missingRTTag}${checkinTag}</div>
       </div>
     </div>`;
   }).join("");
@@ -1840,6 +1905,32 @@ function promptLogin(channel) {
       $("loginConfirmOverlay").classList.remove("hidden");
       return;
     }
+    if (channel === "lingxi") {
+      // WPS 灵犀：CDP 捕获 www.wps.cn 登录后的 wps_sid（internal/login_lingxi）。
+      // 与 comate 完全同形（主按钮拉浏览器自动捕获，次按钮弹粘贴框）；
+      // ⚠ 验证走灵犀侧 plans 端点（lingxi.ValidateSID），不是 comate 的 /models。
+      $("lcMsg").innerHTML = `点击「浏览器登录」会打开一个<b>独立的浏览器窗口</b>并前往 WPS 官网，`
+        + `请在其中正常登录你的 WPS 账号（扫码 / 手机号 / 微信均可），`
+        + `登录完成后本工具会自动捕获 wps_sid 并添加账号（验证走灵犀侧，要求灵犀已开通）。`
+        + `<div class="glm-warn" style="margin-top:10px">`
+        + `<div class="glm-warn-title">⚠️ 关于 wps_sid 有效期</div>`
+        + `wps_sid 是登录 Cookie，<b>不参与自动续期</b>：在官网主动退出登录或修改密码后可能失效。`
+        + `失效后账号卡片会出现 ⟳ 入口，点它重新走一遍本流程即可恢复。`
+        + `</div>`
+        + `也可以点「粘贴 wps_sid」：在已登录 lingxi.kdocs.cn 的浏览器里按 F12 复制该 Cookie 后粘入（效果等价）。`;
+      $("btnLoginConfirm").textContent = "浏览器登录";
+      altBtn.textContent = "粘贴 wps_sid";
+      altBtn.classList.remove("hidden");
+      altBtn.onclick = () => {
+        $("loginConfirmOverlay").classList.add("hidden");
+        $("lingxiSidInput").value = "";
+        $("lingxiErr").textContent = "";
+        $("lingxiOverlay").classList.remove("hidden");
+        setTimeout(() => $("lingxiSidInput").focus(), 30);
+      };
+      $("loginConfirmOverlay").classList.remove("hidden");
+      return;
+    }
     $("lcMsg").innerHTML = `点击「登录${name}」会打开一个<b>独立的浏览器窗口</b>（不影响你日常浏览器的登录态），`
       + `请在其中正常登录（扫码 / 手机号 / 微信均可），登录完成后本工具会自动捕获凭据并保存账号。`
       + `<div class="glm-warn" style="margin-top:10px">`
@@ -1863,6 +1954,12 @@ function promptLogin(channel) {
   // Cline 的凭据是官方 API Key，创建动作发生在 app.cline.bot 网页里，本工具无法代劳，
   // 所以这里没有轮询/回调，只有一次「验证 + 落盘」（后端只调 /api-keys，零 token 消耗）。
   if (isPasteKey(channel)) {
+    if (channel === "comate") {
+      // Comate 有 CDP 自动登录（拉浏览器 → 登录 → 捕获 wps_sid），默认走这条；
+      // 弹层里仍保留手工粘贴入口，供无桌面环境（NAS）或自动失败时兜底。
+      openComateDialog();
+      return;
+    }
     $("clineKeyInput").value = "";
     $("clineErr").textContent = "";
     $("clineWarn").classList.add("hidden");
@@ -2193,6 +2290,157 @@ function cancelGLMLogin() {
   $("glmOverlay").classList.add("hidden");
 }
 
+// ---------- WPS Comate 登录（自动捕获 Cookie，手工粘贴为兜底） ----------
+// 扫码登录：二维码由**服务端**向 qr.wps.cn 申请，面板就地显示；手机 WPS 扫码确认后，
+// 服务端自己用 authcode 换 session Cookie 并落盘。全程不需要桌面/浏览器。
+//
+// 这是对「CDP 拉浏览器」方案的环境无关替换：CDP 只能拉起运行 wild-work 那台机器的
+// 浏览器（NAS 无桌面就永远弹不出来），而用户自己浏览器里的 wps_sid 受同源策略保护读不到。
+let comatePoll = null;
+
+// 打开 Comate 添加弹层：直接申请二维码（少点一次按钮）。
+function openComateDialog() {
+  $("comateErr").textContent = "";
+  $("comateManual").classList.add("hidden");
+  $("comateSidInput").value = "";
+  $("comateQrImg").classList.add("hidden");
+  $("comateQrEmpty").classList.remove("hidden");
+  $("comateQrStatus").textContent = "正在申请二维码…";
+  $("comateOverlay").classList.remove("hidden");
+  loadComateBrowserInfo();
+  startComateQr();
+}
+
+// loadComateBrowserInfo 问后端「本机浏览器登录」这条路是否可用。
+// 没配 login.comate_browser_cdp ⇒ 整块隐藏（配都不配就摆按钮，点了只会报错）；
+// 配了但端口不通 ⇒ 仍显示，但把原因写在 hint 里（最常见是浏览器没带
+// --remote-debugging-port 启动，静默隐藏会让人以为功能不存在）。
+async function loadComateBrowserInfo() {
+  const box = $("comateBrowser");
+  box.classList.add("hidden");
+  try {
+    const info = await api("/api/login/comate_browser_info");
+    if (!info || !info.configured) return;
+    box.classList.remove("hidden");
+    $("comateBrowserHint").textContent = info.available
+      ? `已连接到本机浏览器（${info.endpoint}）`
+      : `未连接到 ${info.endpoint}：${info.hint || "浏览器没有开启调试端口"}`;
+    $("btnComateBrowserStart").disabled = !info.available;
+  } catch (e) { /* 探测失败按未配置处理 */ }
+}
+
+// startComateBrowser 接管本机浏览器：后端开标签页到 WPS 登录页，这里轮询 Cookie 结果。
+function startComateBrowser() {
+  stopComatePoll();
+  $("comateErr").textContent = "";
+  $("comateBrowserStatus").textContent = "正在连接浏览器并打开登录页…";
+  api("/api/login/comate_browser", {})
+    .then((st) => {
+      renderComateBrowser(st);
+      startComatePoll("/api/login/comate_browser_status");
+    })
+    .catch((e) => {
+      $("comateBrowserStatus").textContent = "";
+      $("comateErr").textContent = (e.message || "连接浏览器失败") + "（可展开下方手工方式）";
+      $("comateManual").classList.remove("hidden");
+    });
+}
+
+function renderComateBrowser(st) {
+  if (!st) return;
+  if (st.state === "success") {
+    $("comateBrowserStatus").textContent = `✅ 已添加账号：${st.nickname || st.uid}`;
+  } else {
+    $("comateBrowserStatus").textContent = st.hint || "请在浏览器里完成登录…";
+  }
+}
+
+// startComateQr 申请（或重新申请）一张二维码并开始轮询扫码状态。
+function startComateQr() {
+  stopComatePoll();
+  $("comateErr").textContent = "";
+  $("comateQrStatus").textContent = "正在申请二维码…";
+  $("comateQrImg").classList.add("hidden");
+  $("comateQrEmpty").classList.remove("hidden");
+  api("/api/login/comate_qr", {})
+    .then((st) => {
+      renderComateQr(st);
+      startComatePoll();
+    })
+    .catch((e) => {
+      // 申请不到二维码（网络不通/上游变更）→ 直接把人引到手工方式
+      $("comateQrStatus").textContent = "";
+      $("comateQrEmpty").textContent = "二维码申请失败";
+      $("comateErr").textContent = (e.message || "申请二维码失败") + "（可展开下方手工方式）";
+      $("comateManual").classList.remove("hidden");
+    });
+}
+
+// renderComateQr 把后端状态画到弹层上（二维码图片、扫码进度）。
+function renderComateQr(st) {
+  if (!st) return;
+  if (st.qr) {
+    const img = $("comateQrImg");
+    // 上游每次换新二维码都是一个新地址，直接按值比较即可判断是否要重载。
+    if (img.getAttribute("src") !== st.qr) img.setAttribute("src", st.qr);
+    img.classList.remove("hidden");
+    $("comateQrEmpty").classList.add("hidden");
+  }
+  if (st.state === "scanned") {
+    $("comateQrStatus").textContent = st.hint || "已扫码，请在手机 WPS 上确认登录";
+  } else if (st.state === "pending") {
+    $("comateQrStatus").textContent = "用手机 WPS Office「扫一扫」扫描二维码";
+  }
+}
+
+let comatePollPath = "/api/login/comate_qr_status";
+
+function startComatePoll(path) {
+  stopComatePoll();
+  comatePollPath = path || "/api/login/comate_qr_status";
+  comatePoll = setInterval(async () => {
+    try {
+      const st = await api(comatePollPath);
+      if (comatePollPath === "/api/login/comate_qr_status") renderComateQr(st);
+      else renderComateBrowser(st);
+      if (st.state === "success") {
+        stopComatePoll();
+        if (comatePollPath === "/api/login/comate_qr_status") {
+          $("comateQrStatus").textContent = `✅ 已添加账号：${st.nickname || st.uid}`;
+        } else {
+          $("comateBrowserStatus").textContent = `✅ 已添加账号：${st.nickname || st.uid}`;
+        }
+        // toast 是单槽位（后一条覆盖前一条），故告警与成功文案合并成一条：
+        // 同账号告警更重要（用户可能白加了），放前面。
+        toast(st.warning ? `${st.warning} —— ${st.nickname || st.uid} 已添加` : "WPS Comate 账号已添加");
+        await loadState();
+        refreshFees();
+        setTimeout(() => $("comateOverlay").classList.add("hidden"), 1200);
+      } else if (st.state === "failed") {
+        stopComatePoll();
+        $("comateQrStatus").textContent = "";
+        $("comateBrowserStatus").textContent = "";
+        $("comateErr").textContent = (st.error || "登录失败") + "（可展开下方手工方式）";
+        $("comateManual").classList.remove("hidden");
+      } else if (st.state === "cancelled" || st.state === "idle") {
+        stopComatePoll();
+      }
+    } catch (e) { /* 忽略瞬时错误 */ }
+  }, 1500);
+}
+
+function stopComatePoll() {
+  if (comatePoll) { clearInterval(comatePoll); comatePoll = null; }
+}
+
+function cancelComateLogin() {
+  stopComatePoll();
+  // 没有进行中的会话时后端会回 400，属正常情况，静默即可。
+  api("/api/login/comate_qr_cancel", {}).catch(() => {});
+  api("/api/login/comate_browser_cancel", {}).catch(() => {});
+  $("comateOverlay").classList.add("hidden");
+}
+
 // submitClineKey 提交用户粘贴的 Cline 官方 API Key。
 // 后端只做「GET /api/v1/api-keys 验证 + 落盘」，零 token 消耗；
 // 返回的 warning 非空表示「这把 Key 与已有账号同属一个 Cline 账号」——
@@ -2213,6 +2461,55 @@ async function submitClineKey() {
     refreshFees();
   } catch (e) {
     $("clineErr").textContent = e.message || "验证失败";
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// submitComateSID 提交用户粘贴的 wps_sid Cookie。
+// 后端只做「GET /models 验证 + 落盘」，零积分消耗；
+// 返回的 warning 非空表示「这份 wps_sid 与已有账号相同」——
+// 积分按 WPS 账号计，同账号重复粘贴不扩额度，必须显式告知。
+async function submitComateSID() {
+  const sid = ($("comateSidInput").value || "").trim();
+  if (!sid) { $("comateErr").textContent = "请粘贴 wps_sid Cookie"; return; }
+  const btn = $("btnComateSubmit");
+  btn.disabled = true;
+  $("comateErr").textContent = "验证中…";
+  try {
+    const r = await api("/api/login/comate_sid", { sid });
+    $("comateOverlay").classList.add("hidden");
+    $("comateSidInput").value = "";
+    if (r && r.warning) toast(r.warning);
+    toast("WPS Comate 账号已添加");
+    await loadState();
+    refreshFees();
+  } catch (e) {
+    $("comateErr").textContent = e.message || "验证失败";
+  } finally {
+    btn.disabled = false;
+  }
+}
+
+// submitLingxiSID 提交用户粘贴的 wps_sid Cookie（灵犀渠道）。
+// 后端只做「GET plans 验证 + 落盘」，零智点消耗，且能在验证阶段发现
+// 「灵犀侧未开通」（UserUnauthorized）；warning 语义同 comate（同账号不扩智点）。
+async function submitLingxiSID() {
+  const sid = ($("lingxiSidInput").value || "").trim();
+  if (!sid) { $("lingxiErr").textContent = "请粘贴 wps_sid Cookie"; return; }
+  const btn = $("btnLingxiSubmit");
+  btn.disabled = true;
+  $("lingxiErr").textContent = "验证中…";
+  try {
+    const r = await api("/api/login/lingxi_sid", { sid });
+    $("lingxiOverlay").classList.add("hidden");
+    $("lingxiSidInput").value = "";
+    if (r && r.warning) toast(r.warning);
+    toast("WPS 灵犀账号已添加");
+    await loadState();
+    refreshFees();
+  } catch (e) {
+    $("lingxiErr").textContent = e.message || "验证失败";
   } finally {
     btn.disabled = false;
   }
@@ -2358,10 +2655,12 @@ function renderFbList() {
     return `<div class="fb-rule-card">
       <div class="fb-rule-head">
         <span class="fb-rule-badge">规则 ${i + 1}</span>
+        <input class="input fb-name-edit" data-name-idx="${i}" value="${esc(r.name || "")}" spellcheck="false" maxlength="64" title="别名（可选）：主力模型的另一个名字，客户端请求它等同于请求主力模型。大小写敏感，不能含 / 、空白、逗号、*" placeholder="别名（可选，如 fast）">
         <span class="pk-wrap fb-from-wrap"><input class="input fb-from-edit" data-edit-idx="${i}" value="${esc(r.from)}" spellcheck="false" title="主力模型ID（channel/model，可编辑；失焦或回车确认，点「保存降级链」生效）" placeholder="主力模型ID（channel/model）"></span>
         <button class="icon-btn" data-del-rule="${i}" title="删除整条规则">🗑</button>
       </div>
       <div class="fb-rule-body">
+        ${r.name ? `<div class="fb-alias-chip"><span class="fb-alias-txt">别名 <code>${esc(r.name)}</code> · 客户端可直接请求</span><button class="icon-btn fb-alias-copy" data-copy-alias="${i}" title="复制别名到剪贴板">复制</button></div>` : ""}
         <div class="fb-chips">${tos || `<span class="hint">（无备胎）</span>`}</div>
         <div class="row" style="margin-top:2px">
           <span class="pk-wrap grow"><input class="input fb-to-add" data-add-idx="${i}" spellcheck="false" placeholder="＋ 备胎模型ID（模糊搜索 / 回车添加 / 逗号分隔多个）"></span>
@@ -2374,6 +2673,7 @@ function renderFbList() {
   $("fbErr").textContent = "";
   attachFbPickers();
   updateFbDirty();
+  updateFbAliasWarn();
 }
 
 // parseModelList 解析备胎输入：逗号/空格/换行分隔多个 channel/model，本地形态校验。
@@ -2414,11 +2714,50 @@ function attachFbPickers() {
   }
 }
 
+// fbAliasValidate 别名即时校验（前端只为即时反馈，后端 SetModelFallback 才是唯一真相）。
+// 返回 [硬错误文案, 软警告文案]：硬错误阻止保存；软警告（与真实模型裸名重合）只提示。
+// 规则与后端同源（config.ValidAliasName）：不含 / 、空白、逗号、*；大小写敏感。
+function fbAliasValidate() {
+  const names = {};
+  const mapKeys = Object.keys((state.compat && state.compat.model_map) || {});
+  const channels = new Set(((state.compat && state.compat.channels) || []).concat(Array.from(RESERVED_CHANNEL_NAMES)));
+  const bareNames = new Set(collectAllModels().map((x) => x.short));
+  const warns = [];
+  for (let i = 0; i < fbRules.length; i++) {
+    const nm = String(fbRules[i].name || "").trim();
+    if (!nm) continue;
+    const where = `规则 ${i + 1} 的别名 ${nm}`;
+    if (nm.includes("/")) return [`${where} 不能含 /（别名是裸名，不是 channel/model 形式）`, ""];
+    if (/[\s,*，　]/.test(nm)) return [`${where} 不能含空白、逗号或 *`, ""];
+    if (names[nm]) return [`${where} 与${names[nm]}重名（别名不可重复，大小写敏感：Fast ≠ fast）`, ""];
+    names[nm] = `规则 ${i + 1} `;
+    if (mapKeys.includes(nm)) return [`${where} 与 compat.model_map 的键重名（别名优先，但同名会造出「有时走映射、有时走别名」的幽灵行为）`, ""];
+    if (channels.has(nm)) return [`${where} 与渠道名重名（会搅乱前缀解析）`, ""];
+    if (bareNames.has(nm)) warns.push(`别名 ${nm} 与某个真实模型的裸名重合：运行时按别名走（别名优先于 model_map / default_channel）`);
+  }
+  return ["", warns.join("；")];
+}
+
+// updateFbAliasWarn 把软警告渲染到黄字提示行（不阻止保存）。
+function updateFbAliasWarn() {
+  const el = $("fbAliasWarn");
+  if (!el) return;
+  const [, warn] = fbAliasValidate();
+  el.textContent = warn ? "⚠ " + warn : "";
+  el.style.display = warn ? "" : "none";
+}
+
 async function saveModelFallback() {
   try {
     fbSanitize(); // 落盘前互斥兜底（正常路径 renderFbList 已清洗过，防御未来路径）
-    await api("/api/config/model_fallback", { rules: fbRules });
-    toast("降级链已保存（热生效）");
+    const [hardErr] = fbAliasValidate();
+    if (hardErr) { $("fbErr").textContent = hardErr; return; } // 前端即时反馈（后端仍独立判定）
+    const resp = await api("/api/config/model_fallback", { rules: fbRules });
+    // 后端软警告（如别名与真实裸名重合）如实透出，不阻止保存
+    const warns = (resp && resp.warnings) || [];
+    toast(warns.length ? "降级链已保存（热生效），有 " + warns.length + " 条提示" : "降级链已保存（热生效）");
+    if (warns.length) $("fbAliasWarn").textContent = "⚠ " + warns.join("；");
+    if (warns.length) $("fbAliasWarn").style.display = "";
     $("fbErr").textContent = "";
     state.model_fallback = JSON.parse(JSON.stringify(fbRules)); // 即时同步服务端态基准，提示随之熄灭
     updateFbDirty();
@@ -2434,7 +2773,7 @@ async function saveModelFallback() {
 const RESERVED_CHANNEL_NAMES = new Set([
   "workbuddy", "workbuddyai", "traework", "traecode", "qoder", "qodercn", "qodercom",
   "qwenwork", "monkeycode", "raccoon", "loomy", "oczen", "kilo", "minimax", "lobsterai",
-  "zcode", "gemini", "codearts", "glm", "cline", "officeace",
+  "zcode", "gemini", "codearts", "glm", "cline", "officeace", "comate", "lingxi",
   "cline-free", // ModelNamespaces：上游 ID 自带命名空间，自定义渠道不得占用
 ]);
 let editCustomChannels = [];
@@ -2675,6 +3014,9 @@ function openSettings() {
   $("effModelInput").value = ""; $("effEffortInput").value = "";
   // 自动签到 + 开机自启
   $("chkAutostart").checked = !!state.autostart;
+  // 临期口径（1/2/7）：后端唯一真源；旧后端不读该字段时回退默认 1 日
+  setExpiringDays(state.expiring_days);
+  $("selExpiring").value = String(EXPIRING_DAYS);
   $("chkLoopGuard").checked = state.loop_guard !== false; // 缺省（旧后端）按开启显示
   $("chkBodyLog").checked = !!state.body_log;
   syncListenRisk(); // 按当前监听地址初始化警告条与必填星号
@@ -3249,6 +3591,15 @@ async function saveSettings() {
     } catch (e) { toast(e.message); return; }
   }
 
+  // 4b) 临期口径（1/2/7，独立端点即时生效，后端会异步重刷一轮积分）
+  const expDays = parseInt($("selExpiring").value, 10);
+  if (expDays !== EXPIRING_DAYS || expDays !== (state.expiring_days ?? EXPIRING_DEF)) {
+    try {
+      await api("/api/config/expiring_days", { days: expDays });
+      setExpiringDays(expDays);
+    } catch (e) { toast(e.message); return; }
+  }
+
   // 5) API-Key（最后保存：改 Key 可能影响当前会话的后续请求）
   try {
     await api("/api/config/api_key", { key: $("keyInput").value.trim() });
@@ -3426,6 +3777,15 @@ function bind() {
   $("btnAddCline").onclick = () => promptLogin("cline");
   $("btnClineSubmit").onclick = submitClineKey;
   $("btnClineCancel").onclick = () => $("clineOverlay").classList.add("hidden");
+  $("btnAddComate").onclick = () => openComateDialog();
+  $("btnComateQrStart").onclick = () => startComateQr();
+  $("btnComateBrowserStart").onclick = () => startComateBrowser();
+  $("btnComateSubmit").onclick = submitComateSID;
+  $("btnComateCancel").onclick = cancelComateLogin;
+  $("btnComateToggleManual").onclick = () => $("comateManual").classList.toggle("hidden");
+  $("btnAddLingxi").onclick = () => promptLogin("lingxi");
+  $("btnLingxiSubmit").onclick = submitLingxiSID;
+  $("btnLingxiCancel").onclick = () => $("lingxiOverlay").classList.add("hidden");
   $("btnAddOfficeAce").onclick = () => promptLogin("officeace");
   $("btnAddMiniMax").onclick = () => promptLogin("minimax");
   $("btnAddLobsterAI").onclick = () => promptLogin("lobsterai");
@@ -3526,12 +3886,18 @@ function bind() {
     const kept = tos.filter((t) => !fsx[t]);
     if (kept.length === 0) { $("fbErr").textContent = "备胎均与主力模型互斥（含新主力自身），请更换备胎"; return; }
     if (kept.length < tos.length) toast(`已剔除 ${tos.length - kept.length} 个与主力模型互斥的备胎`);
-    fbRules.push({ from, to: kept });
+    fbRules.push({ from, to: kept, name: "" });
     $("fbFromInput").value = ""; $("fbToInput").value = "";
     renderFbList(); // 内部先 fbSanitize：互斥兜底（预过滤后此处不再剔除）
   };
   $("btnFbSave").onclick = saveModelFallback;
   $("fbList").addEventListener("click", async (e) => {
+    const copyAlias = e.target.closest("[data-copy-alias]");
+    if (copyAlias) {
+      const r = fbRules[+copyAlias.dataset.copyAlias];
+      if (r && r.name) copyText(r.name, "别名");
+      return;
+    }
     const addBtn = e.target.closest("[data-add-to]");
     if (addBtn) {
       const i = +addBtn.dataset.addTo;
@@ -3581,6 +3947,21 @@ function bind() {
     if (fbRules.some((r, k) => k !== i && r.from === from)) { $("fbErr").textContent = `主模型 ${from} 已有规则（每个主模型只允许一条）`; e.target.value = cur; return; }
     fbRules[i].from = from;
     fbRules[i].to = fbRules[i].to.filter((t) => t !== from);
+    renderFbList();
+  });
+  // 行内别名编辑：change（失焦/回车）提交——非法则回滚输入框并报错，合法写回编辑态。
+  // 校验口径与后端同源；重名/与 model_map 或渠道名冲突等硬拒只在保存时由后端点名。
+  $("fbList").addEventListener("change", (e) => {
+    if (!e.target.classList.contains("fb-name-edit")) return;
+    const i = +e.target.dataset.nameIdx;
+    const nm = String(e.target.value || "").trim();
+    if (!nm) { fbRules[i].name = ""; renderFbList(); return; }
+    if (nm.includes("/") || /[\s,*，　]/.test(nm)) {
+      $("fbErr").textContent = `别名 ${nm} 不能含 / 、空白、逗号或 *（大小写敏感：Fast ≠ fast）`;
+      e.target.value = fbRules[i].name || "";
+      return;
+    }
+    fbRules[i].name = nm;
     renderFbList();
   });
   // 备胎 chip 拖拽排序（委托在 #fbList；仅同规则内拖动）。drop 后就地 splice fbRules[i].to
@@ -4242,16 +4623,19 @@ function stTkItem(label, val) {
 let perfLookup = {};
 
 // perfCellFor 按 "channel/model" 取速度单元格；无样本显示「—」（与运行统计同款三态）。
+// 速度 = 最近窗口（默认 60 秒）的按秒分桶滑动速率，不是单请求平均：
+// 上游每秒吞吐随繁忙程度变化，单请求比值与用户感知严重不符（R147）。
 function perfCellFor(channel, model) {
   const m = perfLookup[channel + "/" + model];
-  if (!m) return `<span class="muted" title="该模型暂无成功请求的速度样本">—</span>`;
-  const tps = Number(m.avg_tok_per_sec) || 0;
+  if (!m) return `<span class="muted" title="该模型最近窗口内无流式投递样本">—</span>`;
+  const tps = Number(m.tok_per_sec) || 0;
   const ttfb = Number(m.avg_ttfb_ms) || 0;
   const parts = [];
   if (tps > 0) parts.push(fmtPct(tps) + " tok/s");
   if (ttfb > 0) parts.push(fmtCredits(ttfb) + "ms");
-  if (!parts.length) return `<span class="muted" title="无速度样本">—</span>`;
-  return `<span title="样本 ${fmtCredits(m.perf_samples)} 次成功请求">${parts.join(" · ")}</span>`;
+  if (!parts.length) return `<span class="muted" title="最近窗口内无流式投递样本">—</span>`;
+  const win = Number(m.tput_window_sec) || 60;
+  return `<span title="最近 ${win} 秒按秒分桶的投递速率（token ÷ ${win} 秒）；TTFB 样本 ${fmtCredits(m.perf_samples)} 次">${parts.join(" · ")}</span>`;
 }
 
 // buildPerfLookup 用 stats 快照的 models[] 建索引（30s 轮询时刷新）。
@@ -4316,7 +4700,7 @@ function renderPlatformTable(s) {
       `<span class="st-plat-accts">${fmtCredits(r.accounts)}</span>` +
       stPlatNum("st-plat-credits", r.credits, "分") +
       stPlatNum("st-plat-in", r.credit_in) +
-      stPlatNum("st-plat-out", r.credit_used) +
+      stPlatOut(r) +
       stPlatNum("st-plat-expd", r.credit_expired) +
       stPlatTok(r.tokens) +
       stPlatNum("st-plat-exp", r.expire_today, "分") +
@@ -4389,6 +4773,22 @@ function stPlatNum(cls, amount, suffix) {
   if (amount <= 0) return `<span class="${cls} st-plat-zero">—</span>`;
   return `<span class="${cls}">${fmtCredits(amount)}${suffix || ""}</span>`;
 }
+// 今日消耗单元格：以差值净消耗（credit_used）为主；逐请求精确积分（credit_exact）
+// 是**并列的第二口径**，不是修正值。comate 这类「无余额端点」的渠道差值恒 0，
+// 若只画差值整列恒「—」，用户会以为没用过（R130）。
+// 两口径同时有值时并列展示（`120 (精 3.5)`），与合计行同一写法。
+function stPlatOut(r) {
+  const used = Number(r.credit_used) || 0;
+  const exact = Number(r.credit_exact) || 0;
+  if (used <= 0 && exact <= 0) return `<span class="st-plat-out st-plat-zero">—</span>`;
+  if (exact > 0 && used <= 0) {
+    return `<span class="st-plat-out" title="该渠道无余额端点：只能按每次回答的 usage.credits 逐请求累计（精确口径）">${fmtCreditS(exact)} <span class="st-plat-sub">(精)</span></span>`;
+  }
+  if (exact > 0) {
+    return `<span class="st-plat-out" title="差值净消耗 ${fmtCredits(used)}；逐请求精确 ${fmtCreditS(exact)}">${fmtCredits(used)} <span class="st-plat-sub">(精 ${fmtCreditS(exact)})</span></span>`;
+  }
+  return `<span class="st-plat-out">${fmtCredits(used)}</span>`;
+}
 // Token 单元格：单位走 万/亿，0 同样置灰
 function stPlatTok(amount) {
   amount = Number(amount) || 0;
@@ -4449,6 +4849,12 @@ function fmtExpireAt(s) {
 }
 
 // 最近临期：到期日升序；risk=按今日速度花不完 → 给预计作废量（额度−外推消耗）
+//
+// 额度格三件事必须分开（2026-11-05 修）：额度 / 今日花费 / 作废。
+// 旧文案「已耗 today_out」是余额差值，把到期作废也算成消耗，于是出现
+// 「300分 · 已耗 300 · 预计作废 264分」——都花完了还能作废一半，自相矛盾。
+// 现在：today_spent = 余额下降差值扣今日已作废（估算值），today_expired = 账本已作废；
+// 两条链路无法逐笔对齐，预测只按估算花费速度外推。
 function renderExpiry(ex) {
   if (!ex.length) { $("stExpiry").innerHTML = ""; $("stExpiry").className = "st-expiry"; return; }
   let html = `<div class="st-block-title">最近临期<span class="st-hint">按剩余时长升序 · ${ex.length} 个账号</span></div>` +
@@ -4459,7 +4865,7 @@ function renderExpiry(ex) {
     `<span class="st-ex-name">账号</span>` +
     `<span class="st-ex-date">到期时刻</span>` +
     `<span class="st-ex-days">剩余</span>` +
-    `<span class="st-ex-amt">额度 · 今日已耗</span>` +
+    `<span class="st-ex-amt" title="额度 = 本行这批包（同一到期日）的待作废额度；花费 ≈ max(0, 今日余额下降差值 − 今日已作废)，发放与作废相抵时可能低估；今日已废 = 该账号今天已经清零的全部包，不一定是本行这批；到期前还会废 = 按今日估算花费速度外推、本行这批到期前花不完的量（观测不足时按全废计）。三者口径不同，不必相加相等">额度 · 今日花费</span>` +
     `</div>`;
   ex.forEach((r, i) => {
     // 剩余时长优先用后端下发的精确小时数（hours_left），退回自然日文案兜底。
@@ -4468,15 +4874,22 @@ function renderExpiry(ex) {
     const dayTxt = Number.isFinite(h) && h > 0
       ? (h < 1 ? `${Math.round(h * 60)} 分钟后` : `${h.toFixed(1)} 小时后`)
       : (r.days_left <= 0 ? "今日到期" : (r.days_left === 1 ? "明日到期" : `${r.days_left} 天后到期`));
+    // 今日花费是估算值；老后端无此字段时退回差值，不至空白。
+    const spent = r.today_spent != null && Number.isFinite(Number(r.today_spent)) ? Number(r.today_spent) : Number(r.today_out);
+    const expired = Number(r.today_expired) || 0;
+    // 「今日已废」与「到期前还会废」必须带批次限定词：二者是**不同的包**——
+    // 前者是账号今天已经清零的（往往是凌晨那批），后者是本行这批到期前的预估。
+    // 不加限定会被读成「废了两次」（实测用户观感）。
+    const expiredTxt = expired > 0 ? ` · 今日已废 ${fmtCredits(expired)}` : "";
     // 预计作废：burn_forecast<0 表示观测不足、无法外推，此时按「全部额度都会作废」
     // 展示（与后端 Risk 判定同口径），不能显示「作废 -1 分」这种反数。
     const burn = r.risk
-      ? ` · 预计作废 ${fmtCredits(r.burn_forecast < 0 ? r.amount : r.amount - r.burn_forecast)}分`
+      ? ` · 到期前还会废 ${fmtCredits(r.burn_forecast < 0 ? r.amount : r.amount - r.burn_forecast)}分`
       : "";
     // 配色按**紧迫度**（后端 urgency），不按 risk：
     //   今天到期 → 红（st-risk）；明天到期 → 黄（st-warn）；更远 → 不上色。
     // 此前用 risk 上色，7 天内的行全飘红（135 小时后到期的也红），一片警示等于没有警示。
-    // 「预计作废」文字仍只跟 risk 走：那是数据结论，与颜色分档独立。
+    // 「到期前还会废」文字仍只跟 risk 走：那是数据结论，与颜色分档独立。
     const urg = r.urgency === "today" ? " st-risk"
       : (r.urgency === "tomorrow" ? " st-warn" : "");
     html += `<div class="st-ex-row${urg}">` +
@@ -4485,7 +4898,7 @@ function renderExpiry(ex) {
       `<span class="st-ex-name" title="${esc(r.uid)}">${esc(r.nickname || r.uid)}</span>` +
       `<span class="st-ex-date">${esc(fmtExpireAt(r.expire_at))}</span>` +
       `<span class="st-ex-days">${esc(dayTxt)}</span>` +
-      `<span class="st-ex-amt">${fmtCredits(r.amount)}分 · 已耗 ${fmtCredits(r.today_out)}${burn}</span>` +
+      `<span class="st-ex-amt">${fmtCredits(r.amount)}分 · 花费 ${fmtCredits(spent)}${expiredTxt}${burn}</span>` +
       `</div>`;
   });
   html += `</div>`;
@@ -4496,7 +4909,7 @@ function renderExpiry(ex) {
 // 模型消耗（今日，按积分降序）：Trae 系积分加「≈」（分摊估算），平均速度=成功请求实测均值
 function renderModels(models) {
   let mh = `<tr><th>#</th><th>模型</th><th>次数</th><th>Token</th><th>缓存</th><th>积分</th>` +
-    `<th title="成功请求实测均值：tok/s = 生成 token ÷ 生成耗时（按时长加权）；TTFB = 首字节耗时算术平均">平均速度</th></tr>`;
+    `<th title="最近 60 秒滑动窗口速率：窗口内投递 token 合计 ÷ 60（按秒分桶，反映当前实际吐出速度，不是单请求平均）；TTFB = 首字节耗时算术平均">当前速度</th></tr>`;
   models.forEach((m, j) => {
     const isTrae = isTraeChannel(m.model);
     let creditCell;
@@ -4509,14 +4922,15 @@ function renderModels(models) {
         ? `<span title="TraeWork 无单次精确积分，按渠道真实消耗分摊；暂无余额差值消耗">—</span>`
         : fmtCreditS(m.credit);
     }
-    const tps = Number(m.avg_tok_per_sec) || 0;
+    const tps = Number(m.tok_per_sec) || 0;
     const ttfb = Number(m.avg_ttfb_ms) || 0;
     const parts = [];
     if (tps > 0) parts.push(fmtPct(tps) + " tok/s");
     if (ttfb > 0) parts.push(fmtCredits(ttfb) + "ms");
+    const win = Number(m.tput_window_sec) || 60;
     const perfCell = parts.length
-      ? `<span title="样本 ${fmtCredits(m.perf_samples)} 次成功请求">${parts.join(" · ")}</span>`
-      : "—";
+      ? `<span title="最近 ${win} 秒窗口 · TTFB 样本 ${fmtCredits(m.perf_samples)} 次">${parts.join(" · ")}</span>`
+      : `<span class="muted" title="最近 ${win} 秒内无流式投递">—</span>`;
     mh += `<tr><td class="st-idx">${j + 1}</td>` +
       `<td class="st-mono" title="${esc(m.model)}">${esc(m.model)}</td>` +
       `<td>${fmtCredits(m.reqs)}</td><td>${fmtTokensFull(m.tokens)}</td>` +
@@ -4527,9 +4941,9 @@ function renderModels(models) {
   $("stModels").innerHTML = models.length ? mh : `<tr><td class="st-empty" colspan="7">今日暂无消耗</td></tr>`;
 }
 
-// 请求日志：降序渲染（最新在最上）；tok/s 仅流式有值，0/空给「—」
+// 请求日志：降序渲染（最新在最上）；tok/s = 端到端（token ÷ 总耗时），0/空给「—」
 function renderLogs(rows) {
-  let h = `<tr><th>#</th><th>时间</th><th>模型</th><th>模式</th><th>状态</th><th>TTFB</th><th>tok</th><th>tok/s</th><th>total</th><th>积分</th></tr>`;
+  let h = `<tr><th>#</th><th>时间</th><th>模型</th><th>模式</th><th>状态</th><th>TTFB</th><th>tok</th><th title="本次请求端到端速率：completion token ÷ 总耗时（含排队与首字节）">tok/s</th><th>total</th><th>积分</th></tr>`;
   for (let i = rows.length - 1; i >= 0; i--) {
     const r = rows[i];
     const status = r.status < 400 ? String(r.status) : `<span class="st-bad">${r.status}</span>`;

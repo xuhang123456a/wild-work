@@ -7,18 +7,20 @@
 // activity."}`（协议 §1.2.4 的实测矩阵）。判据与 HTTP 头、运行时（Electron/curl/Node）、
 // 版本头、请求频率、多轮历史、`tools` 声明**都无关**——唯一的开关就是这段文本。
 //
-//	| system 内容                          | 字符数 | 结果          |
-//	|--------------------------------------|--------|---------------|
-//	| 无 system                            | 0      | ✗ 405 + 3012  |
-//	| 仅 cliPrefix                         | 42     | ✗ 405 + 3012  |
-//	| cliPrefix + stable（全部三段）        | 2898   | ✓ 200         |
-//	| 完整四块（含 dynamic 段）             | 7599   | ✓ 200         |
+//	| system 内容                       | 结果          |
+//	|-----------------------------------|---------------|
+//	| 无 system                         | ✗ 405 + 3012  |
+//	| 仅 cliPrefix                      | ✗ 405 + 3012  |
+//	| cliPrefix + stable               | ✓ 200         |
+//	| 三块（cliPrefix + stable + 第3块合并 dynamic/caller）  | ✓ 200（2026-10-23 实测）|
 //
-// ⇒ 本包取「cliPrefix + stable + # Environment 段（+ 调用方 system）」这一最小充分形态：
+// ⇒ 本包取「cliPrefix + stable + # Environment 段（调用方 system 合并进第 3 块）」这一
+// 最小充分形态，**恰好 3 块**（2026-10-23 修正，原为 4 块）：magpie #343 判定明确
+// 「ZCode 的三个 system 块，把 agent 的 system 末尾追加进第 3 块；**加第 4 块被拒**」。
 // 官方完整身份块还含约 5KB 的 dynamic 段（`# Communicating with the user` /
 // `# Context management`），那些是**给 ZCode 内建 coding agent 的行为指令**，与准入无关，
 // 且会被放在 system 开头**压过调用方（本仓上层）自己的 prompt**，表现为「啰嗦、慢」，
-// 故**不含** dynamic 段。
+// 故**不含** dynamic 段（实测即使含也不影响准入，见 ab_tool/ab_env2 实测）。
 //
 // # ⚠ 维护警告（来自参考实现，必须照抄）
 //
@@ -75,26 +77,38 @@ func officialStable() string { return strings.Join(stableSections, "\n\n") }
 // **测试之外不得改写它。**
 var identitySystemFn = buildIdentityBlocks
 
-// buildIdentityBlocks 构造官方形态的 `system` 块数组（协议 §1.4）：
+// buildIdentityBlocks 构造官方形态的 `system` 块数组（协议 §1.4）:
 //
-//	block[0]     = cliPrefix（42 字符）        ← 准入必需
-//	block[1]     = stable（2856 字符）         ← 准入必需
-//	block[2]     = "# Environment" 段
-//	block[3..]   = 调用方 system（**追加在最后**）
+//	block[0]     = cliPrefix（42 字符）                  ← 准入必需
+//	block[1]     = stable（2856 字符）                   ← 准入必需
+//	block[2]     = "# Environment" 段 + 调用方 system    ← **合并进同一块**
 //
-// ⚠ 调用方内容必须追加在**最后**：上游检查的是前缀结构，官方身份块必须处在开头位置。
+// ⚠ **必须恰好 3 块**（2026-10-23 实测，magpie #343 判定）：上游的 Start Plan 准入
+// 检查「ZCode 的三个 system 块，把 agent 的 system 追加在第 3 块末尾」——**加第 4 块被拒**
+// （HTTP 405 + code 3012）。旧实现把调用方 system 放进独立第 4 块，恰撞此判据：
+// 报错签名 `405 {"code":3012,"msg":"request has been blocked due to unusual activity."}`
+// 与 magpie start.test 的失败签名逐字节一致。两个参考实现（zcode-pool 2 块、magpie 3 块）
+// 发调用方 system 时都不超过 3 块，本项目取 3 块形态（不削掉 # Environment 段）。
+//
+// ⚠ 调用方内容必须**合并进第 3 块末尾**，绝不得开新块。
 // ⚠ 只在**最后一块**打 prompt caching 断点（协议 §1.4 实测/推导）：Anthropic 的
 // 缓存断点是**前缀式**的（一个位于末尾的断点覆盖面等于每块各打一个），且单请求断点
 // 有数量上限（4 个）——每块都打会用满预算，导致 `tools` 再也打不了点。
 func buildIdentityBlocks(callerSystem string, env envInfo) []any {
+	// 第 3 块 = "# Environment" 段 + 调用方 system（以 \n\n 衔接），合并进同一块。
+	// 实测（2026-10-23）：无论动态段是否包含 before/after Environment 章节，
+	// 只要保持恰好 3 块 + metadata.user_id，多轮工具对话均返回 200。
+	caller := strings.TrimSpace(callerSystem)
+	if caller != "" && !strings.Contains(caller, cliPrefix) {
+		// 幂等：调用方自己已经带了官方身份块（例如上游客户端直连本工具）时不重复。
+		caller = "\n\n" + caller
+	} else {
+		caller = ""
+	}
 	blocks := []any{
 		textBlock(cliPrefix),
 		textBlock(officialStable()),
-		textBlock(environmentSection(env)),
-	}
-	// 幂等：调用方自己已经带了官方身份块（例如上游客户端直连本工具）时不重复追加。
-	if cs := strings.TrimSpace(callerSystem); cs != "" && !strings.Contains(cs, cliPrefix) {
-		blocks = append(blocks, textBlock(callerSystem))
+		textBlock(environmentSection(env) + caller),
 	}
 	if m, ok := blocks[len(blocks)-1].(map[string]any); ok {
 		m["cache_control"] = map[string]any{"type": "ephemeral"}

@@ -17,6 +17,7 @@ import (
 	"wild-work/internal/auth"
 	"wild-work/internal/idle"
 	"wild-work/internal/provider"
+	"wild-work/internal/sanitize"
 )
 
 // ErrKind 错误分类，pool 据此决定冷却时长。
@@ -320,7 +321,10 @@ func (c *Client) RefreshToken(a *auth.Auth) error {
 // 只有传输层失败才返回 err。
 func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status int, respBody []byte, err error) {
 	url := c.chatBase(a) + "/v2/chat/completions"
-	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(PrepareBody(body)))
+	// prepared：脱敏后的最终请求体（ChatStream 级保留一份，ErrContentBlocked 时
+	// 供 diag 落盘——落的是发往上游的真实字节，不是调用方原始 body）。
+	prepared := PrepareBody(body)
+	req, err := http.NewRequest(http.MethodPost, url, bytes.NewReader(prepared))
 	if err != nil {
 		return nil, 0, nil, err
 	}
@@ -344,6 +348,12 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status
 		kind := Classify(resp.StatusCode, string(raw))
 		log.Printf("chat_stream uid=%s: upstream %d %s body=%s",
 			a.UID, resp.StatusCode, kind, truncate(string(raw), 200))
+		// diag：渠道指纹拦截时落盘 prepared body（零 token 口径：body 不含凭据头），
+		// 供 scripts/bisect-blocked.py 分层重放定位。仅 ErrContentBlocked，正常请求零 IO。
+		if kind == ErrContentBlocked {
+			log.Printf("[diag] content_blocked system_head=%q", sanitize.SystemHead(prepared, 120))
+			DumpBlocked(prepared)
+		}
 		return nil, resp.StatusCode, raw, nil
 	}
 	// 成功分支：cancel 所有权交给 idle.Monitor（其 Close 会 cancel；静默超时也会 cancel）。

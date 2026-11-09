@@ -45,8 +45,26 @@ type Config struct {
 	// WorkBuddy 国际版使用该模式。
 	ActivitiesOnly bool
 
+	// FollowGlobalCheckin 表示本渠道的签到时刻**跟随面板全局配置**（config.schedule.checkin_times）。
+	// 只有它为 true 的调度器才会被 App.SetCheckinTimes 热更新。
+	//
+	// 为什么需要这个标记（issue #210）：旧实现无条件把全局时刻广播给**所有**调度器，于是
+	//   ① 显式配成 []int{} 的渠道（qwenwork/cline/comate/oczen/kilo/zcode）一旦用户改过一次
+	//      签到时间，就获得了签到时刻，从此每天空跑必然失败的签到并把面板染红；
+	//   ② Qoder 双区的固定 10:00 窗口（上游活动开放时刻，见 main.go 的 qoderCheckinMinute）
+	//      会被用户的 09:00/21:00 覆盖掉，起点跑到活动创建之前。
+	// 「有没有签到时刻」不足以区分这两者——qodercn 有固定时刻但不该跟随全局。
+	FollowGlobalCheckin bool
+
 	// Ledger 积分流水记账器（非 nil 时签到后余额刷新触发差分记账）。
 	Ledger *ledger.Ledger
+
+	// ExpiringDays 面板「临期额度」的展示窗口（自然日，1/2/7，默认 1 = 今日到期）。
+	//
+	// 它是**纯展示口径**（见 R112b），与选号完全无关：本渠道签到后刷新余额时用它
+	// 算出 expiring 写回 pool，使面板能立刻反映新窗口（不必等到下一次积分自动刷新）。
+	// 0 = 用 provider.ExpiringDays（默认 1），供旧测试/未接线的渠道兼容。
+	ExpiringDays int
 }
 
 // Scheduler 调度器。
@@ -441,13 +459,48 @@ func (s *Scheduler) CheckinAccount(uid string) (CheckinResult, error) {
 	return s.checkinOne(uid), nil
 }
 
-// finishCheckin 统一收尾：记录签到状态并上报观察者。
-// ActivitiesOnly 渠道跳过这两步（无签到语义，且需对用户透明）。
-func (s *Scheduler) finishCheckin(uid string, r CheckinResult) CheckinResult {
-	if !s.cfg.ActivitiesOnly {
-		s.cfg.Pool.RecordCheckin(uid, r.OK, r.Msg)
-		s.notifyCheckin(r)
+// SetExpiringDays 运行中更新临期展示窗口（自然日，1/2/7）。
+// 改变只影响**之后的**签到/刷新写回值；已写入 pool 的 expiring 由下一次
+// 积分刷新（App.SetExpiringDays 会立即刷一轮）重算，因此这里不主动触发刷新。
+func (s *Scheduler) SetExpiringDays(days int) {
+	s.mu.Lock()
+	s.cfg.ExpiringDays = days
+	s.mu.Unlock()
+}
+
+// expiringDays 当前临期展示窗口（0 表示未配置 ⇒ 用 provider 默认值）。
+func (s *Scheduler) expiringDays() int {
+	s.mu.Lock()
+	d := s.cfg.ExpiringDays
+	s.mu.Unlock()
+	if d <= 0 {
+		return provider.ExpiringDays
 	}
+	return d
+}
+
+// ExpiringDays 当前临期展示窗口（面板/测试读回用；未配置时回 provider 默认值）。
+func (s *Scheduler) ExpiringDays() int { return s.expiringDays() }
+
+// FollowsGlobalCheckin 本渠道的签到时刻是否跟随面板全局配置（决定 SetCheckinTimes 是否推送）。
+func (s *Scheduler) FollowsGlobalCheckin() bool {
+	s.mu.Lock()
+	defer s.mu.Unlock()
+	return s.cfg.FollowGlobalCheckin
+}
+
+// finishCheckin 统一收尾：记录签到状态并上报观察者。
+// 两种情况跳过这两步：
+//   - ActivitiesOnly：无签到语义，需对用户透明（WorkBuddy 国际版）；
+//   - 本渠道没有签到时刻（R39 的显式空切片）：根本没有签到任务，把它必然失败的
+//     DailyCheckin 桩当成「签到失败」落盘，正是 issue #210 的红标来源。
+//     判据取自配置本身，渠道侧无需改动；即使被外部误调 RunCheckinNow 也不会污染面板。
+func (s *Scheduler) finishCheckin(uid string, r CheckinResult) CheckinResult {
+	if s.cfg.ActivitiesOnly || len(s.CheckinMinutes()) == 0 {
+		return r
+	}
+	s.cfg.Pool.RecordCheckin(uid, r.OK, r.Msg)
+	s.notifyCheckin(r)
 	return r
 }
 
@@ -558,9 +611,10 @@ func (s *Scheduler) checkinOne(uid string) CheckinResult {
 	} else {
 		_, unusable := provider.Summarize(items)
 		// 临期额度（仅展示）与最早到期时刻（Pick 排序键）同一份 items。
-		// 阈值固定 provider.ExpiringDays，R112 起不再可配。
+		// 窗口取调度器配置（config.schedule.expiring_days，默认 1 天，R112b），
+		// 与 App.creditSnapshot 同源；不参与选号。
 		now := time.Now()
-		expiring := provider.ExpiringWithinDays(items, provider.ExpiringDays, now)
+		expiring := provider.ExpiringWithinDays(items, s.expiringDays(), now)
 		earliest, _ := provider.EarliestExpire(items, now)
 		r.Remain, r.HasRemain = usable, true
 		log.Printf("checkin credits platform=%s uid=%s remain=%d expiring=%d unusable=%d earliest=%v", name, uid, usable, expiring, unusable, earliest)
@@ -649,13 +703,19 @@ func (s *Scheduler) refreshForCheckin(a *auth.Auth, uid string) error {
 	if s.refreshOverride != nil { // 仅测试注入
 		return s.refreshOverride(a, uid)
 	}
-	if err := s.cfg.Upstream.RefreshToken(a); err != nil {
+	// 单飞：签到与请求路径/保活/credit 循环并发，同账号并发刷新会互相作废 refresh_token。
+	if err := provider.RefreshOnce(a, func() error {
+		if rerr := s.cfg.Upstream.RefreshToken(a); rerr != nil {
+			return rerr
+		}
+		if serr := a.SaveAtomic(); serr != nil {
+			log.Printf("refresh save failed platform=%s uid=%s err=%v", name, uid, serr)
+			return fmt.Errorf("refresh save: %w", serr)
+		}
+		return nil
+	}); err != nil {
 		log.Printf("refresh failed platform=%s uid=%s err=%v", name, uid, err)
 		return err
-	}
-	if err := a.SaveAtomic(); err != nil {
-		log.Printf("refresh save failed platform=%s uid=%s err=%v", name, uid, err)
-		return fmt.Errorf("refresh save: %w", err)
 	}
 	log.Printf("refresh success platform=%s uid=%s expires_at=%d", name, uid, a.ExpiresAt)
 	return nil
@@ -680,7 +740,17 @@ func (s *Scheduler) RunKeepaliveNow() {
 			continue
 		}
 		log.Printf("refresh start platform=%s uid=%s reason=keepalive", name, st.UID)
-		if err := s.cfg.Upstream.RefreshToken(a); err != nil {
+		// 单飞：保活与请求路径/签到/credit 循环并发，同账号并发刷新会互相作废 refresh_token。
+		// saveErr 由真正执行刷新的那个 goroutine 写入；等待者不执行 fn，其 saveErr 保持 nil
+		// 是正确语义 —— 落盘已由执行者完成。
+		var saveErr error
+		if err := provider.RefreshOnce(a, func() error {
+			if rerr := s.cfg.Upstream.RefreshToken(a); rerr != nil {
+				return rerr
+			}
+			saveErr = a.SaveAtomic()
+			return nil
+		}); err != nil {
 			log.Printf("refresh failed platform=%s uid=%s err=%v", name, st.UID, err)
 			var ue *provider.Error
 			if errors.As(err, &ue) && ue.Kind == provider.ErrSessionDead {
@@ -690,9 +760,9 @@ func (s *Scheduler) RunKeepaliveNow() {
 			s.notifyRefresh(st.UID, false, err.Error())
 			continue
 		}
-		if err := a.SaveAtomic(); err != nil {
-			log.Printf("refresh save failed platform=%s uid=%s err=%v", name, st.UID, err)
-			s.notifyRefresh(st.UID, false, "refresh save: "+err.Error())
+		if saveErr != nil {
+			log.Printf("refresh save failed platform=%s uid=%s err=%v", name, st.UID, saveErr)
+			s.notifyRefresh(st.UID, false, "refresh save: "+saveErr.Error())
 			continue
 		}
 		log.Printf("refresh success platform=%s uid=%s expires_at=%d", name, st.UID, a.ExpiresAt)

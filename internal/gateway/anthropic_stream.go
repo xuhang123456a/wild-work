@@ -250,6 +250,12 @@ func (g *Gateway) handleCountTokens(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
+	// 别名/未知模型也必须在这里解析（R129）：三个接口共用同一套优先级，否则会出现
+	// 「Chat/Responses 能用别名、count_tokens 说 model 不认识」的错位。
+	// 本接口不发上游（纯字符启发式估算），所以解析失败就报与另两个接口同构的 400。
+	if _, ok := g.resolveModel(w, asString(body["model"]), true); !ok {
+		return
+	}
 	tokens := estimateAnthropicTokens(body)
 	writeJSON(w, http.StatusOK, map[string]any{"input_tokens": tokens})
 }

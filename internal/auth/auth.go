@@ -485,6 +485,21 @@ func LoadClineDir(dir string) ([]*Auth, error) {
 	return loadPrefixed(dir, "cline")
 }
 
+// LoadComateDir 扫描 WPS Comate 渠道凭证（comate-*.json）。
+// 与 cline 同为「粘贴型」渠道：凭据是 wps_sid Cookie（面板粘贴，见 app.SubmitComateSID），
+// 存于 AccessToken；Cookie 不轮换 ⇒ 无 refresh/保活/签到，ExpiresAt 恒远期。
+func LoadComateDir(dir string) ([]*Auth, error) {
+	return loadPrefixed(dir, "comate")
+}
+
+// LoadLingxiDir 扫描 WPS 灵犀渠道凭证（lingxi-*.json）。
+// 与 comate 同为「粘贴型」渠道：凭据同为 wps_sid Cookie（面板粘贴，见
+// app.SubmitLingxiSID），存于 AccessToken；Cookie 不轮换 ⇒ 无 refresh/保活，
+// ExpiresAt 恒远期；但灵犀有每日签到（领智点），由调度器走 checkinMinutes。
+func LoadLingxiDir(dir string) ([]*Auth, error) {
+	return loadPrefixed(dir, "lingxi")
+}
+
 // LoadOfficeAceDir 扫描华为云果办 OfficeAce 渠道凭证（officeace-*.json）。
 // 与 cline 同为「导入型」渠道：凭据由面板从本机 OfficeAce 客户端文件发现后生成
 // （见 internal/officeace 的发现逻辑），或自助 OAuth 登录生成。

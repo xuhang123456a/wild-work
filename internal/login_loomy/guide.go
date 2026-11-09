@@ -115,13 +115,33 @@ func (s *session) handleLogin(w http.ResponseWriter, r *http.Request) {
 			"message": "本次登录流程已结束，请回面板重新点「添加账号 → Loomy」再试一次"})
 		return
 	}
-	// 页面刷新后 msgid 会丢（#173 缺陷 B）：服务端留一份，提交时能补上就补上，
-	// 不让用户为「刷新了一下」而不得不重发短信（重发还会撞上发送间隔限制）。
+	// msgid 的「有没有发过」判定**只在这里**做，页面不再抢判。
+	//
+	// 三级兜底，全部答不上来才报错：
+	//   ① 页面带来的（同一标签页内正常路径）；
+	//   ② 本会话留下的（页面刷新 / 开第二个标签页）；
+	//   ③ 同一手机号跨会话留下的（面板取消后重新发起、4 分钟 flowTTL 到点 ——
+	//      此时短信仍躺在用户手机上、5 分钟内有效，旧实现会答「没有下发记录」）。
+	//
+	// 只在后端判的原因：页面拿不到 ③，也无法区分「真的没发过」与「服务端换了会话」。
 	if strings.TrimSpace(msgid) == "" {
 		msgid = s.storedMsgID()
 	}
+	if strings.TrimSpace(msgid) == "" {
+		msgid = lookupMsgID(phone)
+	}
+	if strings.TrimSpace(msgid) == "" {
+		writeJSON(w, map[string]any{"ok": false,
+			"message": "本机没有查到这次验证码的下发记录，请点「获取验证码」重新获取"})
+		return
+	}
 
 	if _, err := s.login(s.guideClient(), strings.TrimSpace(phone), strings.TrimSpace(code), strings.TrimSpace(msgid)); err != nil {
+		// 上游说 msgid 无效时丢掉跨会话留存：留着只会让后续每次提交都撞同一个错，
+		// 用户却没有任何可见线索能自愈（验证码错误不该丢，用户改码重试是正常路径）。
+		if strings.Contains(err.Error(), "msgid") {
+			forgetMsgID(phone)
+		}
 		// 就地报错让用户重试（不关页面、不置终态）。
 		writeJSON(w, map[string]any{"ok": false, "message": err.Error()})
 		return
@@ -240,11 +260,14 @@ const guidePage = `<!DOCTYPE html>
     var phone = digits(phoneEl);
     if (phone.length !== 11) { setStatus('请输入 11 位手机号', 'err'); return; }
     sendBtn.disabled = true;
+    // 发码在途时锁住「登录」：否则用户抢在回包前提交，本地 msgid 还是空的，
+    // 会被误报成「请先点「获取验证码」」（本次报障的现场之一）。
+    loginBtn.disabled = true;
     setStatus('正在发送验证码…');
     post('` + apiSendCodePath + `', { phone: phone })
       .then(function (res) {
         if (res && res.ok) {
-          msgid = res.msgid || '';
+          if (res.msgid) msgid = res.msgid; // 回包缺 msgid 时别把页面上已有的值洗掉
           setStatus(res.message || '验证码已发送', 'ok');
           codeEl.focus();
         } else {
@@ -252,21 +275,31 @@ const guidePage = `<!DOCTYPE html>
         }
       })
       .catch(function () { setStatus('连不上本工具的登录引导服务（面板侧可能已结束本次登录），请回面板重新发起登录', 'err'); })
-      .finally(function () { sendBtn.disabled = false; });
+      .finally(function () { sendBtn.disabled = false; loginBtn.disabled = false; });
   });
 
+  // 「有没有发过验证码」不在这里判，交给后端。
+  //
+  // 页面能看到的只有本标签页的变量和服务端**当前会话**的状态，而真实的有效下发记录
+  // 可能属于上一个会话（面板取消后重新发起、4 分钟超时）。旧版在这里用 !id 直接拦下，
+  // 用户手上明明收到过验证码却被要求重新获取 —— 这正是本次报障的现场。
+  // 现在无论本地有没有值都照常提交，由 /api/loomy/login 做三级兜底并给出准确文案。
   loginBtn.addEventListener('click', function () {
     var phone = digits(phoneEl);
     var code = digits(codeEl);
     if (phone.length !== 11) { setStatus('请输入 11 位手机号', 'err'); return; }
     if (!code) { setStatus('请输入短信验证码', 'err'); return; }
-    if (!msgid) { setStatus('请先点「获取验证码」', 'err'); return; }
     loginBtn.disabled = true;
     setStatus('正在登录…');
     post('` + apiLoginPath + `', { phone: phone, code: code, msgid: msgid })
       .then(function (res) {
-        if (res && res.ok) setStatus(res.message || '登录成功，可以关闭此窗口了', 'ok');
-        else setStatus((res && res.message) || '登录失败，请重试', 'err');
+        if (res && res.ok) {
+          setStatus(res.message || '登录成功，可以关闭此窗口了', 'ok');
+          return;
+        }
+        // 服务端判定这次验证码确实没有下发记录：清掉本地缓存，避免下次又拿旧的去撞。
+        if (res && res.message && res.message.indexOf('没有查到') >= 0) msgid = '';
+        setStatus((res && res.message) || '登录失败，请重试', 'err');
       })
       .catch(function () { setStatus('连不上本工具的登录引导服务（面板侧可能已结束本次登录），请回面板重新发起登录', 'err'); })
       .finally(function () { loginBtn.disabled = false; });

@@ -170,11 +170,16 @@ func (c *Client) do(method, url string, a *auth.Auth, body []byte) (*http.Respon
 	if err != nil {
 		return nil, nil, err
 	}
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Authorization", "Bearer "+accessToken(a))
+	// 出站头统一走 ApplyHeaders（官方 box-agent LLM 路径的形态）。
+	//
+	// do() 用于签到/目录/余额等**网页业务 API**，官方这些端点走渲染层那套头，与 LLM
+	// 端点不同；但本渠道的对齐目标一直是「让上游看到官方客户端」，故两类端点共用一套头
+	// 以保持代码单一来源（两类端点的差异记载见 headers.go 文件头）。
+	//
+	// orgCode 传空串：个人账号无企业码（auth.Auth 结构里也没有该字段）。
+	// session key 用 "web"：这不是 LLM 端点，官方这些请求不带会话语义；按账号分桶
+	// （不带模型），避免不同账号共用同一个 web 会话。
+	ApplyHeaders(req, accessToken(a), "", gatewayOSVersion(), sessionFor(sessionKeyOf(a, "web")), newTurnID())
 	resp, err := c.httpClient().Do(req)
 	if err != nil {
 		return nil, nil, err
@@ -310,9 +315,25 @@ func (c *Client) ChatStream(a *auth.Auth, body []byte) (rc io.ReadCloser, status
 	if err != nil {
 		return nil, 0, nil, err
 	}
-	req.Header.Set("Content-Type", "application/json")
-	req.Header.Set("Accept", "application/json")
-	req.Header.Set("Authorization", "Bearer "+accessToken(a))
+	// 出站头对齐官方 LLM 请求形态（UA=AsyncOpenAI/Python、X-Stainless-*、x-client-*、
+	// X-RACCOON-Session-ID/Turn-ID）。
+	//
+	// 不手写 Accept —— openai SDK 会发 Accept: application/json，但那是 SDK 行为。
+	// session id 按「账号 + 模型」分桶并 24h 轮换；turn id 每请求新建。
+	//
+	// ⚠️ 这两个头**必须一起上**：上游原本完全不发 X-RACCOON-Session-ID，若只引入身体头而
+	// 让 session 每请求新建，上游就会看到「同一账号短时间冒出上百个新会话」——这正是
+	// 429 的触发条件（见下方 429 段落）。
+	sessID, sessNew := sessionForEx(sessionKeyOf(a, modelOf(orig)))
+	// 把会话 ID 与「是否新建」写进 app.log。
+	//
+	// 动机：本渠道的 429 归因（会话稳定性）只能靠「同一账号+模型是否复用同一 sess-」验证，
+	// 而该值此前只在出站头里、日志看不到，等于关键决策点无法事后核对。打 info 级（不是
+	// debug）：会话新建是低频事件、复用是高频事件，两者都只在每请求一行，可与轮换计数
+	// 按时间戳对照。**不打 token**：只打账号 uid、模型名与会话 ID（后者本就是发往上游的
+	// 非敏感随机串）。
+	log.Printf("raccoon session: uid=%s model=%q sid=%s new=%t", accountKey(a), modelOf(orig), sessID, sessNew)
+	ApplyHeaders(req, accessToken(a), "", gatewayOSVersion(), sessID, newTurnID())
 	// 用无总超时的 client：长思考请求不受整请求上限约束（见 Client.StreamHTTP）。
 	resp, err := c.streamClient().Do(req)
 	if err != nil {
@@ -530,7 +551,9 @@ func (c *Client) FetchModels(a *auth.Auth) ([]provider.ModelInfo, error) {
 			ContextWindow:  m.Params.ContextWindow,
 			MaxTokens:      m.Params.MaxTokens,
 			ContextFromAPI: m.Params.ContextWindow > 0,
-			SupportsImages: hasTag(m.Tags, "vision"),
+			// catalog 的 vision tag 曾漏标 raccoon-19b265 / raccoon-405a1c，
+			// 但真实 image_url A/B 对照已确认它们可识图；能力按「上游声明 ∪ 实测」投影。
+			SupportsImages: hasTag(m.Tags, "vision") || measuredVisionModels[id],
 			// 本渠道不投影档位（上游目录未声明 reasoning_efforts，见阶段 C 实测），
 			// 仅如实声明模型是否具备推理标签，便于客户端自行选择。
 			SupportsReasoning: hasTag(m.Tags, "reasoning"),
@@ -615,9 +638,16 @@ type pointsBill struct {
 }
 
 // pointsBillsResp /api/web/points/v1/bills 的响应。
-// 分页用 `paging.limit` / `paging.offset`（`type` 之类参数会 400）；服务端另有
-// 返回条数上限（实测 limit=1000 只回 61 条），故本渠道只取最近一页即可——
-// 每日积分 7 天窗口最多 8 笔在效发放。
+//
+// 分页用 `paging.limit`；`paging.offset` 实测无效（offset>0 恒返回空数组），
+// 服务端另有条数上限（limit=1000 仍只回 100 条），所以只有「最近 N 条」这一页可用。
+//
+// `type` 是**筛选枚举**（all / expense / income，缺省 all），传其它值会
+// `400 params_invalid_error: param type invalid`。官方桌面客户端「积分明细」页
+// 的「全部/消耗/收入」三个页签就是靠它切的（见 app.asar 里
+// `getBills({limit, cursor, type})`；客户端走 v2/bills + cursor，v1 同样认该枚举）。
+// 本渠道只关心收入，故固定 `type=income` —— 收入流水每天最多几笔，不会被
+// 消耗流水挤出窗口（详见 fetchDailyGrants）。
 type pointsBillsResp struct {
 	Code int `json:"code"`
 	Data struct {
@@ -691,8 +721,16 @@ func (c *Client) UserResourceDetail(a *auth.Auth) (int64, []provider.ResourceIte
 // 到期日的额度，且消耗按**先进先出**（最老的一笔先被花掉，实测：三账号 10-13
 // 那笔各花掉 100/109/111，其后的发放笔笔满额，到期清零额恰好等于老笔的剩余）。
 // 升序即「消耗顺序」，供 withDailyExpiry 做先进先出拆分。
+//
+// 为什么必须带 `type=income`（2026-11-09 实测，源自官方客户端「收入明细」页签）：
+// 不带筛选时这一页混着「桌面端 LLM 对话消耗」，每笔对话都占一条。实测该账号约
+// 11 条/小时，而服务端只给最近 100 条且 offset 翻不页 ⇒ 当天的发放记录在几小时
+// 后就被挤出窗口，grants 变空，面板「有效期」整列随之消失、今日到期恒为 0
+// （2026-11-01～11-08 每天 22:06 的 checkin 日志 earliest 均为零值即此）。
+// 收入流水每天 1 笔左右（偶有 reward_grant），100 条足够覆盖数月，窗口不会再被
+// 消耗记录冲掉。
 func (c *Client) fetchDailyGrants(a *auth.Auth) ([]dailyGrant, error) {
-	resp, raw, err := c.do(http.MethodGet, c.authBaseURL()+EpPointsBills+"?paging.limit=50&paging.offset=0", a, nil)
+	resp, raw, err := c.do(http.MethodGet, c.authBaseURL()+EpPointsBills+"?paging.limit=100&type=income", a, nil)
 	if err != nil {
 		return nil, err
 	}
@@ -745,9 +783,15 @@ func (c *Client) fetchDailyGrants(a *auth.Auth) ([]dailyGrant, error) {
 //     Expire 取到的是**最早**那一笔的到期时刻，正好是 `ledger.expired()` 需要的判据
 //     （最早一笔过期 ⇒ 本轮余额下降归因 expire 而非 spend）。
 //
-// 余额拆分口径：池子总额（daily_points）按到期升序逐笔扣减（先进先出），最后一笔
-// 承接全部余量 —— 保证拆分后 Remain 之和恒等于 daily_points（`provider.Summarize`
-// 与 pool 快照据此取值，差一分都会让面板与余额对不上）。
+// 余额拆分口径：上游按**先进先出**消耗（最老的一笔先花，见 R107 实测：10-13 那笔
+// 各花 100/109/111、其后发放笔笔满额、到期清零额恰等于老笔剩余），因此池子里剩下的
+// 余额属于**最新的那几笔**。拆分从到期最晚的一笔往前分配，再按到期升序输出 ——
+// Remain 之和恒等于 daily_points（`provider.Summarize` 与 pool 快照据此取值），
+// 输出升序则让账本聚合后取到的 Expire 是最早一笔（`ledger.expired()` 的判据）。
+//
+// ⚠️ 方向不能反：反着填（余额先给最早的一笔）会让「300 分今晚到期」这种假临期
+// 出现在面板上。2026-11-09 实盘：6 笔在效发放共 1800、池子只剩 300，正确归属是
+// 今天那笔（11-15 到期），反着填会算成 11-09 23:59 到期、今日到期虚报 300。
 func withDailyExpiry(items []provider.ResourceItem, grants []dailyGrant) []provider.ResourceItem {
 	idx := -1
 	for i, it := range items {
@@ -761,15 +805,24 @@ func withDailyExpiry(items []provider.ResourceItem, grants []dailyGrant) []provi
 	}
 	daily := items[idx]
 	if daily.Remain <= 0 {
-		return items // 池子已空：没有可拆的余额，也就没有可展示的到期
+		// 池子已空：没有可拆的余额，但仍要给这一条挂上**最早一笔在效发放**的到期
+		// 时刻 —— 否则「有效期」整列会随当日额度花完而消失（面板时有时无的另一半：
+		// 早上领的 300 一到下午用完，表格里就再没有任何带到期日的条目）。
+		// Total/Remain/Name/Key 一律原样（余额汇总与账本差分键都不受影响），只补 ExpireAt。
+		out := make([]provider.ResourceItem, len(items))
+		copy(out, items)
+		out[idx].ExpireAt = grants[0].ExpireAt
+		return out
 	}
 
 	budget := daily.Remain
 	split := make([]provider.ResourceItem, 0, len(grants))
-	for _, g := range grants {
+	// grants 按到期升序，故从后往前 = 从最新的发放往前分配（先进先出的余额归属）。
+	for i := len(grants) - 1; i >= 0 && budget > 0; i-- {
+		g := grants[i]
 		take := g.Points
 		if take > budget {
-			take = budget // 池子不够：本笔已被花掉一部分
+			take = budget // 池子不够：这笔只承接剩下的余额
 		}
 		if take <= 0 {
 			continue
@@ -779,19 +832,20 @@ func withDailyExpiry(items []provider.ResourceItem, grants []dailyGrant) []provi
 			ExpireAt: g.ExpireAt, Usable: daily.Usable,
 		})
 		budget -= take
-		if budget <= 0 {
-			break
-		}
 	}
 	if len(split) == 0 {
 		return items
 	}
 	if budget > 0 {
-		// 上游口径漂移（池子比 bills 里在效发放之和还大）：余量挂到**最新**那一笔上，
-		// 保证 Remain 之和仍等于 daily_points。宁可到期日略偏，也不让余额对不上。
-		last := &split[len(split)-1]
-		last.Total += budget
-		last.Remain += budget
+		// 上游口径漂移（池子比 bills 里在效发放之和还大）：余量挂到**最新**那一笔上
+		// （此刻 split[0] 即最新），保证 Remain 之和仍等于 daily_points。
+		// 宁可到期日略偏，也不让余额对不上。
+		split[0].Total += budget
+		split[0].Remain += budget
+	}
+	// 输出按到期升序：ledger 按 key 聚合取首个非空 Expire，必须是最早那笔。
+	for i, j := 0, len(split)-1; i < j; i, j = i+1, j-1 {
+		split[i], split[j] = split[j], split[i]
 	}
 
 	out := make([]provider.ResourceItem, 0, len(items)-1+len(split))

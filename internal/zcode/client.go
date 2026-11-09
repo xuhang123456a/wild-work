@@ -254,7 +254,7 @@ func (c *Client) messagesURL(ch channel) string {
 func (c *Client) ChatStream(a *auth.Auth, body []byte) (io.ReadCloser, int, []byte, error) {
 	model := upstreamModelName(modelOf(body))
 	entry, known := c.catalogEntry(model)
-	out, berr := buildMessagesBody(body, entry, known)
+	out, berr := buildMessagesBody(body, entry, known, deviceMidOf(a))
 	if berr != nil {
 		return nil, http.StatusBadRequest, badParamsBody(berr), nil
 	}

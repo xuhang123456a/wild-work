@@ -252,8 +252,8 @@ func TestChatStreamOutboundShape(t *testing.T) {
 	}
 
 	system, _ := gotBody["system"].([]any)
-	if len(system) < 4 {
-		t.Fatalf("system 块数 = %d，期望 >= 4（身份块 + 调用方）", len(system))
+	if len(system) != 3 {
+		t.Fatalf("system 块数 = %d，期望 3（cliPrefix + stable + 第3块合并调用方；加第4块被上游 405/3012 拒），2026-10-23 实测", len(system))
 	}
 	if blockText(system[0]) != cliPrefix {
 		t.Error("system[0] 必须是官方 cliPrefix")
@@ -264,8 +264,8 @@ func TestChatStreamOutboundShape(t *testing.T) {
 	if !strings.Contains(blockText(system[2]), "# Environment") {
 		t.Error("system[2] 应是 # Environment 段")
 	}
-	if !strings.Contains(blockText(system[3]), "CALLER-SYSTEM-TEXT") {
-		t.Error("调用方 system 必须追加在最后")
+	if !strings.Contains(blockText(system[2]), "CALLER-SYSTEM-TEXT") {
+		t.Error("调用方 system 必须合并进第 3 块末尾（绝不是独立第 4 块）")
 	}
 	last := system[len(system)-1].(map[string]any)
 	cc, _ := last["cache_control"].(map[string]any)
@@ -274,6 +274,20 @@ func TestChatStreamOutboundShape(t *testing.T) {
 	}
 	if _, has := system[0].(map[string]any)["cache_control"]; has {
 		t.Error("身份块不应带 cache_control（只给最后一块）")
+	}
+
+	// metadata.user_id 必须存在（参考实现 magpie 的 Start Plan 契约）。
+	md, _ := gotBody["metadata"].(map[string]any)
+	uidStr := strOf(md["user_id"])
+	var mdParsed map[string]any
+	if err := json.Unmarshal([]byte(uidStr), &mdParsed); err != nil {
+		t.Errorf("metadata.user_id 应是 JSON 字符串：%v", err)
+	}
+	if strOf(mdParsed["device_id"]) != "11111111-2222-4333-8444-555555555555" {
+		t.Errorf("metadata.user_id.device_id = %q，期望与 X-Device-Mid 一致", mdParsed["device_id"])
+	}
+	if mdParsed["account_uuid"] != "" || mdParsed["session_id"] != "" {
+		t.Errorf("metadata.user_id.account_uuid/session_id 应为空：%+v", mdParsed)
 	}
 
 	// tools 扁平形态 + 最后一个 tool 打缓存断点。
@@ -336,7 +350,7 @@ func TestEffortOnlyWhenDeclared(t *testing.T) {
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
 			entry, known := catalogEntryForTest("GLM-5.3-Flash")
-			out, err := buildMessagesBody(chatBody(t, tc.effort), entry, known)
+			out, err := buildMessagesBody(chatBody(t, tc.effort), entry, known, "11111111-2222-4333-8444-555555555555")
 			if err != nil {
 				t.Fatalf("buildMessagesBody: %v", err)
 			}

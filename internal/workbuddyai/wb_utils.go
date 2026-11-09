@@ -17,9 +17,9 @@ import (
 // 请求体改写
 // ---------------------------------------------------------------------------
 
-// PrepareBody 改写发往国际版上游的 chat 请求体（含脱敏）。
+// PrepareBody 改写发往国际版上游的 chat 请求体。
 func PrepareBody(src []byte) []byte {
-	return sanitize.Messages(prepareBodyInner(src))
+	return prepareBodyInner(src)
 }
 
 func prepareBodyInner(src []byte) []byte {
@@ -38,6 +38,8 @@ func prepareBodyInner(src []byte) []byte {
 	normalizeRoles(obj)
 	normalizeToolChoice(obj)
 	ensureLeadingSystemMessage(obj)
+	// 出站脱敏（规则见 sanitize.go）
+	sanitize.MessagesInPlace(obj)
 	out, err := json.Marshal(obj)
 	if err != nil {
 		return src

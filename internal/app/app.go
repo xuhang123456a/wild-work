@@ -20,14 +20,20 @@ import (
 
 	"wild-work/internal/auth"
 	"wild-work/internal/backuplink"
+	"wild-work/internal/cdp"
 	"wild-work/internal/cline"
+	"wild-work/internal/codearts"
+	"wild-work/internal/comate"
 	"wild-work/internal/config"
 	"wild-work/internal/custom"
 	"wild-work/internal/ledger"
+	"wild-work/internal/lingxi"
 	"wild-work/internal/login"
 	logincodearts "wild-work/internal/login_codearts"
+	"wild-work/internal/login_comate"
 	logingemini "wild-work/internal/login_gemini"
 	"wild-work/internal/login_glm"
+	loginlingxi "wild-work/internal/login_lingxi"
 	loginlobsterai "wild-work/internal/login_lobsterai"
 	loginloomy "wild-work/internal/login_loomy"
 	loginminimax "wild-work/internal/login_minimax"
@@ -58,7 +64,7 @@ import (
 )
 
 // Version 版本号。
-const Version = "2.9.6"
+const Version = "2.11.6"
 
 const (
 	loginTimeout   = 5 * time.Minute
@@ -136,6 +142,13 @@ type App struct {
 	muGLMLogin sync.Mutex
 	glmLogin   *loginglm.AutoSession
 
+	// WPS Comate 扫码登录会话（服务端 HTTP，不需要桌面/浏览器；见 internal/login_comate）。
+	muComateLogin sync.Mutex
+	comateLogin   *logincomate.QRSession
+	// comateBrowser 接管本机浏览器登录的会话（与扫码会话互斥使用，但各自独立存放：
+	// 用户可能先用扫码、再改用浏览器，两条会话不应互相清状态）。
+	comateBrowser *logincomate.BrowserSession
+
 	muOALogin sync.Mutex
 	oaLogin   *officeace.LoginSession
 
@@ -166,6 +179,13 @@ type App struct {
 
 	refreshMu  sync.Mutex // 防并发刷新积分
 	refreshing bool
+	// refreshDone RefreshAll 的收尾信号（关闭时 Close 要等它落地）。
+	// 值可以是 nil（没有在跑的刷新），Close 对它做一次普通的 nil 判断即可。
+	refreshDone chan struct{}
+	// closed 已进入关闭流程。置位后刷新一律拒绝:
+	// 后台 goroutine 可能还没调度到 Close 就已经结束，它一旦真的跑起来
+	// 会重新 MkdirAll 出 data/ledger 目录，把已清理的 TempDir 又弄成非空。
+	closed bool
 
 	// ledger 用量/积分双流水（data/ledger/）；锦上添花统计，nil = 未启用
 	ledger     *ledger.Ledger
@@ -231,6 +251,8 @@ func New(opts Options) (*App, error) {
 	log.SetOutput(&logWriter{app: a})
 	a.loadPricingCache()
 	a.healRaccoonProtocol()
+	// Loomy 凭据历史估算 expiresAt 归一化（无 refresh 端点时短期值只会触发必失败刷新）。
+	a.healLoomyExpiry()
 	return a, nil
 }
 
@@ -257,8 +279,37 @@ func (a *App) healRaccoonProtocol() {
 	_ = raccoon.ClearCallback(dir)
 }
 
+// waitRefresh 等在跑的 RefreshAll 收尾（没有在跑就立即返回）。
+//
+// 为什么必须等：刷新链路会往回写 pool 快照 / ledger / stats，并在写的过程中
+// **重新创建 data 目录**。Close 若不等它，进程退出（或测试里的 TempDir 清理）
+// 会与后台 goroutine 抢同一批文件句柄——Windows 上表现为
+// `RemoveAll cleanup: ... directory is not empty` / `The process cannot access the file`，
+// 面板侧则可能留下一个半截的 state.json。
+// timeout 是有界的：上游可能卡在超时里，退出路径不能无限挂。
+func (a *App) waitRefresh(timeout time.Duration) {
+	a.refreshMu.Lock()
+	done := a.refreshDone
+	a.refreshMu.Unlock()
+	if done == nil {
+		return
+	}
+	select {
+	case <-done:
+	case <-time.After(timeout):
+		log.Printf("退出前等待积分刷新超时（%s）：后台刷新仍在写 data 文件", timeout)
+	}
+}
+
 // Close 关闭日志文件。
 func (a *App) Close() {
+	// 第一件事：置关闭标志并等正在跑的积分刷新收尾。
+	// 置标志是为了堵住「go RefreshAll() 还没被调度，Close 已经跑完」这个窗口——
+	// 那个 goroutine 一旦还真跑起来，会在已关闭的目录上重新建出 data/ledger。
+	a.refreshMu.Lock()
+	a.closed = true
+	a.refreshMu.Unlock()
+	a.waitRefresh(5 * time.Second)
 	// 停 ledger 自动落盘并冲刷句柄（丢最后几秒流水可接受，但不能一直丢）
 	if a.ledgerStop != nil {
 		select {
@@ -338,50 +389,65 @@ func (a *App) allStatuses() []pool.Status {
 	return out
 }
 
-// channelOrder 渠道固定展示顺序（面板账号卡片/费率表/设置代理列表统一用此序）。
-// 旧 Qoder 已下线不列；未出现在表中的渠道排最后（按字母序）。
-var channelOrder = map[provider.Kind]int{
-	provider.Oczen: 0, provider.WorkBuddy: 1, provider.WorkBuddyAI: 2,
-	provider.QoderCN: 3, provider.QoderCOM: 4, provider.TraeWork: 5, provider.QwenWork: 6,
-	provider.GLM:       7,
-	provider.OfficeAce: 8,
-	provider.Kilo:      9, // 免密免费池：排序上紧随 oczen 之后（同属无账号渠道）
-	provider.Minimax:   10,
-	provider.LobsterAI: 11,
-	provider.ZCode:     12,
-	provider.Gemini:    13,
-	provider.CodeArts:  14,
+// channelDisplayRank 渠道展示名次（索引即排序键），从 provider.ChannelDisplayOrder 派生 ——
+// 与前端 CH_LABEL / CH_SUMMARY_ORDER、面板按钮序、费率 tab 序全部同源（R142）。
+var channelDisplayRank = func() map[provider.Kind]int {
+	m := make(map[provider.Kind]int, len(provider.ChannelDisplayOrder))
+	for i, k := range provider.ChannelDisplayOrder {
+		m[k] = i
+	}
+	return m
+}()
+
+// channelSortKey 面板渠道展示排序键（R142）：
+//   - tier 0 = 内建渠道，按**显示名的 UTF-8 字节序**（rank 即 ChannelDisplayOrder 下标）；
+//   - tier 1 = 自定义渠道 / 未登记渠道，**硬编码钉在最末**，组内按渠道标识字节序，
+//     保证同一批自定义渠道每次渲染顺序一致（不依赖入参顺序）。
+//
+// 旧 Qoder 已从界面下线（代码与路由保留）：它仍是内建渠道、有显示名，故落在「Q」位置，
+// 存量账号不再被特殊钉到最末——统一规则不为单个已下线渠道开例外。
+type channelSortKey struct {
+	tier int
+	rank int
+	name string
+}
+
+func channelSortKeyOf(k provider.Kind) channelSortKey {
+	if r, ok := channelDisplayRank[k]; ok {
+		return channelSortKey{tier: 0, rank: r}
+	}
+	return channelSortKey{tier: 1, name: k.String()}
+}
+
+func (a channelSortKey) less(b channelSortKey) bool {
+	if a.tier != b.tier {
+		return a.tier < b.tier
+	}
+	if a.tier == 0 {
+		return a.rank < b.rank
+	}
+	return a.name < b.name
 }
 
 // feeChannelOrder 「模型列表和费率」面板的渠道分组顺序。
-// 与 channelOrder 分开维护：本表把 Oczen 放首位（其免费模型最常被查），
-// kilo 紧随其后（同为免密免费池），且含 TraeCode（与 TraeWork 共账号但模型集不同，需独立成组）。
-var feeChannelOrder = []provider.Kind{
-	provider.Oczen, provider.Kilo, provider.WorkBuddy, provider.WorkBuddyAI, provider.QoderCN,
-	provider.QoderCOM, provider.TraeWork, provider.TraeCode, provider.QwenWork, provider.GLM,
-	provider.Cline, // 漏在此表 = 面板永远不出该渠道 tab（buildFeesChannels 只遍历本表）
-	provider.MonkeyCode,
-	provider.Raccoon,
-	provider.Loomy,
-	provider.Minimax,
-	provider.LobsterAI,
-	provider.ZCode,
-	provider.Gemini,
-	provider.CodeArts,
-	provider.OfficeAce,
-}
-
-// channelRank 渠道排序键：未知渠道排最后。
-func channelRank(k provider.Kind) int {
-	if r, ok := channelOrder[k]; ok {
-		return r
+// 与面板账号卡片/汇总条同序（R142：按渠道显示名字节序），旧 Qoder 已下线故不列
+// （buildFeesChannels 也会跳过它）。原先「Oczen/Kilo 置首位」的特例被统一规则取代。
+var feeChannelOrder = func() []provider.Kind {
+	out := make([]provider.Kind, 0, len(provider.ChannelDisplayOrder))
+	for _, k := range provider.ChannelDisplayOrder {
+		if k == provider.Qoder {
+			continue
+		}
+		out = append(out, k)
 	}
-	return 100
-}
+	return out
+}()
 
-// sortChannelsByOrder 按 channelOrder 固定顺序稳定排序渠道条目（泛型，复用于各展示处）。
+// sortChannelsByOrder 按展示序稳定排序渠道条目（泛型，复用于各展示处）。
 func sortChannelsByOrder[T any](items []T, kindOf func(T) provider.Kind) {
-	sort.SliceStable(items, func(i, j int) bool { return channelRank(kindOf(items[i])) < channelRank(kindOf(items[j])) })
+	sort.SliceStable(items, func(i, j int) bool {
+		return channelSortKeyOf(kindOf(items[i])).less(channelSortKeyOf(kindOf(items[j])))
+	})
 }
 
 // creditsNAKind 判定该渠道的「积分」概念是否不适用（面板显示「不适用」而不是 0）。
@@ -391,6 +457,12 @@ func sortChannelsByOrder[T any](items []T, kindOf func(T) provider.Kind) {
 //   - cline：上游**确无余额端点**（/credits /usage /billing /quota /me 等 12 个候选实测全 404），
 //     属于「查不到」。把这种情况显示成 0 会被误读成「额度已用光」，故同样走 NA。
 //   - 自定义渠道（R66）：无积分与额度接口，同样走 NA。
+//
+// ⚠️ comate **不在此列**（R136 起）：R130 曾据「/credits /userinfo /me 全 404」
+// 判成 NA，但真实额度端点是 `/llmproxy/v1/user/token-usage`（每日额度
+// limit/remain/used + 周期明细），额度只有「每日」一种口径
+// `lingxi.kdocs.cn/api/public/v1/credits/balance`。两者都在 internal/comate/credits.go
+// 里解析，面板因此能显示真实剩余并支持「刷新积分」。
 //
 // 注意：**ZCode 不走这里**（尽管它的额度也不是积分）——它有真实的 token 桶要展示，
 // 走 creditsUnit="token" 的「Token 计数」面板，而不是「不适用」（见 creditsUnit）。
@@ -478,7 +550,7 @@ func (a *App) SetCustomChannelsSyncer(fn func(channels []custom.ChannelConfig)) 
 // 自定义渠道无签到活动（R66）；内建名单固定，故抽成无状态的包级函数（可脱离 App 断言），
 // 方法体仅补上「是否自定义渠道」这一动态判定。
 func noExplicitCheckin(k provider.Kind) bool {
-	return k == provider.WorkBuddyAI || k == provider.QwenWork || k == provider.Oczen || k == provider.Kilo || k == provider.ZCode || k == provider.Gemini || k == provider.Cline
+	return k == provider.WorkBuddyAI || k == provider.QwenWork || k == provider.Oczen || k == provider.Kilo || k == provider.ZCode || k == provider.Gemini || k == provider.Cline || k == provider.Comate
 }
 
 func (a *App) noExplicitCheckinKind(k provider.Kind) bool {
@@ -511,6 +583,18 @@ func (a *App) keepaliveHours() []int {
 		return rt.Scheduler.KeepaliveHours()
 	}
 	return nil
+}
+
+// expiringDays 面板「积分汇总·临期」的展示窗口（自然日，1/2/7）。
+// 配置值是唯一真源；缺省/非法（老配置没读过 normalize）一律回退 1 天。
+func (a *App) expiringDays() int {
+	a.mu.Lock()
+	d := a.cfg.Schedule.ExpiringDays
+	a.mu.Unlock()
+	if !config.IsExpiringDays(d) {
+		return config.DefaultExpiringDays
+	}
+	return d
 }
 
 func (a *App) nextFire() time.Time {
@@ -808,6 +892,16 @@ func init() {
 		Poll:     wrapPoll(loginraccoon.Poll, loginraccoon.ErrPending, func(a *App, r loginraccoon.Result) error { a.completeRaccoonLogin(r); return nil }),
 		Shutdown: loginraccoon.Shutdown,
 	}
+	// Lingxi：WPS 灵犀网页版 CDP 捕获 wps_sid（与 Raccoon 同款范式）。粘贴路径
+	// （SubmitLingxiSID，F12 复制 Cookie）是等价入口，两条路径共用 persistLingxiAccount
+	// 入库，文件格式与同账号告警语义完全一致。
+	// pollTimeout 对齐包内 10m 等待上限：通用 5m 会先到、关掉还在等用户登录的浏览器。
+	loginFlows[provider.Lingxi] = &loginFlow{
+		Start:       loginlingxi.Start,
+		Poll:        wrapPoll(loginlingxi.Poll, loginlingxi.ErrPending, func(a *App, r loginlingxi.Result) error { return a.completeLingxiLogin(r) }),
+		Shutdown:    loginlingxi.Shutdown,
+		pollTimeout: loginlingxi.PollTimeout,
+	}
 
 	// —— 不通过本表发起的渠道（改造前 A 表的四种语义，现统一为说明文字）——
 	loginFlows[provider.MonkeyCode] = &loginFlow{
@@ -920,7 +1014,7 @@ func (a *App) needsPollFor(kind string) bool {
 // 不接受也不知道怎么消费用户粘回来的 URL，故一律为 false。
 func manualCallbackKind(kind provider.Kind) bool {
 	switch kind {
-	case provider.CodeArts, provider.LobsterAI, provider.TraeWork, provider.QwenWork, provider.Gemini:
+	case provider.CodeArts, provider.LobsterAI, provider.TraeWork, provider.Gemini:
 		return true
 	}
 	return false
@@ -1366,6 +1460,14 @@ func (a *App) completeCodeArtsLogin(r logincodearts.Result) {
 		return
 	}
 	log.Printf("codearts 登录凭证已保存 uid=%s file=%s", r.UID, filepath.Base(fp))
+	// 重新登录 = 账号权限可能已变更 ⇒ 清空「不可用模型」摘除记录（R143）。
+	// 这是唯一的重置入口：81009.404/002002009 的摘除是持久化的、不自动过期。
+	if rt := a.runtime(provider.CodeArts); rt != nil {
+		if c, ok := rt.Upstream.(*codearts.Client); ok {
+			c.ClearUnusable()
+			log.Printf("codearts 已清空不可用模型摘除记录")
+		}
+	}
 	a.reloadAccounts()
 	a.finishLogin()
 	a.afterAccountAdded(provider.CodeArts)
@@ -1641,6 +1743,394 @@ func (a *App) SubmitClineKey(apiKey string) (string, string, error) {
 	return res.UID, warn, nil
 }
 
+// SubmitComateSID 提交用户粘贴的 wps_sid Cookie：验证 → 落盘 → 重载账号池。
+//
+// 验证只调 GET /models —— **零积分消耗**，避免「添加账号即烧积分」。
+// 上游 /models 不回传任何身份字段（实测），uid 用 sid 的 sha256 前 16 位兜底
+// （与 cline probeKey 的 hash 兜底同款：只需稳定且不含明文）。
+//
+// 同账号检测：wps_sid 与已入库账号逐字比对 —— 同一份 sid 重复添加不扩额度
+// （积分按 WPS 账号计），提示用户换账号而不是重复粘贴。
+func (a *App) SubmitComateSID(sid string) (string, string, error) {
+	// 容错：用户常把整段 Cookie / DevTools 表格一行 / 带引号的值一起粘进来，
+	// 这里先规整成裸值（否则报「sid 无效」，用户完全无从自查）。
+	s := comate.NormalizeSID(sid)
+	if s == "" {
+		return "", "", errors.New("wps_sid 不能为空")
+	}
+	uid, models, err := comate.ValidateSIDWithModels(s)
+	if err != nil {
+		return "", "", err
+	}
+
+	// 同账号检测：与已入库 comate 账号的 sid 逐字比对。
+	// 顺带取回「已存在的这个账号的昵称」——用户可能在面板上手工改过名（实测就有人改成
+	// 「business」），重贴 sid 时不能把人家改的名字冲掉。
+	warn := ""
+	prevNick := ""
+	if existing, lerr := auth.LoadComateDir(a.cfg.AuthDir); lerr == nil {
+		for _, e := range existing {
+			if e.AccessTokenValue() == s {
+				warn = fmt.Sprintf("这个 wps_sid 与已添加的账号 %s 相同（积分按 WPS 账号计），"+
+					"重复添加不会增加可用积分。请换一个 WPS 账号的 wps_sid。", e.UID)
+				break
+			}
+		}
+		for _, e := range existing {
+			if e.UID == uid {
+				prevNick = e.Nickname
+				break
+			}
+		}
+	}
+
+	_ = os.MkdirAll(a.cfg.AuthDir, 0o755)
+	// 昵称用上游真实身份（R136）：/api/coserve/v1/users/current 会给昵称与企业名，
+	// 比「WPS 账号 2f4da9」可读得多——多账号时一眼能分清企业号与个人号。
+	// 取不到就回退 uid 尾号（不让装饰性请求挡住保存凭据）。
+	nick := comateNicknameFor(uid, prevNick, func() (string, error) {
+		nickName, company, perr := comate.FetchProfile(s)
+		if perr != nil {
+			return "", perr
+		}
+		return comate.DisplayName(nickName, company), nil
+	})
+	ca := &auth.Auth{
+		Kind:        "comate",
+		UID:         uid,
+		Nickname:    nick,
+		AccessToken: s,
+		// Cookie 无过期概念：ExpiresAt 必须远期，0 会让 NeedsRefresh 恒真（不变量 21 同款陷阱）
+		ExpiresAt: comate.FarFutureExpiry(),
+		FilePath:  filepath.Join(a.cfg.AuthDir, "comate-"+uid+".json"),
+	}
+	if err := ca.SaveAtomic(); err != nil {
+		return "", "", fmt.Errorf("保存 Comate 凭据失败：%w", err)
+	}
+	// 日志零 token（不变量 2）：只打 uid，绝不打完整 sid
+	log.Printf("comate 账号已添加（粘贴 wps_sid）uid=%s 模型数=%d 同账号告警=%v", uid, models, warn != "")
+	a.reloadAccounts()
+	a.afterAccountAdded(provider.Comate)
+	if models == 0 {
+		// R135：目录为空 = 这个 WPS 账号在 Comate 侧一个模型都没有（典型：个人号「注册了但没开通」）。
+		// 把它留在池里的代价是整条渠道瘫痪：实测每次对话都被它接走、返回 mock 帧「未配置可用模型」，
+		// 而该帧被归为模型级错误（ErrNotFound），账号永远不会冷却 ⇒ 6/6 全失败。
+		// 故落盘后立刻停用：账号仍可见、可手动启用，但没有模型就不参与路由。
+		// 走 Pool.Disable 而非 DisableAccount，是为了让停用原因写在账号卡片上（面板启用时自动清空）。
+		if rt, _ := a.findRuntimeAuth(uid); rt != nil && rt.Pool != nil {
+			rt.Pool.Disable(uid, "该账号没有可用模型（未开通 Comate），已自动停用")
+			log.Printf("comate 账号暂无可用模型，已自动停用 uid=%s", uid)
+		} else {
+			log.Printf("comate 账号暂无可用模型，但未找到运行时（无法自动停用）uid=%s", uid)
+		}
+		noModels := "该账号在 Comate 侧没有任何可用模型（多半还没开通 Comate，个人号常见），" +
+			"已自动停用以免拖累整个渠道；开通后在这个账号上点『启用』即可。"
+		if warn == "" {
+			warn = noModels
+		} else {
+			warn += " " + noModels
+		}
+	}
+	return uid, warn, nil
+}
+
+// comateNicknamePrefix 占位昵称前缀：R136 之前的账号昵称只有这个 + uid 尾号。
+const comateNicknamePrefix = "WPS 账号"
+
+// comateNickname 账号展示名（uid 末尾 6 位足够区分同一台机器上的多个 WPS 账号）。
+// R136 起这是**兜底**：正常路径用 comate.FetchProfile 拿真实昵称与企业名。
+func comateNickname(uid string) string {
+	if len(uid) <= 6 {
+		return comateNicknamePrefix
+	}
+	return comateNicknamePrefix + " " + uid[len(uid)-6:]
+}
+
+// comateNicknameFor 决定保存凭据时写的昵称：
+//  1. 已存在且**不是占位昵称**的名字优先 —— 那是用户自己改的，不能因为重贴 sid /
+//     自动巡检就冲掉（实测有用户把企业号改成「business」）；
+//  2. 否则取上游真实身份（昵称（企业名））；
+//  3. 再不行回退 uid 尾号，绝不让装饰性请求挡住保存凭据。
+func comateNicknameFor(uid, prev string, fetch func() (string, error)) string {
+	if p := strings.TrimSpace(prev); p != "" && !strings.HasPrefix(p, comateNicknamePrefix) {
+		return p
+	}
+	if fetch != nil {
+		if disp, err := fetch(); err == nil {
+			if d := strings.TrimSpace(disp); d != "" {
+				return d
+			}
+		}
+	}
+	return comateNickname(uid)
+}
+
+// SweepComateEmptyAccounts 启动后扫一遍 comate 账号的模型目录，
+// 把「一个模型都没有」的账号停用（R135）；顺带把 R136 之前入库的
+// 占位昵称（「WPS 账号 xxxxxx」）换成上游真实身份。
+//
+// 为什么需要巡检：SubmitComateSID 只挡得住**新增**的空目录账号，而线上已有一批
+// 在 R135 之前加进来的（正是「登进去看不到模型」那批用户）。这类账号留在池里会
+// 让整条渠道瘫痪 —— 它按 uid 顺序被选走、返回 mock 帧「未配置可用模型」，而该帧
+// 是 HTTP 200 + 正常 SSE 头，handler 无法在同一请求内换号，于是所有人看到失败。
+//
+// 判据必须严格：只有 /models 明确 `code==0` 且 `items` 为空才算空目录。
+// 网络错误、非 200、业务码非 0 一律跳过 —— 上游抖动不该把好账号停掉。
+func (a *App) SweepComateEmptyAccounts() {
+	auths, err := auth.LoadComateDir(a.cfg.AuthDir)
+	if err != nil {
+		log.Printf("comate 目录巡检跳过：读取账号失败 %v", err)
+		return
+	}
+	renamed := false
+	for _, au := range auths {
+		rt, _ := a.findRuntimeAuth(au.UID)
+		if rt == nil || rt.Pool == nil {
+			log.Printf("comate 目录巡检：未找到运行时，跳过 uid=%s", au.UID)
+			continue
+		}
+		// 昵称补全（R136）：占位昵称换成「昵称（企业名）」。失败静默保持原样 ——
+		// 这只是展示层装饰，不该在启动日志里制造噪声。
+		if strings.HasPrefix(au.Nickname, comateNicknamePrefix) {
+			if nick, company, perr := comate.FetchProfile(au.AccessTokenValue()); perr == nil {
+				if disp := comate.DisplayName(nick, company); disp != "" {
+					au.Nickname = disp
+					if serr := au.SaveAtomic(); serr == nil {
+						renamed = true
+						log.Printf("comate 昵称已补全 uid=%s", au.UID)
+					}
+				}
+			}
+		}
+		// 已停用的账号不重复探测（用户手工停用的，尊重现状）。
+		if st, ok := rt.Pool.Status(au.UID); ok && st.Disabled {
+			continue
+		}
+		_, models, verr := comate.ValidateSIDWithModels(au.AccessTokenValue())
+		if verr != nil {
+			log.Printf("comate 目录巡检跳过 uid=%s：%v", au.UID, verr)
+			continue
+		}
+		if models > 0 {
+			continue
+		}
+		rt.Pool.Disable(au.UID, "该账号没有可用模型（未开通 Comate），已自动停用")
+		log.Printf("comate 目录巡检：账号无可用模型，已自动停用（R135）uid=%s", au.UID)
+	}
+	if renamed {
+		// 昵称已落盘，重载一次让面板生效（否则要等下一次账号变更才刷新）。
+		a.reloadAccounts()
+	}
+}
+
+// completeLingxiLogin CDP 自动登录（login_lingxi）成功后的收尾：入库。
+//
+// 与其它 CDP 渠道的 complete*Login 同构（wrapPoll 的 done 闭包上抛错误由 pollLogin 展示）；
+// 落盘走 persistLingxiAccount，与粘贴路径 SubmitLingxiSID 完全一致。
+func (a *App) completeLingxiLogin(r loginlingxi.Result) error {
+	warn, err := a.persistLingxiAccount(r.SID, r.UID)
+	if err != nil {
+		// persist 内部（SaveAtomic 失败）已带「保存 Lingxi 凭据失败」前缀，这里不再重复包装。
+		return err
+	}
+	// 日志零 token（不变量 2）：只打 uid，绝不打完整 sid
+	log.Printf("lingxi 账号已添加（自动登录）uid=%s 同账号告警=%v", r.UID, warn != "")
+	return nil
+}
+
+// SubmitLingxiSID 提交用户粘贴的 wps_sid Cookie（灵犀渠道）：验证 → 落盘 → 重载账号池。
+//
+// 与 comate 的差异：验证走 GET plans 端点（零智点消耗），且能在验证阶段就发现
+// 「灵犀侧未开通」（result=UserUnauthorized）——同一个 wps_sid 在 comate 与灵犀
+// 是两道独立门禁，提前拦在这里可避免入库一个必然空目录的账号。
+//
+// 同账号检测：wps_sid 与已入库 lingxi 账号逐字比对（智点按 WPS 账号计）。
+func (a *App) SubmitLingxiSID(sid string) (string, string, error) {
+	s := strings.TrimSpace(sid)
+	if s == "" {
+		return "", "", errors.New("wps_sid 不能为空")
+	}
+	uid, err := lingxi.ValidateSID(s)
+	if err != nil {
+		return "", "", err
+	}
+	warn, err := a.persistLingxiAccount(s, uid)
+	if err != nil {
+		return "", "", err
+	}
+	// 日志零 token（不变量 2）：只打 uid，绝不打完整 sid
+	log.Printf("lingxi 账号已添加（粘贴 wps_sid）uid=%s 同账号告警=%v", uid, warn != "")
+	return uid, warn, nil
+}
+
+// persistLingxiAccount lingxi 账号入库的唯一路径：同账号检测 → 落盘 → 重载账号池。
+// 与 persistComateAccount 同构；返回同账号告警文案（空串=无告警）与入库错误。
+func (a *App) persistLingxiAccount(sid string, uid string) (string, error) {
+	// 同账号检测：与已入库 lingxi 账号的 sid 逐字比对。
+	warn := ""
+	if existing, lerr := auth.LoadLingxiDir(a.cfg.AuthDir); lerr == nil {
+		for _, e := range existing {
+			if e.AccessTokenValue() == sid {
+				warn = fmt.Sprintf("这个 wps_sid 与已添加的账号 %s 相同（智点按 WPS 账号计），"+
+					"重复添加不会增加可用智点。请换一个 WPS 账号的 wps_sid。", e.UID)
+				break
+			}
+		}
+	}
+
+	_ = os.MkdirAll(a.cfg.AuthDir, 0o755)
+	la := &auth.Auth{
+		Kind:        "lingxi",
+		UID:         uid,
+		Nickname:    "WPS 账号 " + uid[len(uid)-6:],
+		AccessToken: sid,
+		// Cookie 无过期概念：ExpiresAt 必须远期，0 会让 NeedsRefresh 恒真（不变量 21 同款陷阱）
+		ExpiresAt: lingxi.FarFutureExpiry(),
+		FilePath:  filepath.Join(a.cfg.AuthDir, "lingxi-"+uid+".json"),
+	}
+	if err := la.SaveAtomic(); err != nil {
+		return "", fmt.Errorf("保存 Lingxi 凭据失败：%w", err)
+	}
+	a.reloadAccounts()
+	a.afterAccountAdded(provider.Lingxi)
+	return warn, nil
+}
+
+// StartComateQRLogin 发起 WPS Comate「扫码登录」：服务端向 qr.wps.cn 申请二维码，
+// 面板显示二维码，用户用手机 WPS 扫码确认后，服务端自己换出 wps_sid 并落盘。
+//
+// 为什么不像 GLM 那样用 CDP 拉浏览器：CDP 只能拉起「运行 wild-work 的那台机器」的
+// 浏览器，NAS / docker / systemd 没有桌面，窗口永远弹不出来；而用户自己浏览器里的
+// Cookie 又受同源策略保护读不到。扫码这条路把登录放在服务端完成，与部署环境无关。
+//
+// 返回后立即进入 pending；前端轮询 GetComateQRLoginStatus 获知二维码与扫码进度。
+// 校验 + 落盘复用 SubmitComateSID —— 自动与手工两条入口共用同一份验证、
+// 同账号告警与日志纪律，不各写一份。
+func (a *App) StartComateQRLogin() error {
+	a.muComateLogin.Lock()
+	defer a.muComateLogin.Unlock()
+	if a.comateLogin != nil {
+		switch a.comateLogin.State() {
+		case logincomate.QRStatePending, logincomate.QRStateScanned:
+			return errors.New("已有 Comate 扫码登录进行中，请在手机上完成确认，或先取消")
+		}
+	}
+	sess, err := logincomate.StartQR(func(sid string) (logincomate.Result, error) {
+		uid, warn, serr := a.SubmitComateSID(sid)
+		if serr != nil {
+			return logincomate.Result{}, serr
+		}
+		return logincomate.Result{UID: uid, Nickname: comateNickname(uid), Warn: warn}, nil
+	})
+	if err != nil {
+		return err
+	}
+	a.comateLogin = sess
+	return nil
+}
+
+// GetComateQRLoginStatus 查询扫码登录状态：state（idle/pending/scanned/success/failed/
+// cancelled）、二维码图片地址 qr、错误信息、成功时的 uid。
+func (a *App) GetComateQRLoginStatus() map[string]any {
+	a.muComateLogin.Lock()
+	sess := a.comateLogin
+	a.muComateLogin.Unlock()
+	if sess == nil {
+		return map[string]any{"state": "idle"}
+	}
+	return sess.Snapshot()
+}
+
+// CancelComateQRLogin 取消扫码登录。
+func (a *App) CancelComateQRLogin() error {
+	a.muComateLogin.Lock()
+	sess := a.comateLogin
+	a.muComateLogin.Unlock()
+	if sess == nil {
+		return errors.New("没有进行中的 Comate 登录")
+	}
+	sess.Cancel()
+	return nil
+}
+
+// ComateBrowserInfo 报告「用本机浏览器登录」这条路是否可用。
+//
+// configured=false（没配 login.comate_browser_cdp）时前端根本不显示入口；
+// configured=true 但 probe 失败时仍显示入口，但把原因写进 hint ——
+// 用户自己开浏览器时忘加 --remote-debugging-port 是最常见的坑，
+// 静默隐藏会让人以为功能不存在。
+func (a *App) ComateBrowserInfo() map[string]any {
+	ep := strings.TrimSpace(a.cfg.Login.ComateBrowserCDP)
+	out := map[string]any{"configured": ep != "", "endpoint": ep}
+	if ep == "" {
+		return out
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel()
+	if err := cdp.Probe(ctx, ep); err != nil {
+		out["available"] = false
+		out["hint"] = err.Error()
+		return out
+	}
+	out["available"] = true
+	return out
+}
+
+// StartComateBrowserLogin 接管配置好的本机浏览器：开一个 WPS 登录页标签，
+// 用户登录后由后台轮询该浏览器的 Cookie，读到 wps_sid 即校验并落盘。
+//
+// 与扫码的分工：扫码不需要任何浏览器（服务器无桌面也能用）；
+// 这条路复用用户天天在用的浏览器，登录一次、多号可切，适合桌面用户。
+func (a *App) StartComateBrowserLogin() error {
+	ep := strings.TrimSpace(a.cfg.Login.ComateBrowserCDP)
+	if ep == "" {
+		return errors.New("未启用「用本机浏览器登录」：请在 config.json 的 login.comate_browser_cdp 填写浏览器调试地址（如 http://127.0.0.1:9222）")
+	}
+	a.muComateLogin.Lock()
+	defer a.muComateLogin.Unlock()
+	if a.comateBrowser != nil {
+		switch a.comateBrowser.State() {
+		case logincomate.QRStatePending, logincomate.QRStateScanned:
+			return errors.New("已有 Comate 浏览器登录进行中，请先在浏览器里完成登录，或先取消")
+		}
+	}
+	sess, err := logincomate.StartBrowserLogin(ep, func(sid string) (logincomate.Result, error) {
+		uid, warn, serr := a.SubmitComateSID(sid)
+		if serr != nil {
+			return logincomate.Result{}, serr
+		}
+		return logincomate.Result{UID: uid, Nickname: comateNickname(uid), Warn: warn}, nil
+	})
+	if err != nil {
+		return err
+	}
+	a.comateBrowser = sess
+	return nil
+}
+
+// GetComateBrowserLoginStatus 查询「用本机浏览器登录」的状态。
+func (a *App) GetComateBrowserLoginStatus() map[string]any {
+	a.muComateLogin.Lock()
+	sess := a.comateBrowser
+	a.muComateLogin.Unlock()
+	if sess == nil {
+		return map[string]any{"state": "idle"}
+	}
+	return sess.Snapshot()
+}
+
+// CancelComateBrowserLogin 取消「用本机浏览器登录」（不关闭用户的浏览器）。
+func (a *App) CancelComateBrowserLogin() error {
+	a.muComateLogin.Lock()
+	sess := a.comateBrowser
+	a.muComateLogin.Unlock()
+	if sess == nil {
+		return errors.New("没有进行中的 Comate 浏览器登录")
+	}
+	sess.Cancel()
+	return nil
+}
+
 // StartGLMAutoLogin 发起智谱清言自动登录：拉起独立 profile 的浏览器，
 // 用户在真实浏览器里登录，后台经 CDP 自动捕获 Cookie。
 //
@@ -1711,11 +2201,14 @@ func (a *App) CancelGLMAutoLogin() error {
 // 「新增账号」直接顶成旧终态（表现为「点了没反应」）。
 func (a *App) StartOfficeAceLogin() (string, error) {
 	a.muOALogin.Lock()
+	// 必须 defer 释放：本函数有三条返回路径（已有流程 / 启动失败 / 成功），
+	// 早期版本在**成功路径**漏了 Unlock，导致 muOALogin 被永久持有
+	// ——此后 GetOfficeAceLoginStatus / CancelOfficeAceLogin / 再次 Start 全部阻塞，
+	// 前端轮询超时后把「账号已添加成功」误报成「登录失败」，只能重启进程恢复。
+	defer a.muOALogin.Unlock()
 	if a.oaLogin != nil {
 		if st, _ := a.oaLogin.Status(); oaLoginActive(st) {
-			url := a.oaLogin.URL()
-			a.muOALogin.Unlock()
-			return url, errors.New("已有 OfficeAce 登录流程进行中，请先完成或取消")
+			return a.oaLogin.URL(), errors.New("已有 OfficeAce 登录流程进行中，请先完成或取消")
 		}
 		// 上一轮已到终态：清空，让本次新建的会话立刻成为唯一可见状态。
 		// 刻意在上锁期间清空 —— 否则并发的 GetOfficeAceLoginStatus 会读到旧会话。
@@ -1727,7 +2220,6 @@ func (a *App) StartOfficeAceLogin() (string, error) {
 		log.Printf("officeace 自助登录完成，账号池已重载 uid=%s", r.UID)
 	})
 	if err != nil {
-		a.muOALogin.Unlock()
 		return "", err
 	}
 	a.oaLogin = sess
@@ -2013,6 +2505,24 @@ func (a *App) reloadAccounts() {
 			rt.Pool.SyncToDir(auths)
 		}
 	}
+	// Comate：一个 WPS 账号一份 wps_sid，凭据由面板「粘贴 wps_sid」写入。
+	if rt := a.runtime(provider.Comate); rt != nil && rt.Pool != nil {
+		auths, err := auth.LoadComateDir(a.cfg.AuthDir)
+		if err != nil {
+			log.Printf("reload comate accounts: %v", err)
+		} else {
+			rt.Pool.SyncToDir(auths)
+		}
+	}
+	// Lingxi：一个 WPS 账号一份 wps_sid（灵犀侧开通），凭据由面板「粘贴 wps_sid」写入。
+	if rt := a.runtime(provider.Lingxi); rt != nil && rt.Pool != nil {
+		auths, err := auth.LoadLingxiDir(a.cfg.AuthDir)
+		if err != nil {
+			log.Printf("reload lingxi accounts: %v", err)
+		} else {
+			rt.Pool.SyncToDir(auths)
+		}
+	}
 	// OfficeAce：华为云果办，凭据由面板「浏览器登录」或「从客户端导入」写入 auths/。
 	// 两条添加路径（OAuth onDone / importOfficeAce）都依赖本分支把新账号同步进池，
 	// 缺了它账号要等 daemon 重启才出现（R34/R41 家族的「声明了却没接线」）。
@@ -2105,20 +2615,28 @@ func (a *App) refreshIfSessionDead(rt *Runtime, au *auth.Auth, err error) bool {
 		return false
 	}
 	log.Printf("session dead, refreshing platform=%s uid=%s", rt.Kind, au.UID)
-	if rerr := rt.Upstream.RefreshToken(au); rerr != nil {
+	// 单飞：同一账号的并发 401 只放一次刷新出去（refresh_token 单会话，并发刷新必然一方冲突）。
+	// 此处刻意不做 NeedsRefresh 重检 —— session 已被上游作废，而本地 expiresAt 可能还没到期。
+	rerr := provider.RefreshOnce(au, func() error {
+		if err := rt.Upstream.RefreshToken(au); err != nil {
+			return err
+		}
+		// 刷新成功必须落盘：否则下次启动又拿旧 token，重回 401。
+		if serr := au.SaveAtomic(); serr != nil {
+			log.Printf("session dead refresh save failed platform=%s uid=%s err=%v", rt.Kind, au.UID, serr)
+		}
+		return nil
+	})
+	if rerr != nil {
 		log.Printf("session dead refresh failed platform=%s uid=%s err=%v", rt.Kind, au.UID, rerr)
 		return false
-	}
-	// 刷新成功必须落盘：否则下次启动又拿旧 token，重回 401。
-	if serr := au.SaveAtomic(); serr != nil {
-		log.Printf("session dead refresh save failed platform=%s uid=%s err=%v", rt.Kind, au.UID, serr)
 	}
 	return true
 }
 
 // creditSnapshot 实时拉取明细并算出「可消耗余额」「临期额度」「不可消耗余额」三口径，
 // 成功即回写 pool 快照 + ledger 差分。三者同源于 UserResourceDetail 的单次响应：remain 即
-// pool 路由口径的可消耗余额，临期额度为其中 provider.ExpiringDays 个自然日内到期的部分
+// pool 路由口径的可消耗余额，临期额度为其中 config.schedule.expiring_days 个自然日内到期的部分
 // （**仅展示**，R112 起不参与选号），不可消耗部分由条目的 Usable 标记汇总得到
 // （渠道不区分专用池时为 0；渠道不下发到期时间时临期为 0，如 Qoder）。
 // 同一响应里还算出「最早到期时刻」一并写入 pool——那是 Pick() 的唯一排序键。
@@ -2137,10 +2655,11 @@ func (a *App) creditSnapshot(rt *Runtime, au *auth.Auth) (remain int64, items []
 		return 0, nil, 0, 0, err
 	}
 	_, unusable = provider.Summarize(items)
-	// 临期额度：自然日口径（provider.ExpiringDays 个自然日内到期，次日 00:00 失效算今日）。
+	// 临期额度：自然日口径（config.schedule.expiring_days 个自然日内到期，次日 00:00 失效算今日）。
 	// R112 起**仅展示**（面板三口径/汇总条），不参与选号——选号用下面的 earliest。
+	// 窗口可配 1/2/7（R112b），与运行统计三桶同源。
 	now := time.Now()
-	expiring = provider.ExpiringWithinDays(items, provider.ExpiringDays, now)
+	expiring = provider.ExpiringWithinDays(items, a.expiringDays(), now)
 	// 最早到期时刻：Pick() 的第一排序键（R112）。ok=false（如 Qoder 不下发到期时间）
 	// 时返回零值，pool 会把它排到「有到期信息」的账号之后按余额兜底。
 	earliest, _ := provider.EarliestExpire(items, now)
@@ -2194,14 +2713,23 @@ func (a *App) StartCreditAutoRefresh(ctx context.Context, kinds []provider.Kind,
 					if au == nil {
 						continue
 					}
-					// token 临近过期时先刷新（国际版 token 有效期长，通常不触发）
+					// token 临近过期时先刷新（国际版 token 有效期长，通常不触发）。
+					// 走单飞：本循环与请求路径/保活/费率是并发的，同账号并发刷新会互相作废 refresh_token。
 					if au.NeedsRefresh(10 * time.Minute) {
-						if err := rt.Upstream.RefreshToken(au); err != nil {
+						if err := provider.RefreshOnce(au, func() error {
+							if !au.NeedsRefresh(10 * time.Minute) {
+								return nil // 已被并发的另一次刷新刷过
+							}
+							if rerr := rt.Upstream.RefreshToken(au); rerr != nil {
+								return rerr
+							}
+							if serr := au.SaveAtomic(); serr != nil {
+								log.Printf("credit auto-refresh token save failed platform=%s uid=%s err=%v", k, st.UID, serr)
+							}
+							return nil
+						}); err != nil {
 							log.Printf("credit auto-refresh token refresh failed platform=%s uid=%s err=%v", k, st.UID, err)
 							continue
-						}
-						if err := au.SaveAtomic(); err != nil {
-							log.Printf("credit auto-refresh token save failed platform=%s uid=%s err=%v", k, st.UID, err)
 						}
 					}
 					usable, expiring, unusable, err := a.creditTotals(rt, au)
@@ -2311,16 +2839,20 @@ func (a *App) RefreshCredits(uid string) (int64, error) {
 // RefreshAll 刷新全部账号积分，返回汇总（供托盘消息框 / Web UI）。
 func (a *App) RefreshAll() RefreshSummary {
 	a.refreshMu.Lock()
-	if a.refreshing {
+	if a.refreshing || a.closed {
 		a.refreshMu.Unlock()
 		return RefreshSummary{Busy: true}
 	}
 	a.refreshing = true
+	done := make(chan struct{})
+	a.refreshDone = done
 	a.refreshMu.Unlock()
 	defer func() {
 		a.refreshMu.Lock()
 		a.refreshing = false
+		a.refreshDone = nil
 		a.refreshMu.Unlock()
+		close(done) // 先解除记录再广播：等的人醒来时状态已是「空闲」
 	}()
 	sum := RefreshSummary{Platforms: map[string]PlatformSummary{}}
 	for _, rt := range a.runtimesSnapshot() {
@@ -2492,7 +3024,42 @@ func (a *App) SetBodyLog(on bool) error {
 	return nil
 }
 
-// SetCheckinTimes 更新自动签到时间（HH:MM）并立即唤醒两个调度器。
+// SetExpiringDays 更新「积分汇总」临期口径（自然日，1/2/7）：保存配置 → 推给所有
+// 调度器 → **立即刷一轮积分**让面板当场生效。
+//
+// 为什么必须立即刷：expiring 只在上游响应到达时计算并写进 pool 快照（见 creditSnapshot），
+// 不主动刷的话用户把下拉框从 1 天改成 7 天后，界面要等到下一次 10 分钟的自动刷新
+// 才有变化，看起来像没生效。刷新是**复用已有账号的余额端点**（每账号一次调用，与常规
+// 10 分钟刷新同源、同量级），不是新增探测。
+//
+// 注意它**不参与选号**：选号判据只有 provider.EarliestExpire（R112），
+// 这里是纯展示口径（R112b）。
+func (a *App) SetExpiringDays(days int) error {
+	if !config.IsExpiringDays(days) {
+		return errors.New("临期口径仅支持 1/2/7 天")
+	}
+	a.mu.Lock()
+	if a.cfg.Schedule.ExpiringDays == days {
+		a.mu.Unlock()
+		return nil // 值未变：不写盘、不刷积分（避免用户点两次就白打一轮上游）
+	}
+	a.cfg.Schedule.ExpiringDays = days
+	err := config.Save(a.cfg, a.cfgPath)
+	a.mu.Unlock()
+	if err != nil {
+		return err
+	}
+	// 推给所有调度器：签到路径也会写 expiring，不推的话它会继续用旧窗口算，
+	// 并在下一次签到把 pool 里的值改回旧口径。
+	for _, rt := range a.runtimesSnapshot() {
+		if rt != nil && rt.Scheduler != nil {
+			rt.Scheduler.SetExpiringDays(days)
+		}
+	}
+	go a.RefreshAll() // 异步：接口立即返回，面板的旧数字在下一次 poll 时被新值替换
+	log.Printf("临期口径已更新：%d 个自然日", days)
+	return nil
+}
 func (a *App) SetCheckinTimes(times []string) error {
 	minutes, err := config.ParseClockTimes(times)
 	if err != nil {
@@ -2514,8 +3081,15 @@ func (a *App) SetCheckinTimes(times []string) error {
 	if err != nil {
 		return err
 	}
+	// 只推给「签到时刻跟随全局配置」的调度器（issue #210）。
+	//
+	// 旧实现无条件广播给所有调度器，带来两个后果：
+	//   - 显式配成 []int{} 的渠道（qwenwork/cline/comate/oczen/kilo/zcode）只要用户改过一次
+	//     签到时间，就会获得签到时刻，从此每天空跑必然失败的签到并把面板染红；
+	//   - Qoder 双区的固定 10:00 窗口（上游活动开放时刻）会被全局时刻覆盖。
+	// 故改成白名单式推送：声明了 FollowGlobalCheckin 的渠道才更新。
 	for _, rt := range a.runtimesSnapshot() {
-		if rt != nil && rt.Scheduler != nil {
+		if rt != nil && rt.Scheduler != nil && rt.Scheduler.FollowsGlobalCheckin() {
 			rt.Scheduler.SetCheckinMinutes(clean)
 		}
 	}
@@ -2879,18 +3453,37 @@ func (a *App) SetCompatSyncer(fn func(defaultChannel string, maxTokensCap int, m
 func (a *App) SetModelFallbackSyncer(fn func(rules []config.ModelFallbackRule)) { a.fbSyncer = fn }
 
 // SetModelFallback 保存模型降级链（设置面板可视化编辑）。
-// 校验：From/To 均须 "channel/model" 全路径；From 全局唯一；每链 To 至少一项、
-// 不含 From 自身（不自环）；空规则列表 = 清空禁用。保存即热生效（fbSyncer）。
-func (a *App) SetModelFallback(rules []config.ModelFallbackRule) error {
+//
+// 校验（后端是**唯一真相**，前端同一套校验只为即时反馈）：
+//   - From/To 均须 "channel/model" 全路径；From 全局唯一；每链 To 至少一项、不含 From 自身
+//   - Name（别名，R129）可选，空串 = 无别名；非空时按 validateAliases 的硬拒矩阵逐条拦下
+//
+// 返回的 warnings 是**软警告**（允许保存）：目前只有「别名与当前模型列表的某个裸名重合」。
+// 空规则列表 = 清空禁用。保存即热生效（fbSyncer 推内层 handler 与兼容层，R129）。
+func (a *App) SetModelFallback(rules []config.ModelFallbackRule) ([]string, error) {
+	// 别名索引先建：下面校验 To 时要靠它识别「备胎里写了别名」。
+	// 形态类硬拒（含 / 、空白/逗号/*、重名）仍由 validateAliases 统一点名，
+	// 这里只取一份「合法别名 → 规则序号」用于 To 检查（脏名不进索引，与运行时同源）。
+	aliasIdx := map[string]int{}
+	for i, r := range rules {
+		name := strings.TrimSpace(r.Name)
+		if name == "" || strings.Contains(name, "/") || !config.ValidAliasName(name) {
+			continue
+		}
+		if _, dup := aliasIdx[name]; !dup {
+			aliasIdx[name] = i
+		}
+	}
 	seen := map[string]bool{}
 	for i := range rules {
 		r := &rules[i]
 		r.From = strings.TrimSpace(r.From)
+		r.Name = strings.TrimSpace(r.Name)
 		if strings.Index(r.From, "/") <= 0 {
-			return fmt.Errorf("规则 %d 的主模型 %q 需为 channel/model 形式", i+1, r.From)
+			return nil, fmt.Errorf("规则 %d 的主模型 %q 需为 channel/model 形式", i+1, r.From)
 		}
 		if seen[r.From] {
-			return fmt.Errorf("主模型 %q 重复（每个主模型只允许一条规则）", r.From)
+			return nil, fmt.Errorf("主模型 %q 重复（每个主模型只允许一条规则）", r.From)
 		}
 		seen[r.From] = true
 		tos := make([]string, 0, len(r.To))
@@ -2899,31 +3492,139 @@ func (a *App) SetModelFallback(rules []config.ModelFallbackRule) error {
 			if to == "" {
 				continue
 			}
+			// ⑥ 备胎链不得写别名（必须在「需为 channel/model 形式」之前判，否则
+			// 用户只会看到一条不知道自己做错了什么的形态错误）。
+			if j, isAlias := aliasIdx[to]; isAlias {
+				return nil, fmt.Errorf("规则 %d 的备胎 %q 是规则 %d 的别名（备胎链只能写 channel/model 全路径，别名不参与备胎链）", i+1, to, j+1)
+			}
 			if strings.Index(to, "/") <= 0 {
-				return fmt.Errorf("主模型 %q 的备胎 %q 需为 channel/model 形式", r.From, to)
+				return nil, fmt.Errorf("主模型 %q 的备胎 %q 需为 channel/model 形式", r.From, to)
 			}
 			if to == r.From {
-				return fmt.Errorf("主模型 %q 的备胎不能是它自己", r.From)
+				return nil, fmt.Errorf("主模型 %q 的备胎不能是它自己", r.From)
 			}
 			tos = append(tos, to)
 		}
 		if len(tos) == 0 {
-			return fmt.Errorf("主模型 %q 的降级链为空（至少填一个备胎模型）", r.From)
+			return nil, fmt.Errorf("主模型 %q 的降级链为空（至少填一个备胎模型）", r.From)
 		}
 		r.To = tos
 	}
+	// ⑥ 的兜底（防御）：主模型也不得写别名——别名指向别名会让「一次请求最多
+	// 降级一次 + 不自环」失去可静态证明性。
+	for i, r := range rules {
+		if _, isAlias := aliasIdx[r.From]; isAlias {
+			return nil, fmt.Errorf("规则 %d 的主模型 %q 本身是别名（主力模型必须写 channel/model 全路径，别名指向别名不合法）", i+1, r.From)
+		}
+	}
+	warns, err := a.validateAliases(rules)
+	if err != nil {
+		return nil, err
+	}
 	a.mu.Lock()
 	a.cfg.ModelFallback = rules
-	err := config.Save(a.cfg, a.cfgPath)
+	err = config.Save(a.cfg, a.cfgPath)
 	a.mu.Unlock()
 	if err != nil {
-		return err
+		return nil, err
 	}
 	if a.fbSyncer != nil {
 		a.fbSyncer(rules)
 	}
 	log.Printf("模型降级链已更新（%d 条规则，保存即热生效）", len(rules))
-	return nil
+	return warns, nil
+}
+
+// validateAliases 校验降级链别名（R129）。硬拒返回错误（文案点名哪条规则的哪个名字）；
+// 软警告返回字符串列表（**不阻止保存**，只告知歧义）。
+//
+// 六条硬拒：① 含 `/`；② 含空白/逗号/`*`；③ 与其他规则的 Name 重名；
+// ④ 与 compat.model_map 的任何 key 重名（含以 `*` 结尾的通配 key）；
+// ⑤ 与任一渠道名重名；⑥ To 里出现别名（备胎链不得写别名）。
+func (a *App) validateAliases(rules []config.ModelFallbackRule) ([]string, error) {
+	// 先建索引：重名判定与 To 校验都靠它（派生口径与 config.AliasIndex 一致，脏名跳过）
+	idx := map[string]int{}
+	for i, r := range rules {
+		name := strings.TrimSpace(r.Name)
+		if name == "" {
+			continue
+		}
+		if strings.Contains(name, "/") {
+			return nil, fmt.Errorf("规则 %d 的别名 %q 不能含 /（别名是裸名，不是 channel/model 形式）", i+1, name)
+		}
+		if !config.ValidAliasName(name) {
+			return nil, fmt.Errorf("规则 %d 的别名 %q 不能含空白、逗号或 *", i+1, name)
+		}
+		if j, dup := idx[name]; dup {
+			return nil, fmt.Errorf("规则 %d 的别名 %q 与规则 %d 重名（别名不可重复，且大小写敏感：Fast ≠ fast）", i+1, name, j+1)
+		}
+		idx[name] = i
+	}
+	if len(idx) == 0 {
+		return nil, nil
+	}
+
+	a.mu.Lock()
+	modelMap := map[string]string{}
+	for k, v := range a.cfg.Compat.ModelMap {
+		modelMap[k] = v
+	}
+	a.mu.Unlock()
+	channels := map[string]bool{}
+	for _, rt := range a.runtimesSnapshot() {
+		if rt != nil {
+			channels[rt.Kind.String()] = true
+		}
+	}
+	// 保留名（含上游命名空间如 cline-free）也算渠道名：它们参与前缀解析
+	for k := range provider.BuiltinKinds() {
+		channels[k] = true
+	}
+
+	for name, i := range idx {
+		if _, hit := modelMap[name]; hit {
+			return nil, fmt.Errorf("规则 %d 的别名 %q 与 compat.model_map 的键重名（别名优先，同名会造出「有时走映射、有时走别名」的幽灵行为）", i+1, name)
+		}
+		if channels[name] {
+			return nil, fmt.Errorf("规则 %d 的别名 %q 与渠道名重名（会搅乱 channel/model 前缀解析）", i+1, name)
+		}
+	}
+	// ⑥ 的兜底（防御）：To 里写别名已在上面（形态校验之前）拦下，这里只保留模型映射/渠道名冲突的判定。
+	return a.aliasBareNameWarnings(idx), nil
+}
+
+// aliasBareNameWarnings 别名与当前模型列表里某个**裸名**重合 → 软警告（允许保存）。
+// 运行时按别名走（别名优先于 model_map / default_channel），用户需要知情。
+// 模型列表因上游不可达而暂时为空时静默跳过，绝不阻塞保存。
+func (a *App) aliasBareNameWarnings(idx map[string]int) []string {
+	if a.handler == nil {
+		return nil
+	}
+	byKind := a.handler.CachedChannelModels()
+	if len(byKind) == 0 {
+		return nil
+	}
+	bare := map[string]bool{}
+	for _, infos := range byKind {
+		for _, mi := range infos {
+			id := strings.TrimSpace(mi.ID)
+			if id == "" {
+				continue
+			}
+			bare[id] = true
+			if i := strings.Index(id, "/"); i > 0 { // 命名空间形态（cline-free/x）也提供裸名视角
+				bare[id[i+1:]] = true
+			}
+		}
+	}
+	var out []string
+	for name := range idx {
+		if bare[name] {
+			out = append(out, fmt.Sprintf("别名 %q 与某个真实模型的裸名重合：运行时按别名走（别名优先于 model_map / default_channel）", name))
+		}
+	}
+	sort.Strings(out) // 稳定输出（面板逐条提示，map 遍历序不确定）
+	return out
 }
 
 // SetReasoningEffortsSyncer 注入思考强度映射热更新回调（由 main.go 注入：推给 server.Handler）。
@@ -3155,9 +3856,12 @@ type State struct {
 	Accounts       []AccountView `json:"accounts"`
 	CheckinTimes   []string      `json:"checkin_times"`
 	KeepaliveHours []int         `json:"keepalive_hours"`
-	ListenHost     string        `json:"listen_host"`
-	ListenPort     int           `json:"listen_port"`
-	APIKey         string        `json:"api_key"`
+	// ExpiringDays 面板「积分汇总·临期」的计算口径（自然日，1/2/7）。
+	// 只影响展示，不参与选号（R112b）。老前端不读该字段也无害。
+	ExpiringDays int    `json:"expiring_days"`
+	ListenHost   string `json:"listen_host"`
+	ListenPort   int    `json:"listen_port"`
+	APIKey       string `json:"api_key"`
 
 	// AdminPassSet 是否已配置管理密码（不回显密码本身）；
 	// AuthEnabled = 面板鉴权已生效（密码非空）；
@@ -3227,6 +3931,7 @@ func (a *App) GetState() State {
 	}
 	st := State{
 		CheckinTimes:   a.checkinTimes(),
+		ExpiringDays:   a.expiringDays(),
 		KeepaliveHours: a.keepaliveHours(),
 		ListenHost:     listen.Host,
 		ListenPort:     listen.Port,
@@ -3306,7 +4011,7 @@ func (a *App) accountViews() []AccountView {
 			RefreshTokenMissingReason: missingRTWhy,
 		})
 	}
-	// 面板固定渠道序展示：OpenCodeZen → WorkBuddyCN → WorkBuddyAI → QoderCN → QoderCOM → TraeWork → 千问办公
+	// 面板统一渠道序展示（R142）：按显示名字节序，自定义渠道钉最末。
 	sortChannelsByOrder(out, func(v AccountView) provider.Kind { return provider.Kind(v.Group) })
 	return out
 }
@@ -3574,12 +4279,6 @@ func (a *App) HandleAPI(mux *http.ServeMux) {
 				apiError(w, http.StatusBadRequest, err.Error())
 				return
 			}
-		case provider.QwenWork:
-			// 内存 pending 通道（与自动回调同一条，见 internal/login_qwenwork SubmitCallbackURL）。
-			if err := loginqwenwork.SubmitCallbackURL(req.URL); err != nil {
-				apiError(w, http.StatusBadRequest, err.Error())
-				return
-			}
 		case provider.Gemini:
 			// 内存 session 通道（state 逐字比对，见 internal/login_gemini SubmitCallbackURL）。
 			if err := logingemini.SubmitCallbackURL(req.URL); err != nil {
@@ -3685,6 +4384,75 @@ func (a *App) HandleAPI(mux *http.ServeMux) {
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "uid": uid, "warning": warn})
 	})
 
+	mux.HandleFunc("POST /api/login/comate_sid", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			SID string `json:"sid"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			apiError(w, http.StatusBadRequest, "请求体解析失败")
+			return
+		}
+		uid, warn, err := a.SubmitComateSID(req.SID)
+		if err != nil {
+			apiError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "uid": uid, "warning": warn})
+	})
+	mux.HandleFunc("POST /api/login/lingxi_sid", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			SID string `json:"sid"`
+		}
+		if err := json.NewDecoder(r.Body).Decode(&req); err != nil {
+			apiError(w, http.StatusBadRequest, "请求体解析失败")
+			return
+		}
+		uid, warn, err := a.SubmitLingxiSID(req.SID)
+		if err != nil {
+			apiError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "uid": uid, "warning": warn})
+	})
+	// Comate 扫码登录（服务端申请二维码，手机确认后自动拿 wps_sid）：三段式。
+	mux.HandleFunc("POST /api/login/comate_qr", func(w http.ResponseWriter, r *http.Request) {
+		if err := a.StartComateQRLogin(); err != nil {
+			apiError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, a.GetComateQRLoginStatus())
+	})
+	mux.HandleFunc("GET /api/login/comate_qr_status", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, a.GetComateQRLoginStatus())
+	})
+	mux.HandleFunc("GET /api/login/comate_browser_info", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, a.ComateBrowserInfo())
+	})
+	mux.HandleFunc("POST /api/login/comate_browser", func(w http.ResponseWriter, r *http.Request) {
+		if err := a.StartComateBrowserLogin(); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, a.GetComateBrowserLoginStatus())
+	})
+	mux.HandleFunc("GET /api/login/comate_browser_status", func(w http.ResponseWriter, r *http.Request) {
+		writeJSON(w, http.StatusOK, a.GetComateBrowserLoginStatus())
+	})
+	mux.HandleFunc("POST /api/login/comate_browser_cancel", func(w http.ResponseWriter, r *http.Request) {
+		if err := a.CancelComateBrowserLogin(); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]any{"error": err.Error()})
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	})
+	mux.HandleFunc("POST /api/login/comate_qr_cancel", func(w http.ResponseWriter, r *http.Request) {
+		if err := a.CancelComateQRLogin(); err != nil {
+			apiError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	})
+
 	mux.HandleFunc("POST /api/account/checkin", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			UID string `json:"uid"`
@@ -3772,6 +4540,17 @@ func (a *App) HandleAPI(mux *http.ServeMux) {
 		}
 		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
 	})
+	mux.HandleFunc("POST /api/config/expiring_days", func(w http.ResponseWriter, r *http.Request) {
+		var req struct {
+			Days int `json:"days"`
+		}
+		_ = json.NewDecoder(r.Body).Decode(&req)
+		if err := a.SetExpiringDays(req.Days); err != nil {
+			apiError(w, http.StatusBadRequest, err.Error())
+			return
+		}
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+	})
 	mux.HandleFunc("POST /api/config/loop_guard", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
 			On bool `json:"on"`
@@ -3842,11 +4621,13 @@ func (a *App) HandleAPI(mux *http.ServeMux) {
 			Rules []config.ModelFallbackRule `json:"rules"`
 		}
 		_ = json.NewDecoder(r.Body).Decode(&req)
-		if err := a.SetModelFallback(req.Rules); err != nil {
+		warns, err := a.SetModelFallback(req.Rules)
+		if err != nil {
 			apiError(w, http.StatusBadRequest, err.Error())
 			return
 		}
-		writeJSON(w, http.StatusOK, map[string]any{"ok": true})
+		// 软警告随成功响应下发（允许保存，只告知歧义），面板用黄字提示。
+		writeJSON(w, http.StatusOK, map[string]any{"ok": true, "warnings": warns})
 	})
 	mux.HandleFunc("POST /api/config/reasoning_efforts", func(w http.ResponseWriter, r *http.Request) {
 		var req struct {
@@ -4176,8 +4957,8 @@ type feesModelRow struct {
 }
 
 // feeChannelOrderWithDynamic 返回费率表渠道顺序：静态 feeChannelOrder + 未登记的动态渠道
-// （自定义渠道，R66）追加到末尾（按名排序）。仅当 modelsByKind 里确有该渠道的模型时
-// 才追加，避免空渠道占位。
+// （自定义渠道，R66）追加到末尾（硬编码钉最末，组内按渠道标识排序）。仅当 modelsByKind
+// 里确有该渠道的模型时才追加，避免空渠道占位。
 func feeChannelOrderWithDynamic(modelsByKind map[provider.Kind][]provider.ModelInfo) []provider.Kind {
 	seen := make(map[provider.Kind]bool, len(feeChannelOrder))
 	for _, k := range feeChannelOrder {
@@ -4302,7 +5083,7 @@ func (a *App) FeesInfo() map[string]any {
 		go a.safeGo(func() { a.RefreshPricing() })
 	}
 
-	// 展示顺序固定（见 feeChannelOrder；旧 Qoder 跳过），**末尾追加动态自定义渠道**（R66）。
+	// 展示顺序见 feeChannelOrder（R142：按渠道显示名字节序，旧 Qoder 跳过），**末尾追加动态自定义渠道**（R66）。
 	// 必须追加：feeChannelOrder 是静态表，自定义渠道不在其中，若不追加则
 	// 面板费率表永远不出现该渠道 tab（buildFeesChannels 只遍历传入的 order）——
 	// 这与 /v1/models、用量流水、运行统计的可见性不一致。按渠道名排序保证稳定顺序。
@@ -4400,16 +5181,24 @@ func (a *App) RefreshPricing() {
 		if acct == nil {
 			continue
 		}
-		// 先确保 token 有效
+		// 先确保 token 有效。走单飞：与请求路径/credit 循环并发，同账号并发刷新会互相作废 refresh_token。
 		if acct.NeedsRefresh(10 * time.Minute) {
-			if err := rt.Upstream.RefreshToken(acct); err != nil {
+			if err := provider.RefreshOnce(acct, func() error {
+				if !acct.NeedsRefresh(10 * time.Minute) {
+					return nil // 已被并发的另一次刷新刷过
+				}
+				if rerr := rt.Upstream.RefreshToken(acct); rerr != nil {
+					return rerr
+				}
+				// 必须落盘：refresh token 会轮换，不写回则下次启动用的是旧 refresh token，
+				// 而旧 access token 已被上游作废 → 本地 expiresAt 仍显示有效 → 卡死在 401。
+				if serr := acct.SaveAtomic(); serr != nil {
+					log.Printf("pricing token save failed platform=%s uid=%s err=%v", rt.Kind, acct.UID, serr)
+				}
+				return nil
+			}); err != nil {
 				errs = append(errs, fmt.Sprintf("%s: token refresh failed", rt.Kind))
 				continue
-			}
-			// 必须落盘：refresh token 会轮换，不写回则下次启动用的是旧 refresh token，
-			// 而旧 access token 已被上游作废 → 本地 expiresAt 仍显示有效 → 卡死在 401。
-			if serr := acct.SaveAtomic(); serr != nil {
-				log.Printf("pricing token save failed platform=%s uid=%s err=%v", rt.Kind, acct.UID, serr)
 			}
 		}
 		pricing, err := rt.Upstream.FetchModelPricing(acct)

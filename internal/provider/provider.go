@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"sort"
 	"strings"
 	"time"
 
@@ -70,6 +71,16 @@ const (
 	// 登录是服务端中介设备授权流。⚠️ **积分领取依赖阿里云验证码 + headful 浏览器**，
 	// 本仓不实现领取路径（渠道包注释里注明）。
 	ZCode Kind = "zcode"
+	// Comate WPS Comate（comate.wps.cn 网页版模型代理）：粘贴型渠道，凭据是 WPS 账号的
+	// **wps_sid Cookie**（浏览器登录 www.wps.cn 后复制），由面板「粘贴 wps_sid」写入 auths/。
+	// Cookie 不轮换 ⇒ 无 RefreshToken、无保活、无签到；上游无积分查询端点（积分只能从
+	// 逐请求 usage.credits 记账）。模型面绑死上游 /models 的 items 数组原样透传。
+	Comate Kind = "comate"
+	// Lingxi WPS 灵犀（lingxi.kdocs.cn 网页版助手）：粘贴型渠道，凭据与 comate 同为
+	// **wps_sid Cookie**（同一 WPS 账号体系但**门禁独立**——灵犀侧开通即可用）。
+	// 有每日签到（领智点）与余额端点；对话是 sessions+completions 两段式（每请求新建
+	// session）+ 自有 SSE 帧型（非 OpenAI 形）。模型面来自 plans 端点 data.models 原样透传。
+	Lingxi Kind = "lingxi"
 )
 
 func (k Kind) String() string { return string(k) }
@@ -81,16 +92,78 @@ func (k Kind) String() string { return string(k) }
 // 表现为「面板/账号操作打到自定义池、对话请求走内建渠道」——不报错但静默出错。
 // 同时排除 ModelNamespaces 里的上游命名空间（如 cline-free），以免路由歧义。
 func BuiltinKinds() map[string]bool {
-	m := map[string]bool{}
-	for _, k := range []Kind{WorkBuddy, WorkBuddyAI, TraeWork, Qoder, QoderCN, QoderCOM,
-		QwenWork, MonkeyCode, Raccoon, Loomy, TraeCode, Oczen, GLM, Cline, OfficeAce, Kilo, Minimax, LobsterAI,
-		Gemini, CodeArts, ZCode} {
+	m := make(map[string]bool, len(builtinKindList))
+	for _, k := range builtinKindList {
 		m[k.String()] = true
 	}
 	for ns := range ModelNamespaces {
 		m[ns] = true
 	}
 	return m
+}
+
+// builtinKindList 内建渠道全集（唯一真源）：BuiltinKinds / DisplayNames / ChannelDisplayOrder 都由此派生。
+// 新增渠道只改这一处 + 下方 DisplayNames，漏登记由 provider_test.go 与 ui-static-check 双向兜住。
+var builtinKindList = []Kind{
+	WorkBuddy, WorkBuddyAI, TraeWork, Qoder, QoderCN, QoderCOM,
+	QwenWork, MonkeyCode, Raccoon, Loomy, TraeCode, Oczen, GLM, Cline, OfficeAce, Kilo, Minimax, LobsterAI,
+	Gemini, CodeArts, ZCode, Comate, Lingxi,
+}
+
+// DisplayNames 渠道**显示名**的 Go 侧真源（面板文案、`/v1/models` 之外的展示处同源）。
+//
+// 前端 `cmd/wild-work/web/app.js` 的 CH_LABEL 是同一份数据的 JS 侧副本 ——
+// 两份必须逐项一致，`scripts/ui-static-check.mjs` 有跨语言一致性断言（Go 源它直接读）。
+// 顺序无关（展示序由 ChannelDisplayOrder 按值排序派生）。
+var DisplayNames = map[Kind]string{
+	WorkBuddy:   "WorkBuddyCN",
+	WorkBuddyAI: "WorkBuddyAI",
+	TraeWork:    "TraeWork",
+	TraeCode:    "TraeCode",
+	Qoder:       "Qoder",
+	QoderCN:     "QoderCN",
+	QoderCOM:    "QoderCOM",
+	QwenWork:    "千问办公",
+	GLM:         "智谱清言",
+	MonkeyCode:  "MonkeyCode",
+	Raccoon:     "小浣熊",
+	Loomy:       "Loomy",
+	Oczen:       "OpenCodeZen",
+	Kilo:        "Kilo",
+	Minimax:     "MiniMax",
+	LobsterAI:   "LobsterAI",
+	ZCode:       "ZCode",
+	Gemini:      "Gemini",
+	CodeArts:    "CodeArts",
+	Cline:       "Cline",
+	OfficeAce:   "OfficeAce",
+	Comate:      "WPS Comate",
+	Lingxi:      "WPS 灵犀",
+}
+
+// DisplayName 渠道显示名；未登记时退回渠道 kind 本身（自定义渠道就走这条）。
+func DisplayName(k Kind) string {
+	if n, ok := DisplayNames[k]; ok {
+		return n
+	}
+	return k.String()
+}
+
+// ChannelDisplayOrder 面板渠道展示顺序的**唯一真源**（R142）。
+//
+// 规则（用户 2026-10-30 拍板）：内建渠道**按显示名的 UTF-8 字节序升序** ——
+// 纯 ASCII 名字自然排在前（Cline → CodeArts → … → ZCode），中文显示名（千问办公 / 小浣熊 /
+// 智谱清言）因码位高自然垫底，`WPS Comate` / `WPS 灵犀` 落在 `ZCode` 之前。
+// 刻意不引入拼音表：那是额外依赖 + 另一份需要人工维护的真源，而 Unicode 码位序自带稳定定序。
+//
+// 自定义渠道（R66）**不入本表**：使用方统一把它们钉在最末（见 app 的 feeChannelOrderWithDynamic）。
+var ChannelDisplayOrder = sortedKindsByDisplayName(builtinKindList)
+
+// sortedKindsByDisplayName 按显示名字节序升序排序（副本，不修改入参）。
+func sortedKindsByDisplayName(ks []Kind) []Kind {
+	out := append([]Kind{}, ks...)
+	sort.SliceStable(out, func(i, j int) bool { return DisplayName(out[i]) < DisplayName(out[j]) })
+	return out
 }
 
 // ModelNamespaces 声明「上游 ID 自带命名空间」的渠道：命名空间前缀 → 渠道 kind。
@@ -746,16 +819,20 @@ func ExpireWithinDays(expireAt string, now time.Time, days int) bool {
 	return !day.After(limit)
 }
 
-// ExpiringDays 面板「临期额度」的展示窗口（自然日，固定 1 天 = 今日到期）。
+// ExpiringDays 面板「临期额度」的**默认**展示窗口（自然日，1 = 今日到期）。
 //
-// 自 2026-10-20 起**不再是路由参数**：选号改用「最早到期时刻升序」
-// （EarliestExpire），窗口大小只决定面板上那一列/汇总条怎么加总，
-// 因此取消设置项（原 R18 的可配阈值被 R112 取代）。
+// 自 2026-10-20（R112）起**不是路由参数**：选号改用「最早到期时刻升序」
+// （EarliestExpire），窗口大小只决定面板上那一列/汇总条怎么加总。
+// 该值自 2026-11-04 起可由 `config.schedule.expiring_days` 覆盖（1/2/7，
+// 纯展示，仍不参与选号，见 R112b）——运行时请读 App 的配置值，
+// 本常量仅作默认值与单测基准。
 const ExpiringDays = 1
 
 // ExpiringWithinDays 统计 days 个自然日内到期的**可消耗**积分小计。
 // 自 R112 起仅用于**展示**（面板三口径的「临期额度」/汇总条）；路由判据是
 // EarliestExpire（最早到期时刻），不再看这个量。
+// days 由 `config.schedule.expiring_days` 决定（1/2/7），与运行统计三桶同源：
+// days=1 → 今日到期桶；days=7 → 三桶累加（= 运行统计「7 日内到期」列）。
 func ExpiringWithinDays(items []ResourceItem, days int, now time.Time) int64 {
 	var expiring int64
 	for _, it := range items {

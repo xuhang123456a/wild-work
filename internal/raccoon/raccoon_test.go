@@ -122,6 +122,53 @@ func TestKnownModelAcceptsLiveCatalog(t *testing.T) {
 	}
 }
 
+// TestMeasuredVisionCapabilities 回归 R140：上游 catalog 的 vision tag 不是完整真值，
+// 动态目录必须把实测能力与 tag 取并集；明确拒绝 image_url 的纯文本 GLM-5.3 不得误标。
+func TestMeasuredVisionCapabilities(t *testing.T) {
+	vision := []string{
+		"raccoon-8c4485", "raccoon-19b265", "raccoon-405a1c",
+		"sn-sensenova-6-8-flash", "sn-sensenova-6-8-flash-lite",
+		"sn-kimi-k3", "sn-glm-5-3-flash", "sn-deepseek-v4-1-flash-1017",
+	}
+	for _, id := range vision {
+		if !measuredVisionModels[id] {
+			t.Errorf("实测可识图模型 %q 未登记", id)
+		}
+	}
+	if measuredVisionModels["sn-glm-5-3"] {
+		t.Fatal("sn-glm-5-3 实测明确拒绝 image_url，不得标为可识图")
+	}
+
+	// 假目录故意不给 19b265 vision tag：FetchModels 仍应从实测表补齐能力。
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"code":0,"data":{"categories":[{"models":[
+			{"model_name":"raccoon-19b265","tags":[],"params":{"context_window":1000}},
+			{"model_name":"sn-glm-5-3","tags":["reasoning"],"params":{"context_window":1000}},
+			{"model_name":"future-vision","tags":["vision"],"params":{"context_window":1000}}
+		]}]}}`))
+	}))
+	defer srv.Close()
+	c := New()
+	c.Base = srv.URL
+	got, err := c.FetchModels(&auth.Auth{AccessToken: "dummy"})
+	if err != nil {
+		t.Fatalf("FetchModels: %v", err)
+	}
+	byID := make(map[string]provider.ModelInfo, len(got))
+	for _, m := range got {
+		byID[m.ID] = m
+	}
+	if !byID["raccoon-19b265"].SupportsImages {
+		t.Error("漏 tag 的实测模型应补 SupportsImages=true")
+	}
+	if byID["sn-glm-5-3"].SupportsImages {
+		t.Error("纯文本模型 sn-glm-5-3 不应误标图片能力")
+	}
+	if !byID["future-vision"].SupportsImages {
+		t.Error("上游明确带 vision tag 的新模型仍应声明图片能力")
+	}
+}
+
 func TestStaticModelsNonEmpty(t *testing.T) {
 	ms := StaticModels()
 	if len(ms) != len(staticModels) {
@@ -546,22 +593,30 @@ func asLoopGuardErr(err error, target **loopguard.Error) bool {
 // R107 每日额度逐笔到期（2026-10-20 生产实录驱动）
 // ---------------------------------------------------------------------------
 
-// billsFixture 一段实测形状的积分流水（2026-10-20 抓自 RaccoonAddison）。
+// billsFixture 一段实测形状的积分流水（2026-10-20 抓自 RaccoonAddison，日期已按当前时刻顺移）。
 // 三种 biz_type 都在：daily_grant 带 expire_at，daily_expire / desktop 不带。
-const billsFixture = `{"code":0,"message":"success","data":{"items":[
+//
+// ⚠ 日期不得写死在过去：fetchDailyGrants 会剔除已到期的发放，写死的旧日期会让
+// 「在效发放」恒为 0（2026-10-28 实测：整包跑此处变红）。相对当前时刻留 7 天窗口。
+func billsFixtureJSON() string {
+	// 以「今天」为基准生成三笔在效发放 + 一笔过期的 daily_expire + 一笔 desktop + 一笔补偿。
+	day := func(d int) string { return time.Now().AddDate(0, 0, d).Format("2006-01-02") }
+	ts := func(d int, hms string) string { return day(d) + hms + "+08:00" }
+	return `{"code":0,"message":"success","data":{"items":[
  {"bill_id":"b1","client_type":"web","event_name":"每日积分发放","biz_type":"daily_grant","points":300,
-  "created_at":"2026-10-20T08:37:00+08:00","grant_at":"2026-10-20T00:00:00+08:00","expire_at":"2026-10-26T23:59:59+08:00"},
+  "created_at":"` + ts(0, "T08:37:00") + `","grant_at":"` + ts(0, "T00:00:00") + `","expire_at":"` + ts(6, "T23:59:59") + `"},
  {"bill_id":"b2","client_type":"web","event_name":"每日积分到期清零","biz_type":"daily_expire","points":-200,
-  "created_at":"2026-10-19T23:59:59+08:00","grant_at":"2026-10-13T00:00:00+08:00","expire_at":"2026-10-19T23:59:59+08:00"},
+  "created_at":"` + ts(-1, "T23:59:59") + `","grant_at":"` + ts(-7, "T00:00:00") + `","expire_at":"` + ts(-1, "T23:59:59") + `"},
  {"bill_id":"b3","client_type":"web","event_name":"每日积分发放","biz_type":"daily_grant","points":300,
-  "created_at":"2026-10-19T08:37:00+08:00","grant_at":"2026-10-19T00:00:00+08:00","expire_at":"2026-10-25T23:59:59+08:00"},
+  "created_at":"` + ts(-1, "T08:37:00") + `","grant_at":"` + ts(-1, "T00:00:00") + `","expire_at":"` + ts(5, "T23:59:59") + `"},
  {"bill_id":"b4","client_type":"desktop","event_name":"桌面端 LLM 对话消耗","biz_type":"desktop","points":-2,
-  "created_at":"2026-10-18T21:45:05+08:00"},
+  "created_at":"` + ts(-2, "T21:45:05") + `"},
  {"bill_id":"b5","client_type":"web","event_name":"每日积分发放","biz_type":"daily_grant","points":300,
-  "created_at":"2026-10-18T00:01:11+08:00","grant_at":"2026-10-18T00:00:00+08:00","expire_at":"2026-10-24T23:59:59+08:00"},
+  "created_at":"` + ts(-2, "T00:01:11") + `","grant_at":"` + ts(-2, "T00:00:00") + `","expire_at":"` + ts(4, "T23:59:59") + `"},
  {"bill_id":"b6","client_type":"web","event_name":"服务异常补偿积分","biz_type":"reward_grant","points":1500,
-  "created_at":"2026-10-16T05:35:50+08:00"}
+  "created_at":"` + ts(-4, "T05:35:50") + `"}
 ]}}`
+}
 
 // TestFetchDailyGrants 只收未到期的 daily_grant，且按到期时刻升序。
 //
@@ -572,10 +627,15 @@ func TestFetchDailyGrants(t *testing.T) {
 		if r.URL.Path != EpPointsBills {
 			t.Errorf("路径不符：%s（应走 %s）", r.URL.Path, EpPointsBills)
 		}
-		if got := r.URL.Query().Get("paging.limit"); got == "" {
-			t.Error("缺少 paging.limit 分页参数（上游缺省 limit 很小）")
+		if got := r.URL.Query().Get("paging.limit"); got != "100" {
+			t.Errorf("paging.limit = %q, want 100（服务端最多只回 100 条）", got)
 		}
-		_, _ = w.Write([]byte(billsFixture))
+		// 必须带收入筛选：不带 type 时这一页混着对话消耗，几小时后当天的发放记录
+		// 就被挤出窗口，有效期整列随之消失（2026-11-01～11-08 生产实录）。
+		if got := r.URL.Query().Get("type"); got != "income" {
+			t.Errorf("type = %q, want income（否则发放记录会被消耗流水挤出窗口）", got)
+		}
+		_, _ = w.Write([]byte(billsFixtureJSON()))
 	}))
 	defer srv.Close()
 
@@ -619,10 +679,11 @@ func TestFetchDailyGrantsDropsExpired(t *testing.T) {
 	}
 }
 
-// TestWithDailyExpiryFIFO 余额按到期升序逐笔扣减（先进先出），余量挂最后一笔。
+// TestWithDailyExpiryFIFO 余额按先进先出归属：剩下的余额落在**最新**的发放上。
 //
 // 这是本改动的**口径核心**：拆开后 Remain 之和必须恒等于 daily_points，
-// 否则 pool 快照与面板余额对不上（Summarize 直接求和）。
+// 否则 pool 快照与面板余额对不上（Summarize 直接求和）。方向也必须对：
+// 上游按先进先出消耗（最老先花），池子里剩下的余额属于最新的那几笔。
 func TestWithDailyExpiryFIFO(t *testing.T) {
 	items := parsePointsBalanceOnly(pointsBalanceData{
 		AvailablePoints: 1000, DailyPoints: 500, RewardPoints: 500,
@@ -645,21 +706,54 @@ func TestWithDailyExpiryFIFO(t *testing.T) {
 	if sum != 500 {
 		t.Fatalf("拆分后每日额度合计 = %d, want 500（必须等于 daily_points）", sum)
 	}
-	// 500 分池子 + 三笔 300：前两笔满额 300，最后一笔只剩 0 → 不产生空条目。
+	// 500 分池子 + 三笔 300：最老那笔已被花光（剩 0 → 不出条目），
+	// 余下 500 落在最新的两笔上（300@23 + 200@22），输出按到期升序。
 	if len(daily) != 2 {
-		t.Fatalf("拆分条目 = %d, want 2（第三笔余额为 0 应省略）: %+v", len(daily), daily)
+		t.Fatalf("拆分条目 = %d, want 2（最老一笔余额为 0 应省略）: %+v", len(daily), daily)
 	}
-	if daily[0].Remain != 300 || daily[0].ExpireAt != grants[0].ExpireAt {
-		t.Fatalf("第一笔应按最早到期满额: %+v", daily[0])
+	if daily[0].Remain != 200 || daily[0].ExpireAt != grants[1].ExpireAt {
+		t.Fatalf("次新一笔应承接余量 200: %+v", daily[0])
 	}
-	if daily[1].Remain != 200 {
-		t.Fatalf("第二笔应承接余量 200: %+v", daily[1])
+	if daily[1].Remain != 300 || daily[1].ExpireAt != grants[2].ExpireAt {
+		t.Fatalf("最新一笔应满额: %+v", daily[1])
 	}
 
 	// Summarize 必须仍等于可用余额（拆分对 pool 快照零影响）。
 	usable, _ := provider.Summarize(got)
 	if usable != 1000 {
 		t.Fatalf("Summarize 可用 = %d, want 1000", usable)
+	}
+}
+
+// TestWithDailyExpiryRemainderOnNewest 复刻 2026-11-09 实盘：6 笔在效发放共 1800，
+// 池子只剩 300（当天那笔未动）。余额必须归到到期最晚的一笔，否则面板会虚报
+// 「今晚 300 到期」，today_spent/今日到期 一起错。
+func TestWithDailyExpiryRemainderOnNewest(t *testing.T) {
+	items := parsePointsBalanceOnly(pointsBalanceData{AvailablePoints: 11261, DailyPoints: 300, RewardPoints: 10961})
+	grants := []dailyGrant{
+		{Points: 300, ExpireAt: "2026-11-09T23:59:59+08:00"},
+		{Points: 300, ExpireAt: "2026-11-10T23:59:59+08:00"},
+		{Points: 300, ExpireAt: "2026-11-11T23:59:59+08:00"},
+		{Points: 300, ExpireAt: "2026-11-13T23:59:59+08:00"},
+		{Points: 300, ExpireAt: "2026-11-14T23:59:59+08:00"},
+		{Points: 300, ExpireAt: "2026-11-15T23:59:59+08:00"},
+	}
+	got := withDailyExpiry(items, grants)
+
+	var daily []provider.ResourceItem
+	for _, it := range got {
+		if it.Name == dailyItemName {
+			daily = append(daily, it)
+		}
+	}
+	if len(daily) != 1 {
+		t.Fatalf("每日额度条目 = %d, want 1（300 分只够最新一笔）: %+v", len(daily), daily)
+	}
+	if daily[0].Remain != 300 || daily[0].ExpireAt != "2026-11-15T23:59:59+08:00" {
+		t.Fatalf("300 分应归到最新一笔（11-15 到期），实际 %+v", daily[0])
+	}
+	if usable, _ := provider.Summarize(got); usable != 11261 {
+		t.Fatalf("Summarize 可用 = %d, want 11261", usable)
 	}
 }
 
@@ -717,6 +811,49 @@ func TestWithDailyExpirySharesOneLedgerKey(t *testing.T) {
 	}
 }
 
+// TestWithDailyExpiryEmptyPoolKeepsExpiry 每日额度花完后仍要保留到期时刻。
+//
+// 生产症状（2026-11-01～11-08）：每天 22:06 的 checkin 日志 earliest 恒为零值，
+// 面板「有效期」整列随之消失——上午领的 300 到下午用完，表格里就没有任何条目
+// 带到期日了。这里锁住：余额为 0 也必须带上最早一笔在效发放的到期时刻，
+// 且不得凭空造出余额、不得就地修改入参。
+func TestWithDailyExpiryEmptyPoolKeepsExpiry(t *testing.T) {
+	items := parsePointsBalanceOnly(pointsBalanceData{DailyPoints: 0, RewardPoints: 10961})
+	grants := []dailyGrant{
+		{Points: 300, ExpireAt: "2026-11-15T23:59:59+08:00"},
+		{Points: 300, ExpireAt: "2026-11-16T23:59:59+08:00"},
+	}
+	got := withDailyExpiry(items, grants)
+
+	var daily []provider.ResourceItem
+	for _, it := range got {
+		if it.Name == dailyItemName {
+			daily = append(daily, it)
+		}
+	}
+	if len(daily) != 1 {
+		t.Fatalf("每日额度条目 = %d, want 1（池子为空不拆笔）: %+v", len(daily), daily)
+	}
+	if daily[0].ExpireAt != grants[0].ExpireAt {
+		t.Fatalf("到期时刻 = %q, want 最早一笔 %q", daily[0].ExpireAt, grants[0].ExpireAt)
+	}
+	if daily[0].Remain != 0 || daily[0].Total != 0 {
+		t.Fatalf("不得凭空造余额: %+v", daily[0])
+	}
+	if daily[0].Key != "" {
+		t.Fatalf("差分键不得改变（Key 必须为空）: %+v", daily[0])
+	}
+	// 入参是调用方的切片，改它会污染同一轮里的其它读取（如 pool 快照）。
+	for _, it := range items {
+		if it.ExpireAt != "" {
+			t.Fatalf("不得就地修改入参: %+v", it)
+		}
+	}
+	if usable, _ := provider.Summarize(got); usable != 10961 {
+		t.Fatalf("Summarize 可用 = %d, want 10961（余额口径不变）", usable)
+	}
+}
+
 // TestWithDailyExpiryNoGrantsUnchanged bills 拿不到发放时原样返回（降级路径）。
 func TestWithDailyExpiryNoGrantsUnchanged(t *testing.T) {
 	items := parsePointsBalanceOnly(pointsBalanceData{DailyPoints: 300})
@@ -740,7 +877,7 @@ func TestUserResourceDetailAttachesDailyExpiry(t *testing.T) {
 			_, _ = w.Write([]byte(`{"code":0,"message":"success","data":{"available_points":8100,` +
 				`"daily_points":2100,"monthly_points":0,"reward_points":6000,"topup_points":0,"topup_frozen":false}}`))
 		case EpPointsBills:
-			_, _ = w.Write([]byte(billsFixture))
+			_, _ = w.Write([]byte(billsFixtureJSON()))
 		default:
 			t.Errorf("意外路径: %s", r.URL.Path)
 		}

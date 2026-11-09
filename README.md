@@ -1,6 +1,6 @@
 # wild-work
 
-> 多渠道账号聚合桌面工具——把 WorkBuddy(CodeBuddy) 国内版/国际版、TraeWork、QoderCN、QoderCOM（国际版）、千问办公、MonkeyCode 平台托管模型、小浣熊、Loomy（讯飞）、智谱清言、Cline（官方 API Key 免费池）、华为云果办 OfficeAce 的多个账号聚合成一个 OpenAI 兼容 API，并额外提供**无需账号**的 OpenCodeZen 匿名免费通道，双击启动，浏览器管理。
+> 多渠道账号聚合桌面工具——把 WorkBuddy(CodeBuddy) 国内版/国际版、TraeWork、QoderCN、QoderCOM（国际版）、千问办公、MonkeyCode 平台托管模型、小浣熊、Loomy（讯飞）、智谱清言、Cline（官方 API Key 免费池）、WPS Comate、华为云果办 OfficeAce 的多个账号聚合成一个 OpenAI 兼容 API，并额外提供**无需账号**的 OpenCodeZen 匿名免费通道，双击启动，浏览器管理。
 
 [![GitHub](https://img.shields.io/badge/GitHub-rockswang%2Fworkbuddy--wild-blue)](https://github.com/rockswang/workbuddy-wild)
 
@@ -12,23 +12,23 @@
 - **思考链死循环检测（防癫拦截）**：流式生成中逐帧检测推理复读/空转，命中即中断 SSE 并向客户端返回错误（`code=upstream_reasoning_loop`），由下游 AI 客户端自行重试恢复；不罚账号（模型级问题），默认开启，面板「设置」可关闭
 - **OpenAI 兼容代理**：`/v1/chat/completions`、`/v1/models`，支持流式/非流式，模型前缀路由
 - **错误分类精细化**：区分「请求问题」与「账号问题」——内容拦截/上下文超限不罚号，限流/风控/账号故障分级冷却，429 不再误判余额耗尽；**单账号渠道（OpenCodeZen）例外：任何错误均不冷却**（无号可轮换，惩罚即等于整渠道下线）
-- **二十渠道聚合**：20 条内建渠道统一按「模型前缀路由」接入（`渠道前缀/<model>`），粘性路由优先复用账号以提升会话缓存利用率，选号按**最早到期优先**（快过期的积分先烧）；渠道明细见下文[二十渠道聚合](#二十渠道聚合)。旧 Qoder（`qoder/*`）路由保留但已从界面下线
+- **二十二渠道聚合**：23 条内建渠道统一按「模型前缀路由」接入（`渠道前缀/<model>`），粘性路由优先复用账号以提升会话缓存利用率，选号按**最早到期优先**（快过期的积分先烧）；其中旧 Qoder（`qoder/*`）仅保留路由、界面已下线，可添加的是 22 条。渠道明细见下文[二十二渠道聚合](#二十二渠道聚合)
 - **Cline 免费池**（`cline/*`）：粘贴官方 `sk_` API Key 即用（`app.cline.bot` 自行注册并创建，Key 不过期、不轮换、不与浏览器/客户端互踢）；本渠道**只调度免费模型**，多把 Key 须来自**多个独立账号**（官方额度按账号计，同账号多 Key 共享一份额度，面板会自动识别并提示）
 - **匿名免费通道**（OpenCodeZen）：内置 `public` 凭证即可调用 Zen 上的免费模型（含 `big-pickle`），无需注册/登录；面板固定一个 `[OpenCodeZen] 匿名` 条目（不可增删停用、无签到、积分显示「不适用」）
-- **自动签到**：每日定时签到领额度（Qoder 双区含 10:00–12:00 窗口重试，避免上游活动延迟导致漏领；小浣熊走工作台接口触发**惰性落账**的每日积分，见下），token 保活，冷却状态机
+- **自动签到**：每日定时签到领额度（Qoder 双区含 10:00–12:00 窗口重试，避免上游活动延迟导致漏领；小浣熊走工作台接口触发**惰性落账**的每日积分，见下），token 保活，冷却状态机。**没有签到活动的渠道**（千问办公/Cline/Comate/OpenCodeZen/Kilo/ZCode/Gemini）不参与签到调度，面板显示灰色「无签到」而不是红色「签到失败」
 - **自动领日活奖励**（WorkBuddy 国际版）：定时自动用免费模型对话保活，自动领取每日活跃奖励，无需手动签到
-- **用量与流水统计**：token 流水（渠道×模型）与积分流水（入项/消耗/过期）双口径记账，面板折线图 + 模型用量榜（含**缓存利用率**与**平均速度**列，取自运行统计引擎同源数据）+ 积分流水对账，选号按最早到期优先；区间（今日/7日）选择**自动记忆**
+- **用量与流水统计**：token 流水（渠道×模型）与积分流水（入项/消耗/过期）双口径记账，面板折线图 + 模型用量榜（含**缓存利用率**与**当前速度**列，速度是最近 60 秒的滑动窗口速率，取自运行统计引擎同源数据）+ 积分流水对账，选号按最早到期优先；区间（今日/7日）选择**自动记忆**
 - **运行统计面板**（第三 tab）：实时视图——今日签到收入/花费/账号数里程碑、平台概览、使用中接棒（粘性路由）、最近临期与预计作废、模型消耗、请求日志（含 TTFB/吞吐）、异常账号、运行日志，30s 自动刷新；与上面「用量与流水」是**两套并列口径**（各自标注，不做数字对齐）
 - **Web 管理面板**：账号管理（添加/签到/刷新/停用/删除）、积分明细、模型列表和费率、API 配置、统一设置弹层（含**备用上游通道**与**自定义渠道**）；监听非本机地址时强制管理密码登录（HttpOnly cookie 会话）
 - **自定义渠道接入**（`custom_channels`）：在面板设置中接入任意第三方 OpenAI 兼容 API（如官方 StepFun、本地 CLIProxy、DeepSeek 等），通过 `渠道标识/模型名` 统一路由并集中查看用量流水（ledger）与实时运行统计（TTFB、吞吐、请求日志）
 - **系统托盘**：常驻右下角，双击打开面板，右键菜单操作
 - **跨平台**：Windows（完整支持）、macOS（代码已就绪，CI 构建）、Linux（无头模式）
 - **developer→system 角色转换**：自动将下游 Agent 发送的 `<developer>` 角色改写为 `<system>`，避免上游触发内容过滤
-- **上游协议头仿真**：出站自动注入官方客户端指纹头（`X-CodeBuddy-Request`、`X-Machine-ID` 等），降低风控误判风险
+- **上游协议头仿真**：出站自动注入官方客户端指纹头（UA、`X-IDE-Version`、`X-Product`、会话头族等，按官方桌面客户端 5.8.3 对齐），降低风控误判风险
 
-## 二十渠道聚合
+## 二十二渠道聚合
 
-20 条内建渠道统一按「模型前缀路由」接入（`渠道前缀/<model>`），粘性路由优先复用账号以提升会话缓存利用率，选号按**最早到期优先**（快过期的积分先烧）；另有自定义渠道（`custom_channels`，见「自定义渠道接入」）可接入任意 OpenAI 兼容 API。
+`provider.BuiltinKinds()` 共声明 **23 条内建渠道**，统一按「模型前缀路由」接入（`渠道前缀/<model>`），粘性路由优先复用账号以提升会话缓存利用率，选号按**最早到期优先**（快过期的积分先烧）；其中旧 Qoder（`qoder/*`）仅保留路由、界面已下线 ⇒ 面板上可添加的是 **22 条**。另有自定义渠道（`custom_channels`，见「自定义渠道接入」）可接入任意 OpenAI 兼容 API。
 
 | 渠道 | 模型前缀 | 接入方式 | 说明 |
 |------|----------|----------|------|
@@ -44,6 +44,8 @@
 | Loomy（讯飞） | `loomy/*` | 从客户端导入 | 导入型渠道：凭据从**本机已登录的官方客户端**读取；上游无 refresh 端点，session 约 14 天，到期需重新导入 |
 | 智谱清言 | `glm/*` | CDP 自动捕获 | **网页版私有接口**（非开放平台），凭据是浏览器 Cookie 里的 `chatglm_refresh_token`；新账号须在智谱清言 App 登录一次才发放初始额度 |
 | Cline | `cline-free/*`（兼容旧写法 `cline/*`） | 粘贴官方 API Key | 只调度免费模型；Key 不过期、不轮换；官方额度按账号计，多把 Key 须来自**多个独立账号**（同账号多 Key 共享一份额度，面板会自动识别并提示） |
+| WPS Comate | `comate/*` | 扫码登录 / 本机浏览器接管 / 手工粘贴 | WPS 网页版模型代理（`comate.wps.cn`）：**扫码登录**为默认路径（服务端向 `qr.wps.cn` 申请二维码，面板就地显示，手机 WPS 扫码确认后由服务端换出 Cookie —— 无需桌面、无需浏览器，NAS/docker 可用；**Cookie 一出现 ≠ 登录完成**，判据是上游 `/models` 校验通过）；有桌面的本机部署可配置 `login.comate_browser_cdp` 接管**已在跑**的浏览器（`--remote-debugging-port`）直接读登录态；任何环境都能展开「手工方式」粘贴 `wps_sid`（整段 Cookie 头也直接吃）；模型列表由上游 `/models` 动态下发（GLM/DeepSeek/MiniMax/MiMo 等，上下文窗口为上游官方声明）；**额度查得到**（主积分 = `/llmproxy/v1/user/token-usage` 的每日额度剩余；该池为空的账号回退 `/api/coserve/v1/billing/v3/credits/trial` 的「免费额度」，见 R136/R138。明细里每日/每月/免费额度各自成条，倍率取每款模型的 `consume_ratio`），并支持「刷新积分」；积分按 WPS 账号计，多份 sid 须来自**多个独立账号**（面板会自动识别并提示） |
+| WPS 灵犀 | `lingxi/*` | 扫码 / 粘贴 `wps_sid`（CDP 自动捕获） | WPS 灵犀（`lingxi.kdocs.cn`）网页版助手：两段式对话（先建 session 再 completions SSE），模型目录取上游 `plans` 动态下发，`reasoning_effort` 三档映射；每日签到 + 余额查询（智点口径）。凭据就是 WPS 网页版 Cookie 里的 `wps_sid`，与 comate 共用同一份 Cookie 但账号 uid 带 `lxsid-` 前缀，两渠道互不串号 |
 | 华为云果办 OfficeAce | `officeace/*` | 自助 OAuth／从客户端导入 | 华为云 AgentArts 模型网关；两条添加路径：主按钮自助 OAuth（华为云授权码 + PKCE + DPoP，跨平台），次按钮读本机 OfficeAce 桌面端凭据（临时 AK/SK 经 DPAPI 解密，仅 Windows）；对话走不过期的网关 Basic 凭据，每日签到的临时凭据约 2 小时有效并自动续期 |
 | OpenCodeZen | `oczen/*` | 无需账号 | 匿名免费通道，内置 `public` 凭证即可调用 Zen 免费模型 |
 | Kilo | `kilo/*` | 无需账号 | 免密免费池 |
@@ -87,6 +89,8 @@
 | [xxhhlk/loomy2api](https://github.com/xxhhlk/loomy2api) | 讯飞 Loomy 渠道协议逆向（MIT），loomy 渠道依据 |
 | [Q-shuang-dot/officeace2api](https://github.com/Q-shuang-dot/officeace2api) | 华为云果办 OfficeAce 渠道协议依据（MIT）——V4/V11 华为云签名（`src/quota.mjs`）、网关错误码分类（`src/server.mjs`）、`max_tokens` 推理预算常量（`src/config.mjs`）、桌面端凭据发现与 DPAPI/AES-256-GCM 档案解密（`src/discover*.mjs` / `src/dpapi.mjs`）、DPoP + PKCE 自助 OAuth（`src/oauth.mjs`）、refresh_token 一次性轮换（`src/refresh.mjs`）；本项目只取协议与凭据链路，其**批量注册/接码**、Web 控制台、Windows 计划任务看门狗未采用 |
 | [luawei1/cline2api](https://github.com/luawei1/cline2api) | Cline 渠道协议逆向参考（MIT；虽未采用其 WorkOS OAuth 方案，模型/对话协议知识有参考，`recommended-models` free 池机制亦借鉴自其分析） |
+| [DiEr-TouShou/dsh-connect-comate](https://github.com/DiEr-TouShou/dsh-connect-comate) | WPS Comate 渠道协议逆向参考（MIT；虽未采用其 DSH 插件封装与凭据密封存储，comate 网关的 Cookie-only 鉴权形态、思考档位线值、错误文案分类与请求体规范化的知识有参考） |
+| [KevinFX-code/magpie-wps-lingxi](https://github.com/KevinFX-code/magpie-wps-lingxi) | WPS 灵犀（`lingxi/*`）渠道协议依据（MIT）——两段式对话（先建 session 再 completions）、三专用头、SSE 9 帧序列、签到与智点余额端点均由此逆向而来；本仓只取协议知识、未复用其代码 |
 | [donghangxunlang-cmd/dsh-attention-health](https://github.com/donghangxunlang-cmd/dsh-attention-health) | 思考链死循环（发癫）检测算法来源——`lib/guard.js` 的四条复读/空转判据与防误杀护栏（本项目只取死循环检测，健康评估/工作交接/会话日志未采用） |
 | [ttales430/wild-work PR #46](https://github.com/rockswang/wild-work/pull/46) | 智谱清言渠道实现（含 CDP 登录编排） |
 
@@ -102,7 +106,7 @@
 2. 放到任意目录，双击启动
 3. 右下角出现 W 图标，**双击托盘图标** → 浏览器打开 Web 管理面板
 4. 在面板中点击「+ WorkBuddyCN」/「+ WorkBuddyAI」/「+ TraeWork」/「+ QoderCN」/「+ QoderCOM」/「+ 千问办公」/「+ 智谱清言」/「+ OfficeAce」添加账号
-   （OpenCodeZen 无需添加账号，启动即已就绪；Cline 无需登录流程，直接粘贴 API Key）
+   （OpenCodeZen 无需添加账号，启动即已就绪；Cline 无需登录流程，直接粘贴 API Key；WPS Comate 默认走「扫码登录」（手机 WPS 扫码确认即可，无桌面环境也能用），也可粘贴整段 Cookie 兜底）
 5. 根据下方配置说明接入你的 AI 客户端
 
 ### 托盘菜单
@@ -311,9 +315,32 @@ curl http://127.0.0.1:7863/v1/chat/completions \
 ```
 
 - 带 `channel/` 前缀的模型名始终优先（如 `workbuddy/hy3`），行为与旧版一致
-- 无前缀时依次尝试：`model_map` 精确匹配 → 通配匹配（key 以 `*` 结尾）→ `default_channel`
+- 无前缀时依次尝试：**降级链别名** → `model_map` 精确匹配 → 通配匹配（key 以 `*` 结尾）→ `default_channel`
 - `max_tokens_cap` 用于封顶客户端的 `max_tokens`（Anthropic 客户端常发 64000，
   超出部分上游会直接 400）；设 `0` 表示不限制
+
+#### 给降级链起个短名（别名，R129）
+
+降级链的主力模型 ID 是 `channel/model` 全路径，每次在客户端里抄一遍很容易抄错。
+可以在降级链规则上配一个 `name`，客户端直接请求这个名字：
+
+```json
+"model_fallback": [
+  { "from": "workbuddyai/deepseek-v4.1-flash", "to": ["workbuddy/glm-5.2"], "name": "fast" }
+]
+```
+
+- **别名是主力模型的另一个名字**：请求 `fast` 等同于请求 `workbuddyai/deepseek-v4.1-flash`——
+  同样的粘性路由、容量判定、降级链与冷却；主力没容量时照样按 `to` 降级。
+- 优先级：**别名 > `model_map` > `default_channel`**（别名是结构化配置，最具体）；
+  三个接口（`/v1/chat/completions`、`/v1/responses`、`/v1/messages`）行为一致，保存即热生效。
+- 别名**不参与备胎链**（`to` 里只能写 `channel/model` 全路径）；也**不会**在用量榜/请求日志里
+  单独成行——消耗一律记在主力模型名下，面板数字不会裂成两截。
+- 别名会出现在 `/v1/models` 里（排在真实模型之前，带 `alias` 字段指向主力），能力字段
+  与主力模型逐字段相同。
+- 保存时的硬限制：不能含 `/`、空白、逗号、`*`；不能与另一条规则的别名重名、
+  不能与 `model_map` 的键或渠道名重名（大小写敏感：`Fast` ≠ `fast`）。与某个真实模型的裸名重合时
+  只给一条**提示**（允许保存，运行时按别名走）。
 
 **Codex CLI 配置示例**（`~/.codex/config.toml`）：
 
@@ -486,9 +513,9 @@ curl -X POST "http://127.0.0.1:7863/v1/systemone" \
   两边会争抢同一个 refresh_token，可能出现其中一侧被挤下线。要两边同时用，请用「网页版登录」在独立浏览器窗口里**单独登录一次**
   （本流程新建独立会话），而不是从浏览器复制凭据粘进来。
   - ⚠️ **平台限制**：MonkeyCode / 小浣熊 / Loomy 的「从客户端导入」路径探测**跨平台**（用标准用户目录 / 环境变量定位客户端凭据，macOS / Linux 上客户端把配置写在标准位置即可命中，找不到则返回明确报错）。小浣熊的**网页版自动登录同样跨平台**（纯 HTTP + 系统 Edge/Chrome，不依赖注册表）；小浣熊 / Loomy 官方另有 macOS / Linux 客户端，MonkeyCode 客户端则仅发布过 Windows 版（其导入在非 Windows 仍会按上述口径尽力而为）。其余渠道（WorkBuddy 系 / Trae 系 / Qoder 系 / 千问办公 / 智谱清言 / Cline）跨平台可用（Cline 是纯 HTTP + 官方 API Key，不依赖本机客户端，天然跨平台）。
-- **账号管理**：卡片显示积分、签到状态（WorkBuddy 国际版显示「自动领日活奖励」）；图标按钮操作（签到 ✓ / 刷新 ↻ / 停用 ⏸ / 删除 ✕）
+- **账号管理**：卡片显示积分、签到状态（WorkBuddy 国际版显示「自动领日活奖励」，无签到活动的渠道显示灰色「无签到」）；图标按钮操作（签到 ✓ / 刷新 ↻ / 停用 ⏸ / 删除 ✕）
   - **修改显示名**：点击卡片上的账号名即可修改，用于给账号起好认的别名
-  - 账号按固定渠道序展示：OpenCodeZen → WorkBuddyCN → WorkBuddyAI → QoderCN → QoderCOM → TraeWork → 千问办公 → 智谱清言 → Cline → MonkeyCode → 小浣熊 → Loomy
+  - 账号按**渠道显示名的字母序**展示（Unicode 码位序，中文名因码位高自然排在最后）：Cline → CodeArts → Gemini → Kilo → LobsterAI → Loomy → MiniMax → MonkeyCode → OfficeAce → OpenCodeZen → Qoder → QoderCN → QoderCOM → TraeCode → TraeWork → WPS Comate → WPS 灵犀 → WorkBuddyAI → WorkBuddyCN → ZCode → 千问办公 → 小浣熊 → 智谱清言；**自定义渠道硬编码排在最后**（同组内按渠道标识排）。账号卡片、积分汇总条、费率 tab 三处同一顺序，规则单一来源（见决议 R142）
   - 积分显示为「可用积分」；若该账号还有本工具用不了的额度（如 TraeWork 官方客户端专用池），会追加显示 `/ N 不可用`
 - **积分明细**：鼠标悬停积分数字显示套餐明细（含有效期与可用/不可用小计），条目多时用底部 `‹ ›` 翻页
 - **刷新积分**：面板顶部按钮，批量刷新全部账号余额
@@ -508,6 +535,9 @@ curl -X POST "http://127.0.0.1:7863/v1/systemone" \
     **管理密码**（给面板登录；与 API-Key 是两套凭据）
   - *自动签到与开机自启*：签到时间多组增删、开机自启开关
   - *模型路由*：默认渠道、封顶 tokens、CC/Codex 客户端模型名映射表（`claude-* = workbuddy/glm-5.2` 形式，支持通配）
+  - *模型降级链*：每条链可填一个**别名**（可选，如 `fast`）——客户端直接请求这个名字等同于请求主力模型；
+    面板会即时校验（非法字符/重名当场报错，与真实裸名重合只黄字提示），保存即热生效，
+    并在链卡片上显示可一键复制的别名 chip（R129）
   - *备用上游通道*：全局只配**一个**代理地址（`http://` / `https://` / `socks5://`），留空 = 关闭。
     它**不影响任何常规请求**（所有渠道一律直连）；只有上游回「地区限制」时，本工具才在
     同一次请求内自动改走该通道重发一次，重发也失败则透传原始错误（不拿第二次尝试的错误掩盖首因）。
@@ -579,6 +609,41 @@ curl -X POST "http://127.0.0.1:7863/v1/systemone" \
 - 如果你平时会打开小浣熊网页/客户端，积分本来也会到账；本工具的签到保证**即使一天都不打开**也不漏领。
 
 > 注：纯对话、查余额、刷新 token 都**不会**触发这个落账，只有工作台接口算「当天登录」。
+
+### 6. 账号切换太频繁 / 太黏着不动，能调吗？
+
+可以。本工具对每个渠道使用**粘性路由**：选定一个账号后尽量复用它（提高上游会话缓存命中率），
+直到「连续成功 N 次」或该账号遇冷却/禁用/登录态失效才换号。这个 N 就是
+`config.json` 里的 `server.sticky_max_requests`，**默认 50**：
+
+```json
+{ "server": { "sticky_max_requests": 20 } }
+```
+
+- 调**小**（如 10~20）：更均匀地分摊消耗、遇到单个账号变慢时更快轮到别人，代价是缓存命中率下降；
+- 调**大**（如 200）：缓存亲和更好，但单个账号会被长时间钉住；
+- 填 `0` 或负数视为非法，会在日志里记一条 `WARN config: server.sticky_max_requests=…` 并**回退默认 50**（不会改你的配置文件）。
+
+注意它只决定「什么时候换下一个号」，**不影响选哪个号**——选号永远是「最早到期优先」（快过期的积分先烧）。
+改完需重启本工具生效；已在跑的粘性链路仍按旧阈值跑到耗尽（不会中途被打断）。
+
+### 7. WPS Comate 怎么登录？没有桌面的 NAS 能用吗？
+
+能用。三条路，**同一份凭据纪律**，以「上游 `/models` 校验通过」为完成判据
+（Cookie 出现 ≠ 登录完成：未登录态也会下发预登录 Cookie，上游会回 401 `not_login`）：
+
+1. **扫码登录（默认，NAS/docker 可用）**：点「＋ WPS Comate」→ 面板里直接出二维码 →
+   用手机 WPS 扫码确认。二维码由**服务端**向 `qr.wps.cn` 申请、Cookie 也在服务端换取，
+   全程不需要桌面、不需要浏览器。二维码 110 秒自动换新，整体 5 分钟超时。
+2. **本机浏览器接管（有桌面的本机部署）**：在 `config.json` 里填
+   `"login": { "comate_browser_cdp": "http://127.0.0.1:9222" }`，并用
+   `--remote-debugging-port=9222` 启动浏览器（Chrome 136+ 默认 profile 拒开调试口，需换 profile）。
+   之后面板会显示该入口：它会**在你正在用的浏览器里**开一个 WPS 登录页，登录完自动读 `wps_sid`；
+   结束后只断开连接，**不会关掉你的浏览器**。
+3. **手工粘贴（兜底）**：展开「手工方式」粘贴。裸值、`wps_sid=...`、整段 Cookie 请求头、
+   DevTools 表格整行都能直接吃（`comate.NormalizeSID` 会自己剥噪声）。
+
+注意 `wps_sid` 没有 refresh 机制，过期后需重新走一遍上面任一条路（账号卡片上没有 ⟳ 重登按钮）。
 
 ## ⚠️ 风险警告与免责声明
 

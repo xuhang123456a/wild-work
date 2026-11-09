@@ -40,6 +40,13 @@ type fakeUpstream struct {
 	rejectMsg string
 	// sendRejectMsg 非空时，sendMsgCode 直接回该错误（模拟短信下发失败/频率限制）。
 	sendRejectMsg string
+	// sendOKCode / sendOKDesc 是 sendMsgCode 成功时的信封 code/desc。
+	// 默认 "0"/"success"；置成别的值可模拟「上游成功码不在 {0, 空} 白名单里」的真实形态
+	// （真实现场：desc="成功" 而 code 非 0，旧实现据此把已下发的短信判成失败）。
+	sendOKCode string
+	sendOKDesc string
+	// sendMsgIDAtTop 为真时把 msgid 发在**响应顶层**而不是 data 里。
+	sendMsgIDAtTop bool
 	// sendFailLeft 是「还允许失败几次下发」：用完之后恢复正常，
 	// 用于验证「下发失败可以就地重试」（#173 缺陷 A）。
 	sendFailLeft int
@@ -72,10 +79,18 @@ func (f *fakeUpstream) handler(t *testing.T) http.Handler {
 			_ = json.NewEncoder(w).Encode(map[string]any{"code": "020004", "desc": f.sendRejectMsg})
 			return
 		}
-		_ = json.NewEncoder(w).Encode(map[string]any{
-			"code": "0", "desc": "success", "sid": "s1",
+		payload := map[string]any{
+			"code": orDefault(f.sendOKCode, "0"),
+			"desc": orDefault(f.sendOKDesc, "success"),
+			"sid":  "s1",
 			"data": map[string]any{"msgid": f.msgid},
-		})
+		}
+		if f.sendMsgIDAtTop {
+			// 少数形态把 msgid 放在响应顶层：仍必须能取到（整包兜底）。
+			payload["data"] = map[string]any{}
+			payload["msgid"] = f.msgid
+		}
+		_ = json.NewEncoder(w).Encode(payload)
 	})
 	mux.HandleFunc("/login/phone/checkCode", func(w http.ResponseWriter, r *http.Request) {
 		f.mu.Lock()
@@ -150,11 +165,17 @@ func newFake(t *testing.T, mutate func(*fakeUpstream)) *fakeUpstream {
 }
 
 // isolate 隔离包级会话，避免测试相互污染。
+//
+// 跨会话的 msgid 留存（sentByPhone）也是包级状态，一并清空：
+// 否则前一个用例发过的码会让后一个用例的「从未下发过」断言假通过/假失败。
 func isolate(t *testing.T) string {
 	t.Helper()
 	dir := t.TempDir()
 	statePath := filepath.Join(dir, "login-state.json")
 	Shutdown()
+	sentMu.Lock()
+	sentByPhone = map[string]sentMsg{}
+	sentMu.Unlock()
 	t.Cleanup(Shutdown)
 	return statePath
 }

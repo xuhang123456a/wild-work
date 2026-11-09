@@ -19,10 +19,12 @@ import (
 	"fmt"
 	"net"
 	"net/http"
+	"net/url"
 	"os"
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"strconv"
 	"strings"
 	"time"
 )
@@ -35,11 +37,17 @@ type Cookie struct {
 }
 
 // Browser 一个受控的浏览器实例。
+//
+// 两种来源：Launch 自己拉起一个（cmd/profile 非空，Close 会杀进程并清目录），
+// 或 Attach 接管一个**已经在跑**的浏览器（用户自己的 Chrome/Edge，开着调试端口）。
+// 后者的语义差别很大：绝不能关掉用户的浏览器 —— 这正是 attached 标记存在的理由。
 type Browser struct {
-	cmd     *exec.Cmd
-	port    int
-	profile string
-	exe     string
+	cmd      *exec.Cmd
+	port     int
+	profile  string
+	exe      string
+	attached bool
+	wsURL    string // 浏览器级 WS 地址；Attach 时取自 /json/version
 }
 
 // Options 启动选项。
@@ -194,6 +202,10 @@ func (b *Browser) ProfileDir() string { return b.profile }
 
 // Close 关闭浏览器并清理临时 profile。
 func (b *Browser) Close() error {
+	// 接管的浏览器属于用户：只断开引用，不关窗口、不杀进程、不动 profile。
+	if b.attached {
+		return nil
+	}
 	// 优先经 CDP 优雅关闭，避免留下进程
 	if ws, err := DialWebSocket(b.browserWSURL(), 5*time.Second); err == nil {
 		_, _ = ws.Call("Browser.close", nil, 3*time.Second)
@@ -216,7 +228,96 @@ func (b *Browser) Close() error {
 
 // browserWSURL 取浏览器级 WebSocket 地址。
 func (b *Browser) browserWSURL() string {
+	if b.wsURL != "" {
+		return b.wsURL
+	}
 	return fmt.Sprintf("ws://127.0.0.1:%d/devtools/browser", b.port)
+}
+
+// Attach 接管一个已在运行的浏览器（必须已开 --remote-debugging-port）。
+//
+// endpoint 形如 http://127.0.0.1:9222（也接受 127.0.0.1:9222）。与 Launch 的区别：
+// 共用用户日常 profile 里的登录态 —— 用户在自己熟悉的浏览器里登录一次，
+// 渠道就能直接读到 Cookie，不必再复制粘贴。代价是浏览器归用户所有：
+// Close 只解引用，绝不关闭它。
+func Attach(ctx context.Context, endpoint string) (*Browser, error) {
+	ep := strings.TrimSpace(endpoint)
+	if ep == "" {
+		return nil, fmt.Errorf("cdp: 浏览器调试地址为空")
+	}
+	if !strings.Contains(ep, "://") {
+		ep = "http://" + ep
+	}
+	ep = strings.TrimRight(ep, "/")
+	u, err := url.Parse(ep)
+	if err != nil {
+		return nil, fmt.Errorf("cdp: 非法调试地址 %q: %w", endpoint, err)
+	}
+	port := 0
+	if p := u.Port(); p != "" {
+		port, err = strconv.Atoi(p)
+		if err != nil {
+			return nil, fmt.Errorf("cdp: 非法端口 %q: %w", p, err)
+		}
+	}
+
+	client := &http.Client{Timeout: 4 * time.Second}
+	req, err := http.NewRequestWithContext(ctx, http.MethodGet, ep+"/json/version", nil)
+	if err != nil {
+		return nil, err
+	}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, fmt.Errorf("cdp: 调试端口未响应（%s）：请确认浏览器以 --remote-debugging-port 启动: %w", ep, err)
+	}
+	defer resp.Body.Close()
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("cdp: %s/json/version 返回 HTTP %d", ep, resp.StatusCode)
+	}
+	var ver struct {
+		Browser           string `json:"Browser"`
+		WebSocketDebugger string `json:"webSocketDebuggerUrl"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&ver); err != nil {
+		return nil, fmt.Errorf("cdp: 解析 /json/version 失败: %w", err)
+	}
+	wsURL := ver.WebSocketDebugger
+	if wsURL == "" {
+		wsURL = fmt.Sprintf("ws://%s/devtools/browser", u.Host)
+	}
+	return &Browser{port: port, attached: true, wsURL: wsURL}, nil
+}
+
+// Probe 只检查 endpoint 背后是不是一个可用的 CDP 调试端口（不做任何状态变更）。
+func Probe(ctx context.Context, endpoint string) error {
+	b, err := Attach(ctx, endpoint)
+	if err != nil {
+		return err
+	}
+	if b.wsURL == "" {
+		return fmt.Errorf("cdp: %s 未返回浏览器级调试地址", endpoint)
+	}
+	return nil
+}
+
+// OpenTab 在浏览器里开一个新标签页并返回 targetId。
+func (b *Browser) OpenTab(ctx context.Context, rawURL string) (string, error) {
+	ws, err := DialWebSocket(b.browserWSURL(), 10*time.Second)
+	if err != nil {
+		return "", fmt.Errorf("cdp: 连接浏览器级 WS 失败: %w", err)
+	}
+	defer ws.Close()
+	raw, err := ws.Call("Target.createTarget", map[string]any{"url": rawURL}, 10*time.Second)
+	if err != nil {
+		return "", fmt.Errorf("cdp: 新建标签页失败: %w", err)
+	}
+	var out struct {
+		TargetID string `json:"targetId"`
+	}
+	if err := json.Unmarshal(raw, &out); err != nil {
+		return "", fmt.Errorf("cdp: 解析 createTarget 结果失败: %w", err)
+	}
+	return out.TargetID, nil
 }
 
 // pageTarget 一个可调试的页面目标。

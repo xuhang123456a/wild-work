@@ -31,6 +31,8 @@
   --ch-officeace: #dc2626;   /* OfficeAce 华为中国红 */
   --ch-oczen: #475569;       /* OpenCodeZen 禅意石板灰 */
   --ch-cline: #15803d;       /* Cline 机器人深绿 */
+  --ch-comate: #d97706;      /* WPS Comate 琥珀橙（WPS 品牌色系） */
+  --ch-lingxi: #7c3aed;      /* WPS 灵犀 电紫（kdocs 灵犀助手品牌色系，与 comate 橙拉开 ΔE） */
   --ch-custom: #6366f1;      /* 自定义渠道兜底色（走黄金角自适应色，见 chColor） */
   --ch-kilo: #164e63;        /* Kilo 深冷松蓝 */
   --ch-minimax: #c2410c;     /* MiniMax 活力暖橙（海螺 AI 官方品牌橙，告别橄榄屎黄） */
@@ -101,9 +103,9 @@ body {
   gap: 8px 10px;
 }
 .pa-right .btn { justify-self: stretch; white-space: nowrap; }
-/* 摆位与列配对由 DOM 顺序（行主序）决定：同列上下 = 同渠道的国内/国际版
-   （WorkBuddyCN/WorkBuddyAI、QoderCN/QoderCOM），Cline 占第一行末位；
-   行数随渠道数增长（当前 18 渠道 + 自定义 = 3 行满格），不做固定行数限制。
+/* 摆位由 DOM 顺序（行主序）决定（R142：内建渠道按显示名字节序、自定义模型钉最末，见
+   provider.ChannelDisplayOrder）。6 列固定、行数随渠道数自然增长（当前 19 个按钮 + 自定义 = 3 行 + 2 格），
+   不再依赖「同列上下 = 国内/国际版」的列配对（那种配对与字母序规则冲突）。
    列数/顺序断言见 scripts/ui-static-check.mjs 与 index.html 内注释。 */
 /* 紧凑档：比标准按钮小两号（14px/8px14px → 12px/6px10px），
    PC 默认宽度下一行能放下 6 个渠道按钮（实测阈值见下方媒体查询注释）。 */
@@ -143,12 +145,20 @@ body {
 .btn.primary.alt.gemini { background: var(--ch-gemini); border-color: var(--ch-gemini); }
 .btn.primary.alt.codearts { background: var(--ch-codearts); border-color: var(--ch-codearts); }
 .btn.primary.alt.cline { background: var(--ch-cline); border-color: var(--ch-cline); }
+.btn.primary.alt.comate { background: var(--ch-comate); border-color: var(--ch-comate); }
+.btn.primary.alt.lingxi { background: var(--ch-lingxi); border-color: var(--ch-lingxi); }
 .btn.primary.alt.custom { background: var(--ch-custom); border-color: var(--ch-custom); }
 
 /* 智谱清言登录弹层步骤列表 */
 .glm-steps { margin: 4px 0 8px; padding-left: 20px; font-size: 13px; line-height: 1.9; }
 .glm-steps code { background: #f0f2f5; padding: 1px 5px; border-radius: 4px; font-size: 12px; }
 .glm-steps a { color: var(--primary); }
+
+/* Comate 扫码登录：二维码就地展示（服务端申请，不依赖桌面/浏览器） */
+.comate-qr-box { display: flex; justify-content: center; margin: 10px 0 6px; }
+.comate-qr { width: 180px; height: 180px; border: 1px solid var(--border); border-radius: 8px; background: #fff; image-rendering: pixelated; }
+.comate-qr-empty { width: 180px; height: 180px; display: flex; align-items: center; justify-content: center;
+  border: 1px dashed var(--border); border-radius: 8px; color: var(--muted); font-size: 13px; text-align: center; }
 .btn.danger { background: var(--danger); border-color: var(--danger); color: #fff; }
 .btn.danger:hover { background: #b91c1c; }
 .btn.small { padding: 5px 10px; font-size: 13px; }
@@ -260,6 +270,8 @@ body {
 .badge.gemini { background: var(--ch-gemini); }
 .badge.codearts { background: var(--ch-codearts); }
 .badge.cline { background: var(--ch-cline); }
+.badge.comate { background: var(--ch-comate); }
+.badge.lingxi { background: var(--ch-lingxi); }
 .badge.custom { background: var(--ch-custom); }
 
 .tag { font-size: 10px; padding: 2px 7px; border-radius: 10px; white-space: nowrap; }
@@ -1619,6 +1631,16 @@ select.input::-ms-expand, .select::-ms-expand { display: none; }
 }
 .fb-rule-head .pk-wrap { flex: 1 1 320px; }
 .fb-rule-head .pk-wrap > input { width: 100%; box-sizing: border-box; }
+/* 别名输入框：窄宽度、不换行占位（R87/R88 对齐纪律 + R90 不额外占行） */
+.fb-rule-head .fb-name-edit { flex: 0 1 150px; min-width: 110px; font-family: ui-monospace, Consolas, monospace; }
+/* 只读别名 chip：确认「这个名字客户端可直接请求」+ 复制按钮；无别名时整块不渲染 */
+.fb-alias-chip {
+  display: flex; align-items: center; gap: 6px; margin-top: 2px;
+  font-size: 12px; color: var(--muted);
+}
+.fb-alias-chip .fb-alias-txt { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; min-width: 0; }
+.fb-alias-chip code { font-family: ui-monospace, Consolas, monospace; color: var(--primary); }
+.fb-alias-chip .fb-alias-copy { flex: none; margin-left: auto; }
 .fb-rule-body .pk-wrap { flex: 1 1 auto; }
 .fb-rule-body .pk-wrap > input { width: 100%; box-sizing: border-box; }
 .fb-rule-body { margin-top: 6px; }

@@ -3325,7 +3325,7 @@ DeepSeek Harness 的 system prompt 正是以这句开头，于是经本代理转
 - 选插冠词的理由：语义扰动最小、改动可见可 review、不依赖不可见字符
   （全角空格会被 NFKC 折叠，抗归一化差）；`built on` 会换实词。
 - 同步更新 `internal/upstream/sanitize_test.go` 的逐字节快照护栏
-  （`sanitizeFeatures` 7→8 项、`sanitizeRewrites` 5→6 对），并新增 3 个回归用例
+  （`sanitizeFeatures` 7→8 项、`sanitizeStringRewrites` 5→6 对），并新增 3 个回归用例
   （改写生效 / 经 `PrepareBody` 落到 system content / 措辞相近的变体不得被误改）。
 
 ---
@@ -3415,7 +3415,7 @@ DeepSeek Harness 的 system prompt 正是以这句开头，于是经本代理转
   `internal/gateway/image_slim_test.go` 6 例、
   `internal/upstream/sanitize_test.go` 新增 3 例（改写生效 / 经 `PrepareBody` 落到
   system content / 措辞相近变体不得被误改）并同步逐字节快照护栏
-  （`sanitizeFeatures` 7→8 项、`sanitizeRewrites` 5→6 对）；
+  （`sanitizeFeatures` 7→8 项、`sanitizeStringRewrites` 5→6 对）；
 - `internal/server/handler_bodylimit_test.go` 改为基于变量断言（不写死 32MiB）。
 
 ## 🙏 致谢
@@ -3718,3 +3718,583 @@ DeepSeek Harness 的 system prompt 正是以这句开头，于是经本代理转
 | [@xxhhlk](https://github.com/xxhhlk) | PR #187：签到时间改就地时间选择器 |
 | [@zrtzrt](https://github.com/zrtzrt)（代码作者 reno） | PR #189：`/v1/models` 输出 `supported_parameters` 与 `reasoning.mandatory`（R124） |
 
+
+# wild-work v2.10.0
+
+本版新增 **WPS Comate 内建渠道**（第 22 条，R130）—— 支持**扫码登录**（无桌面 NAS 也能用）、
+本机浏览器接管与手工粘贴三条路（R131/R132），并修好「一个坏账号拖垮整条渠道模型面」（R133）；
+同时把**模型降级链**从「只能指定真模型」扩展成「可以起别名」（R129），另有粘性路由阈值可配（R127）、
+Loomy 短信发码判据修正（R128）、ZCode 出站身份结构修正（R125）与 OpenCodeZen 会话时间戳修正（R126）。
+
+对应决议 **R125 / R126 / R127 / R128 / R129 / R130 / R131 / R132 / R133**。
+
+> ⚠️ **自动更新仍不在本版**。PR #188 的更新引擎留在 `feat/auto-update` 分支，主线不含任何
+> 自替换二进制的代码；相关工作会在后续版本的架构重构里一并重做（签名校验、重启器与启动期自愈、
+> 预发布过滤、断点续传与空闲看门狗）。
+
+## 🆕 新渠道：WPS Comate（R130）
+
+WPS 网页版的模型代理（`comate.wps.cn`），模型面覆盖 GLM / DeepSeek / MiniMax / MiMo 等。
+
+**接入方式：三条路，同一份凭据纪律（R131/R132）。** 三条路都以「上游 `/models` 校验通过」为
+完成判据 —— **Cookie 出现 ≠ 登录完成**：WPS 未登录态也会下发预登录 Cookie，上游会回 401 `not_login`。
+
+1. **扫码登录（默认，NAS/docker 可用）**：点「＋ WPS Comate」面板里直接出二维码，用手机 WPS 扫码
+   确认即可。二维码由**服务端**向 `qr.wps.cn` 申请、Cookie 也在服务端换取 —— 全程不需要桌面、
+   不需要浏览器。二维码 110 秒自动换新，整体 5 分钟超时。
+2. **本机浏览器接管（有桌面的本机部署）**：在 `config.json` 填
+   `"login": { "comate_browser_cdp": "http://127.0.0.1:9222" }`，并用 `--remote-debugging-port=9222`
+   启动浏览器（Chrome 136+ 默认 profile 拒开调试口，需换 profile）。之后面板会显示该入口：它在你
+   **正在用的**浏览器里开一个 WPS 登录页，登录完自动读 `wps_sid`；结束后只断开连接，**不会关掉你的浏览器**。
+3. **手工粘贴（兜底）**：展开「手工方式」粘贴。裸值、`wps_sid=...`、整段 Cookie 请求头、DevTools
+   表格整行都能直接吃（`comate.NormalizeSID` 自己剥噪声）。
+
+- 凭据**只走 Cookie 头**，不发 `Authorization`（上游对 Bearer 返回 401）；`wps_sid` 无 refresh
+  机制，有效期到了重新走一遍上面任一条路（账号卡片上没有 ⟳ 重登按钮）。
+- **模型目录由上游 `/models` 动态下发**，本仓不改名、不过滤、不编造：上下文窗口、是否支持图片、
+  是否支持思考与档位全部按上游声明填（拿不到就留空，不猜）。
+- **上游没有余额查询接口** ⇒ 账号卡片的积分显示「不适用」，消耗改由每次回答的 `usage.credits`
+  逐请求累计（平台表「今日消耗」列以 `(精)` 标注）。
+- 积分按 WPS 账号计：多份 `wps_sid` 必须来自**多个独立账号**，同账号多份共享一份额度（面板会
+  自动识别并提示）。
+- 多账号池：一份 `wps_sid` 一个账号，可停用、可删除、可改名（粘错了直接删）。
+- 上游偶发用「mock 帧」（`chatcmpl-mock-*` / `"model":"mock"`）顶替真实回答表示该模型暂不可用。
+  这类帧必须在**写出任何字节之前**识别出来，归为「模型级不可用」——换号重试，不罚账号。
+- **模型目录不再被一个坏账号拖垮（R133）**：以前拉 `/models` 只抽一个账号，抽中未开通/失效的号
+  就把整条渠道的模型列表清空并写 5 分钟负缓存（实测加第二个 WPS 账号后 `comate/*` 9 个模型瞬间变 0）。
+  现在改为有界换号重试（最多试 3 个），全部失败才认渠道级失败。
+- **账号加完立刻可见（R131）**：以前「不适用」账号（无余额端点的渠道）默认收起，你亲手粘凭据加的
+  comate / cline / 自定义渠道账号也会被当噪声隐藏，看起来像「没加成功」。现在收起只针对工具自带的
+  虚拟账号（oczen / kilo）。
+
+## 🔀 降级链别名：给主力模型起个短名（R129）
+
+模型降级链原来只能填真模型 ID。现在每条规则可以带一个 `name`：
+
+```json
+"model_fallback": [
+  { "name": "gpt", "from": "workbuddy/deepseek-v4.1-flash", "to": "qodercn/glm-5.3-flash" }
+]
+```
+
+之后客户端直接请求 `gpt` 就等于请求 `workbuddy/deepseek-v4.1-flash`，降级链照旧生效。
+
+**别名是入口的糖，不是备胎链的一环**（三条硬边界）：
+
+1. 别名只解析「进来的模型名」，**不参与** `from → to` 的备胎顺序，也不会被当作降级目标。
+2. 别名**不**在用量榜/费率页独立成行——账本记的是主力模型的真名，否则同一个模型会被拆成两行。
+3. 别名不继承、不宣告任何能力：`/v1/models` 里它单独列一条并标 `alias`，能力字段照主力模型给。
+
+解析优先级：**降级链别名 → `model_map` 精确 → 通配 → `default_channel`**。
+别名在 Chat / Responses / Anthropic 三个接口都生效，`/v1/messages/count_tokens` 同样认。
+名字里不许出现 `/`、空白、逗号等会与模型前缀路由冲突的字符（保存时直接拒）。
+
+## ⚙️ 粘性路由阈值可配（R127）
+
+「连续成功多少次才换号」以前是写死的 50。现在可以在 `config.json` 里调：
+
+```json
+"server": { "sticky_max_requests": 50 }
+```
+
+- 调小（10~20）⇒ 消耗摊到更多账号上，但会话缓存命中率下降。
+- 调大（200+）⇒ 缓存亲和更好，代价是更长时间钉在同一个号上。
+- 填 `0` 或负数会记一条 `WARN config: server.sticky_max_requests=… invalid, fallback=50` 并回退默认值，
+  **不会改写你的配置文件**。
+- 改完需要重启；已经在跑的链路会按旧阈值跑到耗尽。
+- 它只决定**什么时候**换号，不决定**换给谁**——选号仍是「最早到期优先」（R112），不受影响。
+
+## 🔧 修正
+
+**Loomy 短信登录：按「响应里有没有 msgid」判成败（R128，PR #194）**
+旧实现拿上游信封的 `code` 去比对白名单（只认 `"0"` 和空串），而上游实际下发的是 `"000000"`
+（`desc="成功"`）⇒ 真实的「验证码已下发」被判定为失败，用户收到短信却提交不了。现在不再猜
+`code` 的取值约定，只看**响应里有没有 `msgid`**（顶层或 `data` 里都认，`msgid`/`msgId`/
+`msg_id` 等几种写法都收）。取不到才报错，并打出 `data_keys` / `raw_keys` 便于对照上游变化。
+同时 `msgid` 在服务端留一份，刷新页面、换会话都不会丢。
+
+**ZCode：出站 `system` 必须恰好 3 块（R125）**
+上游 Start Plan 准入按「三个 system 块」判定，多开第 4 块会被 `405 {"code":3012}` 拒掉。
+调用方自带的 system 现在合并进第 3 块末尾（缓存断点仍只打最后一块），并补上 `metadata.user_id`
+（`device_id` 与请求头 `X-Device-Mid` 同值）。
+
+**OpenCodeZen：`ses_` 里的时间戳必须落在近 30 天内（R126）**
+上游从 2026-10-25 起校验会话 ID 的时间合理性，超窗直接回 `429 FreeUsageLimitError`——和真实配额
+耗尽同一个报文，极难排障。旧实现从哈希直派生时间戳，落在 1970 年代，必然被拒。现在哈希只在
+「今日往前 30 天」的窗口内挑偏移，锚定 UTC 零点（同种子一天内稳定，保住 prompt cache 亲和）。
+
+**小浣熊测试夹具改为相对今日生成**
+`internal/raccoon` 的流水夹具写死了 2026-10-20 抓包的日期，到期时间一过，「在效发放」恒为 0，
+整个包变红。现在按 `time.Now()` 相对生成，不再有保质期。
+
+## 📚 文档
+
+- README / AGENTS.md / 配色规范统一渠道口径：`provider.BuiltinKinds()` 共 **22 条内建渠道**，
+  其中旧 Qoder 仅保留路由、界面已下线 ⇒ 面板可添加 **21 条**（以前三处分别写 20/21/22）。
+- `ui-static-check` 的配色断言改为从 `CH_CLASS` 派生数量，不再写死「21 个」——新增渠道时标签
+  不会与实际脱节。
+- README 移除交流群小节与二维码图片。
+- `config.example.json` 补 `login.comate_browser_cdp`；`docs/接口参考.md` 补 8 个 comate 登录端点；
+  README 常见问题新增「WPS Comate 怎么登录？没有桌面的 NAS 能用吗？」三条路径说明。
+
+## 🙏 致谢
+
+| 贡献者 | 内容 |
+|---|---|
+| [@happyshushushu](https://github.com/happyshushushu) | PR #192：WPS Comate 内建渠道（R130）；PR #195：扫码登录/本机浏览器接管/目录换号重试（R131–R133） |
+| [@jswh](https://github.com/jswh) | PR #193：模型降级链别名（R129） |
+| [@wzwjustdoit](https://github.com/wzwjustdoit) | PR #191：粘性路由轮换阈值可配（R127） |
+| [@ezjbc](https://github.com/ezjbc) | PR #194：Loomy 短信发码按响应证据判成败（R128） |
+
+
+# wild-work v2.11.0
+
+本版新增 **WPS 灵犀内建渠道**（第 23 条，R141）——与 Comate 共用同一份 `wps_sid` 但走**两段式**对话
+（先建 session 再 completions）、智点余额与每日签到都接通；同时把 **Comate** 从「查不到额度」补成
+真实额度/倍率/昵称（R135–R139，含扫码 CSRF+PKCE 与免费额度池）、修好**小浣熊 8 个模型的识图能力**
+（R140），并把 **DSH 指纹脱敏**从「能过」做到「覆盖所有已知句式」（R134）。
+
+对应决议 **R134 / R135 / R136 / R137 / R138 / R139 / R140 / R141**。
+
+> ⚠️ **自动更新仍不在本版**。PR #188 的更新引擎留在 `feat/auto-update` 分支，主线不含任何
+> 自替换二进制的代码；相关工作会在后续版本的架构重构里一并重做（签名校验、重启器与启动期自愈、
+> 预发布过滤、断点续传与空闲看门狗）。
+
+## 🆕 新渠道：WPS 灵犀（`lingxi/*`，R141）
+
+WPS 的 AI 办公助手（`lingxi.kdocs.cn`），**第 23 条内建渠道**。凭据与 Comate **共用同一份**
+浏览器 Cookie `wps_sid`（Bearer 实测无效），但两者是独立产品线：灵犀的额度叫「智点」。
+
+- **登录**：面板「＋ WPS 灵犀」→ 粘贴整段 Cookie 头即可（`wps_sid=…` 会被自动剥前缀；
+  裸值也能直接用），也支持本机浏览器 CDP 自动捕获。**`sid` 被校验通过（拉通 `plans`）才算加号成功**。
+  uid 带 `lxsid-` 前缀，与 Comate 账号互不串号。
+- **对话协议是两段式**：先 `POST /api/aigc/v3/assistant/sessions` 拿会话，再打
+  `…/sessions/<id>/completions`；**每个请求都新建会话**（同会话并发会被上游用 error 帧拒掉），
+  completions 还必须带三个专用头 `X-Cc-Version: 1` / `X-Client-Type: lingxi-web` / `X-Cc-Entrance: default`。
+- **多轮历史压成单串**：灵犀的 `question` 只有一个字段，故历史被拼成
+  `[System: …]` / `User: …` / `Assistant: …` 段落（最后一条 user 之后的消息丢弃），`max_tokens` 不透传。
+- **思考档位**：low→`"0"`、medium 与 high→`"1"`（上游只三档，拆分必丢档）、max→`"2"`、off/none→不发。
+  **默认档取「中间那档」**（2 档取低档，避免默认就「费智点」）。
+- **签到 + 余额**：每日签到 `POST /api/public/v1/tasks/daily_check_in/claim?date=YYYY-MM-DD`（日期在 query）；
+  余额 `GET /api/public/v1/credits/balance` → 基础智点 + 各赠送包（带各自到期日，面板按自然日分桶）。
+  面板结果如实分「领到 / 已领 / 还没发 / 失败」四档，不一律写「签到成功」。
+- **已知限制**：`reasoning` 帧实测未出现（即使 `effort="2"`）；连签天数按「领取前 +1」推算，可能差 1；
+  `plans` 的套餐权益不解析；无 `RefreshToken`/无保活，`sid` 失效只能重贴或重扫码。
+
+协议依据：[@KevinFX-code/magpie-wps-lingxi](https://github.com/KevinFX-code/magpie-wps-lingxi)（MIT，只取协议知识）。
+
+## 🛠️ Comate 五项修复（R135–R139）
+
+- **R135 「没有模型的账号」不进路由池**：个人号 `/models` 回 `code:0` + `items:[]`，加进来会让整条
+  渠道 100% 撞 mock 帧（账号还显示健康）。现在**加号即拦**（落盘后立刻 `Pool.Disable` 并把原因写进
+  面板警告），启动时还会异步巡检存量账号；账号卡片新增「已停用 · 原因」徽标，可手工启用。
+- **R136 真实额度与倍率**：R130 判「上游无余额端点」是**端点名猜错** —— 真实端点
+  `GET /llmproxy/v1/user/token-usage`（每日 `limit/remain/used`）+ `GET /api/coserve/v1/users/current`
+  （昵称/企业名）+ `/models` 的 `consume_ratio`（倍率）。面板不再显示「不适用」，昵称变成「昵称（企业名）」。
+  上游 `-1` = 该周期**没有额度**（不是用光），不会显示成 0。
+- **R137 扫码能确认却换不出 `wps_sid`**：缺的是 WPS 账号域的 **CSRF 双提交**（`csrf` Cookie + `X-CSRFToken`
+  头），旧实现还把上游响应体丢了、把「没走到校验」误读成「上游不肯发」；同批补上 **PKCE（S256）**，
+  失败时逐条回传上游原文。另修好「已扫码还会 110 秒换新码」导致面板卡在「已扫码，请确认」。
+- **R138 双额度池**：每日额度之外还有**免费额度（试用包）**（`/api/coserve/v1/billing/v3/credits/trial`
+  的 `trial_info`，`value/consumed` 是 scale=3 原始值，必须读 `precision`）。每日为 0 时回退免费额度，
+  明细里两者并列不顶掉。
+- **R139 目录外模型 id 回 400 而不是 404**：404 被归成「账号错误」⇒ 换号 + 记错误 ⇒ 两号各两笔后
+  **整条渠道冷却**（真机自伤事故）。这是纯本地判定、上游一次都没碰，改回 400 后「不换号、不罚号、
+  直接告诉调用方」。**本版把同一坑在灵犀渠道一并堵上**（R141）。
+
+## 👁️ 小浣熊识图能力按实测校正（R140）
+
+`/v1/models` 曾把 `raccoon-19b265`、`raccoon-405a1c` 标成纯文本，静态兜底表反过来把 `sn-glm-5-3` 标成可识图。
+本版用**真实链路 A/B 实测**（240×140 PNG data URI，无图对照先排除「按提示猜答案」）确认 **8 个可识图模型**，
+`sn-glm-5-3` 明确回「当前纯文本模型不支持 `image_url`」故移除误标。
+`SupportsImages` 改为 **上游 `vision` tag ∪ 实测表**，上游漏标也不会再让客户端隐藏上传入口。
+
+## 🎭 DSH 指纹脱敏补全（R134）
+
+预检表改为**全小写 + 自写零分配折叠匹配**（不用 `strings.ToLower`），并补上此前漏掉的三条句式：
+
+- **DSH 身份句**：用正则容忍 `the` / 空格与连字符 / 大小写差异，命中后**整句替换**成中性的
+  「官方 CLI 工具」表述，让品牌串从 `system` 里彻底消失（而不是只改其中一个词）。
+- **`@` 引用约定段**：只改后半句（`Relative paths` → `The relative paths`）；前半句单独出现**不是**指纹，
+  改了反而制造新指纹。
+- **`11-128` 错误码**：改写串用 **U+2011 非断行连字符** —— ASCII 同形会让「改前 == 改后」空转。
+- 新增**整包兜底** `sanitize.BodyFallback`（仅命中才重编码，接在两区 `PrepareBody` 的 `sanitize.Messages` **之后**）
+  与**拦截诊断**：被内容审核拦下时把 `system` 开头若干字符落 `data/blocked/`（滚动留 3 份）并打 `[diag]`
+  日志，配套 `scripts/bisect-blocked.py` 做分层重放二分（默认封顶 24 次请求，守 §0.1 的最小上游请求纪律）。
+
+## 🔧 修正
+
+- 内置渠道配色新增 `--ch-lingxi`，23 个渠道两两不同色（最小 ΔE2000 6.1，灵犀 vs QoderCOM）。
+- `dist/wild-work.exe` 已本地重建（CI 只产出带平台后缀的产物）。
+
+## 📚 文档
+
+- `AGENTS.md` / `docs/决议项.md` 新增 R134–R141；渠道清单与口径从 22 条同步到 **23 条内建**（可添加 22 条）。
+- `docs/渠道接入备忘.md` 新增灵犀章节（两段式对话、三专用头、SSE 9 帧、签到与余额端点、`lxsid-` uid 前缀）。
+- `docs/接口参考.md` 增补 `POST /api/login/lingxi_sid`。
+- `README.md` 致谢表新增 `magpie-wps-lingxi`。
+
+## 🙏 致谢
+
+本版包含 4 个社区贡献（均已合入 master 并保留作者署名）：
+
+| 贡献者 | 内容 |
+|--------|------|
+| [@happyshushushu](https://github.com/happyshushushu) | PR #200：DSH 指纹脱敏补全（R134）；PR #197：小浣熊识图能力实测校正（R140）；PR #199：Comate 额度/空目录账号隔离/扫码 CSRF+PKCE/免费额度池（R135–R139） |
+| [@ezjbc](https://github.com/ezjbc) | PR #198：WPS 灵犀内建渠道（R141） |
+
+以及 [@C3H3-AI](https://github.com/C3H3-AI) 的 PR #196（DSH `@` 引用约定段脱敏）——其结论已被
+PR #200 的完整重写覆盖（且两者对「前半句该不该改」的判断相反，以真机 A/B 为准），本版不重复合入，
+仍致谢其先行定位。
+
+
+# wild-work v2.11.1
+
+小版本，只有一件事：**面板上的渠道顺序统一成一条规则**（R142）。
+
+## 🔀 渠道展示序统一（R142）
+
+内建渠道按**显示名的 Unicode 码位序**（即 UTF-8 字节序）升序排列，**自定义渠道硬编码钉在最末**
+（同组内按渠道标识升序）。账号卡片、积分汇总条、费率 tab、主工具栏渠道按钮——四处现在同一顺序。
+
+排出来的实际顺序：
+
+```
+Cline → CodeArts → Gemini → Kilo → LobsterAI → Loomy → MiniMax → MonkeyCode
+→ OfficeAce → OpenCodeZen → Qoder → QoderCN → QoderCOM → TraeCode → TraeWork
+→ WPS Comate → WPS 灵犀 → WorkBuddyAI → WorkBuddyCN → ZCode
+→ 千问办公 → 小浣熊 → 智谱清言 → [自定义渠道…]
+```
+
+不用拼音序：拼音表是额外依赖 + 又一份要人工维护的真源，而码位序自带稳定定序，
+中文名因码位高天然排在最后（`WPS 灵犀` 也就自然落在 `ZCode` 之前）。
+细节三处：`WPS Comate` 在 `WPS 灵犀` 之前（`C` < `灵`）；`WorkBuddyAI` 在 `WorkBuddyCN` 之前（`A` < `C`，
+按**显示名**比而非渠道标识）；`TraeCode` 仍无独立按钮（随 TraeWork 绑定），`Kilo`/`OpenCodeZen`
+免密无账号、旧 `Qoder` 已下线，三者不占按钮位。
+
+## 🧹 顺带清掉四处重复的顺序表
+
+顺序此前散在四处各自维护：`channelOrder`（16 项手工编号）、`feeChannelOrder`（22 项手工列表）、
+`app.js` 的 `CH_SUMMARY_ORDER`（23 项手写数组）、`index.html` 的按钮 DOM 序。每加一个渠道要人工
+同步四处，**漏一处没有报错**——轻则汇总条把该渠道按字母序垫到最末，重则费率面板根本不出现该渠道
+tab（`buildFeesChannels` 只遍历 `feeChannelOrder`，Cline 接入时踩过）。
+
+现在真源只有一个：`internal/provider` 的 `DisplayNames`（显示名）+ `ChannelDisplayOrder`（按名字
+字节序现算）；`app.js` 的 `CH_SUMMARY_ORDER` 改为由 `CH_LABEL` 派生，不再手写。
+新增渠道只需补 `CH_LABEL` 一行，顺序自动归位。
+
+## 🛡️ 防漂移护栏
+
+`scripts/ui-static-check.mjs` 新增三条**跨语言**断言（它会直接读 Go 源码）：显示名 Go/JS 逐项一致、
+汇总条顺序与 `ChannelDisplayOrder` 逐项同序、`CH_SUMMARY_ORDER` 必须派生不得手写。原「按钮顺序 =
+6 列列配对」的硬编码正则已删除，改为「从 `alt <短类名>` 还原渠道 key，断言按显示名字节序 + 自定义垫底」。
+
+回归：`TestDisplayNamesCoverAllBuiltins` / `TestDisplayNameFallback` / `TestChannelDisplayOrderIsByteOrder` /
+`TestChannelDisplayOrderSpotChecks` / `TestFeeChannelOrderFollowsDisplayOrder` / `TestSortChannelsByOrderCustomLast`；
+`TestFeeChannelOrderCoversAllKinds` 的判据也从手写 14 项改为遍历 `ChannelDisplayOrder`（原先漏补等于该渠道
+从未被校验）。四处变异（交换按钮 / 改显示名 / 排序改回按 kind / 回退手写数组）均已确认变红。
+
+## 📚 文档
+
+- `AGENTS.md` / `docs/决议项.md` 新增 R142（渠道展示序的唯一规则与四条已知限制）。
+- `README.md` 渠道序说明同步改为字母序 + 自定义垫底。
+
+## 已知限制
+
+- 按钮顺序不再保证「同列上下 = 国内/国际版」配对：`WorkBuddyCN`/`WorkBuddyAI` 现在相邻但不上下，
+  窄屏 `auto-fit` 重排后列位置本就随机。
+- 排序键是**显示名**而非渠道标识，故改显示名会带着改顺序（这是刻意的：面板上看到的顺序跟着名字走）。
+- 旧 `Qoder` 仍是内建渠道、有显示名，落在字母序的「Q」位置，账号卡片只为存量账号保留它。
+
+
+---
+
+# wild-work v2.11.2
+
+累积版本：合并 8 个外部 PR（含两个 CodeArts 老问题的根因修复）、修好 issue #210 的「无签到渠道被
+显示成签到失败」、把粘性路由与速度口径各推进一层。
+
+对应决议 **R143 – R150**。
+
+## 🆕 CodeArts 三处根因修复（R143 / R144 / R145）
+
+三个都是「看起来像随机故障、其实每次都必然」的老问题，均由外部 PR 提交并合并：
+
+- **R143 工具调用能用 / 不能用取决于模型在不在 builtin 目录**：`maas_type` 头被无条件签成
+  `benefit`，而它其实只在模型**不在**上游 builtin 目录时才该发。硬编码的 `staticBenefit` 名单把
+  「目录里有这个模型」当成了「本账号有通道权益」，于是每个请求都多签一个头，上游回
+  `InferHub.4004.200 benefit not found`（HTTP 200 + 流内 error 帧，不是 400）。
+  现在按官方客户端（26.10.0 解包 `extension.js` 的 `isCurrentModelBenefitType`）的判据走：
+  builtin 命中 ⇒ 恒不发，否则查 `gatewayConfig.models` 取 channel 名。
+  顺带：上游声明「本账号用不了」的模型（`81009.404` / `002002009`）会**持久**从 `/v1/models` 摘除
+  （落独立文件 `data/models-codearts.json`，重登才清空），并挂到目录拉取与 `/v1/models` 两处出口。
+
+- **R144 `deepseek-v4-(flash|pro)` 的工具调用 100% 失效**：这两个模型返回
+  `finish_reason=stop` + 纯文本 `content`，里面是 `<|DSML|tool_calls>` 语法，**没有 `tool_calls` 字段**。
+  全仓库此前只有「注入」的一半（剥 tools、把 schema 写进 system 提示），**零解析函数**。
+  关键实测：跳过注入、只给标准 `tools`，模型照样输出 DSML 文本（reasoning 里明写「使用 DSML 语法」）
+  ⇒ 这是模型的固有输出行为，解析器是唯一出路。新增流式跨帧两态状态机 + 聚合双路径，统一转成
+  标准 `tool_calls`。**实机发现的真 bug**：21 个工具时上游开标签是 `<|DSML|tool_calls|`（末尾 `|`
+  而非 `>`），正则必须容忍两种终止符，否则整块原样透传、工具调用照样失效。
+
+- **R145 每次重启后前 2~3 次对话 200、之后连续 400**：`TM.00001041 并发会话数已达上限(3个)`。
+  上游按 `user-session-id` 计坑位，而**对话流结束不会自动释放**，唯一释放手段是官方
+  `ChatSessionHeartbeat`。两个缺口叠加：`sessionIDs.headers()` 从不发 `user-session-id`
+  （被「官方空值头一律不发」的裁定误伤），且全包零心跳调用。现在 chat 与心跳都带该头（必须
+  **签名后追加**，进 canonical 会 `401 APIG.0301`），并在响应读完（EOF）**或提前 Close** 时发一次
+  idle 心跳归还坑位 —— 挂 Close 是关键：handler 收到 `[DONE]` 就 Close、永远走不到 EOF。
+
+## 🔀 粘性路由让位于「今天到期」的账号（R146）
+
+现象很反直觉：某账号状态完全健康、积分 3500（含 100 分当天 09:50 到期），当天却只承载 3 次请求，
+另一个号承载 31 次。根因是粘性路由打满 50 次才换号，低流量下这 50 次横跨约 9 小时，
+**「最早到期优先」只在选新号时生效，粘性记录一在就被架空**。
+
+现在命中粘性后会追加一道让位判定：池内最优账号「今天到期」而粘性账号「今天不到期」⇒ 清粘性、
+改钉最优账号（后续继续粘在它上面，直到阈值或不健康）。两个都今天到期时**不让位**——否则请求会在
+两者间来回互抢。
+
+## 📊 面板「速度」改为最近 60 秒滑动窗口（R147）
+
+旧口径 `Σ completion_token ÷ Σ 生成耗时`（生成耗时 = 总耗时 − TTFB）有两处独立错误：分母把排队与
+prefill 整段排除（请求越长虚高越严重）、单请求比值是标量时间平均（无法表达「某一秒吐了多少」）。
+
+生产实测差得离谱：raccoon 27 样本旧口径 **101.9** vs 端到端 **28.6 tok/s（夸大 3.56×）**，
+workbuddy 235.8 vs 120.4，traecode 81.6 vs 44.8；最极端单请求面板显示 **309.5 tok/s**、实际 **2.8**。
+裸 socket 分层计时还证明**帧是成批突发到达的**（59 帧里 48 帧挤在 11 次 recv 内）⇒ 任何「单请求平均」
+都表达不了瞬时速度。
+
+现在速度 = 最近 60 秒窗口内投递 token 合计 ÷ 60，按秒分桶；请求日志单行的 `tok/s` 改为**端到端**
+口径（含排队与首字节）。旧口径整条删除（不留任何能回到它的残留）。窗口无样本显示「—」，
+非流式请求不产生速率样本。
+
+## 🐛 无签到渠道不再显示「签到失败」（R150，issue #210）
+
+qwenwork / kilo / oczen 等**没有签到活动**的渠道，卡片长期红「签到失败」，但积分照常到账。
+三个叠加根因：① 前端徽标判据顺序反了（先看时间戳再看 `noCheckin`）⇒ 灰色「无签到」分支**永不可达**；
+② `SetCheckinTimes` 无条件把全局签到时刻广播给**所有**调度器，用户在面板改一次签到时间，
+七个刻意配成「无定时任务」的渠道就获得签到任务、每天空跑必然失败的桩；③ `finishCheckin` 只认
+`ActivitiesOnly`（「仍调用但不记录」的活跃保活语义），与「本渠道根本没有签到任务」不是一回事。
+
+现在：签到时刻只推给声明 `FollowGlobalCheckin` 的 12 个渠道（**Qoder 双区故意不跟随**——它用上游
+固定 10:00 窗口），无签到时刻的渠道既不落盘也不上报观察者，前端 `noCheckin` 优先。
+
+## 🔧 其它修复
+
+- **R148 raccoon 出站身份对齐官方 box-agent**（issue #208）：UA 改为 `AsyncOpenAI/Python 2.8.0` +
+  6 个 `X-Stainless-*` + 5 个 `x-client-*` + 2 个 `X-RACCOON-*`，会话 ID 按「账号+模型」稳定复用
+  （24h 轮换）；429 透传补 `Retry-After: 60`。**说明**：能证明的是「出站形态与官方一致」和
+  「会话不再高频新建」，**不能证明**上游闸门认这套身份——「补头即解限」属推断，未复验。
+- **R149 Anthropic 入站工具结果顺序**：Claude Code 把 `tool_result` 与新指令放在同一条 user 里时，
+  旧实现把文本 prepend 到最前，出站变成 `user → tool → tool`，WorkBuddy 回 `code 11148`
+  「tool calls and tool results do not match」、qoder 系只回 `Error in upstream response`。
+  语义相同、只改消息边界就 400↔200 翻转（5 种组合 A/B 全部验证）。现在文本/图片一律 append 到
+  工具结果之后。
+- **loomy 凭据改远期 `expiresAt`**：该渠道没有 refresh 端点，旧的 0 值让 `NeedsRefresh` 恒真、
+  反复刷新必失败并触发冷却。改为 +50 年哨兵 + 启动自愈。
+- **OfficeAce 登录锁泄漏**：`StartOfficeAceLogin()` 成功路径漏 `muOALogin.Unlock()`，导致
+  status/cancel/start 三个接口永久阻塞。改为 defer 释放。
+
+## 📚 文档
+
+- `AGENTS.md` / `docs/决议项.md` 新增 R143–R150（含证据链、落选方案与已知限制），范围标记同步。
+- PR #209 的决议与 #201 撞号，按 R123 纪律顺延为 **R149**（master 的号永不重排，PR 的条目一律
+  改写成 master 当前最大号 +1）。
+
+## 已知限制
+
+- **R148 的「解限」结论是推断**：见上，未做上游闸门复验。
+- **R145 的坑位过期周期**只测得「约 3 分钟量级」，未逐分钟二分。
+- **R147 的按秒分摊**隐含「帧内 token 数近似均匀」，该假设未经对照实验验证（属推断级判据）；
+  仍在进行中的请求不进窗口，窗口最长滞后该请求时长（约 ≤60s）。
+- **R146 的到期信息**来自 10 分钟一次的额度刷新，快照可能滞后一个刷新周期；两个账号都今天到期时
+  保持粘性，若粘性账号到期更晚仍可能损失另一账号的额度（刻意用「不抖动」换该风险）。
+- **R143 的模型摘除是按账号记的**：同一账号权限恢复只能靠重新登录；若上游换成新的「不可用」错误码，
+  需要补进 `modelUnavailableMarkers`。
+- **R144 的 DSML 解析**依赖与注入模板逐字一致（改模板必须同步改正则）；`string="false"` 的真实
+  响应形态未逐字核对。
+
+# wild-work v2.11.4
+
+本版包含两项独立改动：**R112b**（面板临期口径恢复可配）与 **R151**（脱敏判据重验，合并 PR #214）。
+
+---
+
+## 一、面板「临期」口径恢复为可配（R112b）
+
+对应决议 **R112b**（部分回滚 R112 / R18）。
+
+### 🔧 「积分汇总」的临期口径恢复为可配（R112b）
+
+**现象**：面板「积分汇总」几乎看不到任何渠道的临期额度，但同一页「运行统计」明明显示好几个渠道
+有 24 小时内到期的积分（`expire_tomorrow=385`、`expiring_7d=8057`）。实测 29 个账号里只有
+officeace 一个非零（其「每日签到有礼 100」今晚 23:59:59 失效），其余全 0。
+
+**根因**：v2.9.4 的 R112 在把选号改成「最早到期时刻优先」的同时，顺手把**展示窗口**固定成
+`provider.ExpiringDays = 1` 并按**自然日**分桶（今天算第 1 天）。而 traework / workbuddy 的每日
+签到包形态是「每天 05:47 发、次日 05:47 到期」——上午 9 点看，最近一笔永远落在「明天」这个
+自然日，于是**一天里大部分时间汇总条必然恒空**。运行统计走的是三桶（今日 / 明日 / 7 日内）
+逐条目累加，所以同一批额度在那边可见。
+
+**现在**：设置弹层恢复「临期口径」下拉，三选项与运行统计三桶**同口径**：
+
+| 选项 | 含义 | 对应运行统计列 |
+|------|------|----------------|
+| 1 日（默认） | 今日到期（次日 00:00 失效算今日） | 「今日到期」 |
+| 2 日 | 今日 + 明日 | 「今日到期」+「明日到期」 |
+| 7 日 | 未来 7 个自然日内到期 | 「7 日内到期」 |
+
+> 1 日对齐的是「今日**到期**」而不是「今日作废」——后者是往回看的账本口径（今天已经过期消失的额度，
+> 见运行统计「今日作废」列），方向相反，两者不可相减。
+
+- 配置项 `schedule.expiring_days`（1/2/7）；非法值只在内存回退默认并记 `WARN config: schedule.expiring_days=`，
+  **加载时不写盘**（老配置缺字段就用默认值，不产生配置漂移）。
+- `POST /api/config/expiring_days` 保存后**立即刷一轮积分**，面板当场生效；当前值随 `/api/state` 下发回显。
+- **仍然不参与选号**：R112 的核心不变量一字未改——选号判据只有 `provider.EarliestExpire`（最早到期
+  时刻升序 → 同到期时刻按 uid ASCII 升序 → 无到期信息者垫底按余额降序）。本项只恢复**纯展示口径**。
+- 两处写回 `expiring` 的路径都取运行期配置（`creditSnapshot` 与签到路径）；漏改后者会让面板数字在
+  下一次签到后悄悄跳回旧窗口。
+
+### 📚 文档
+
+- `AGENTS.md` / `docs/决议项.md` 新增 **R112b**，并在 R18 / R112 行标注「展示窗口这一半已被 R112b 恢复、
+  「不参与选号」这半边仍由 R112 决定」。
+- `docs/接口参考.md` 补 `POST /api/config/expiring_days`。
+- `config.example.json` 的 `schedule` 段补 `"expiring_days": 1`。
+
+### 已知限制
+
+- 改口径会触发一轮 `RefreshAll()`（每账号一次余额端点，与常规 10 分钟刷新同源同量级），不是新增探测。
+- **Gemini 不受影响**：它不在 `StartCreditAutoRefresh` 的 kinds 里（其 `UserResource` 恒 0、配额窗口以
+  `InfoOnly` 呈现），集合永远为空 ⇒ 配多少都是 0。
+- 历史 `state-*.json` 里的 `expiring` 值不重算（下一次刷新/签到自然覆盖，不改写历史快照）。
+- 手改 `config.json` 仍需重启；面板改则立即生效。
+
+---
+
+---
+
+对应决议 **R151**（推翻 R134 的六处清洗策略，R115 的「两份表同步」纪律保留）。
+
+## 二、脱敏层收敛：判据重验 + 停用失效规则 + 删整包兜底（R151）
+
+外部 PR #214（作者 wzwjustdoit）用真机探针重新验证了 WorkBuddy 国内版的上游审核判据，
+发现 R134 那一版清洗策略有六处问题，其中两处会伤到用户内容：
+
+- **语义自相矛盾**：DSH 身份句被替换成「You are Claude Code, Anthropic's official CLI tool for Claude」，
+  可后面几行还写着 DeepSeek 模型、DSH Web GUI —— 模型自我认知直接错乱。
+- **篡改用户内容**：`BodyFallback` 对整包做「DeepSeek Harness → Claude Code」替换，
+  连用户贴的日志、`DeepSeek Harness implementation checkout` 这种正常文本一起改。
+- 另有四处：预检表混入本表自己的改写产物 `11-128`（上游从不匹配，白跑净化）、
+  裸 `11128` 实测不拦却静默改写用户回显、两层改写（先插冠词 the 再由正则整句替换）叠加难维护。
+
+**判据重验结论**（真机探针 33 + 6 + 1 发，另 41 发角色维度复测；探针默认 SKIP，
+须 `WB_PROBE_UID` 指定专用小号才跑，遵守 §0.1 不碰主力账号池）：
+
+| 判据 | 结论 |
+|------|------|
+| DSH 身份句（大小写不敏感）、DSH 跨句 @ 路径、Claude Code 身份句、Main branch、字段反馈句、billing 键值 | **仍拦** |
+| Codex 首段 | **收紧为前缀锚定**（旧改写「CLI tool」仍 400） |
+| 裸 `11128`、DSH Web GUI 段、billing 裸键名、`tools[]` 品牌串 | **已失效** |
+| 角色维度 | **扫 system 与 assistant，不扫 user/tool/function** |
+
+**修法**：
+
+- DSH 身份句改写为 `You are an AI agent powered by DSH`（**缩写而非跨品牌替换**，后文 DSH 关键词一致）；
+- Codex 首段 `in → within`；ACP 路径句 `resolve from → are resolved from`；
+- 失效规则**注释停用**而非删除（保留原判据与停用日期，将来复活必须先跑探针）；
+- **`BodyFallback` 连同 `bodyDSHRe` 与两处 `PrepareBody` 接线一并删除**；
+- 结构化清洗**跳过 `user`/`tool`/`function`**，`system`/`assistant` 继续清洗；
+- 没有任何规则真正生效时**不再 `TrimSpace`**（预检可能因裸键名变体命中却无改写，
+  白改首尾空白就是破坏不变量 16）。
+
+**回归**：两套平行表（`internal/sanitize` 与 `internal/upstream/sanitize`）逐字节快照同步
+（`features 13→9` / `rewrites 7→5` / `regexes 6→5`），并新增**直接 parity 守卫**
+（不再只靠「两条臂都过生产表」的间接断言）+ 6 条「停用规则不得复活」护栏；
+新增真机探针两个文件（默认 SKIP）。`go build ./... && go vet ./... && go test ./...` 全绿。
+
+### 📚 文档
+
+- `AGENTS.md` / `docs/决议项.md` 新增 **R151**，索引表与文档标题范围标记同步到 `R1–R151`。
+- R115 / R134 的正文里 `rewrites` 相关命名同步为 `sanitizeStringRewrites`（原表已改名）。
+
+### 已知限制
+
+- 上游判据是**黑盒快照**，会随上游改版漂移；复活任何停用规则前必须用探针重验（`WB_PROBE_UID`）。
+- 实测只用了**单个小号**，未排除账号灰度差异。
+- `tool_calls.arguments` 的行为沿用旧结论，本轮未重验。
+- `BodyFallback` 删除后，`tools[].function.description` 这类非 messages 字段里的品牌串
+  不再被清洗——探针实测该形态上游已放行，若日后再次拦截需重新加回结构化清洗（而不是整包替换）。
+
+---
+
+---
+
+# wild-work v2.11.5
+
+## 一、OCZen 免费档恒 429 的根因：TLS ClientHello 指纹（R152–R155）
+
+`oczen/*` 全部模型对话恒返回 `429 FreeUsageLimitError`，而 `/inference/v1/models` 仍是 200。
+决定性实验（同一份请求体、同一分钟、同一出口）把五类客户端分别打到上游：
+
+| 客户端 | 结果 |
+|--------|------|
+| Go 默认 Transport（HTTP/1.1） | 429 |
+| Node `https.request`（OpenSSL） | 429 |
+| Chrome 同源 `fetch`（HTTP/2） | 429 |
+| uTLS `HelloChrome_133` 预设 | 429 |
+| **uTLS 复刻官方 Bun ClientHello** | **200 + 真实 SSE** |
+
+⇒ 上游判的是 **TLS 指纹**，不是请求体/头/路径/会话 id/HTTP 版本。修法：
+
+- 新增依赖 `github.com/refraction-networking/utls`，内嵌官方 CLI（Bun 1.4.4）的
+  ClientHello 原件（1502 B），每条连接重新解析成 spec 后 `HandshakeContext`；
+- 自加 10s 握手超时（`net/http` 的 `TLSHandshakeTimeout` 管不到自定义 `DialTLSContext`）；
+- 诊断开关 `OCZEN_NO_FINGERPRINT=1` 退回 Go 原生（可复现 429）。
+
+同时把请求体整形层对齐**官方 OpenCode 2.2.5 本机抓包**：官方 12 工具（无 `patch`）、
+官方 system prompt 与 `<env>` 块的原位、UA `opencode/latest/2.2.5/cli`、恢复 `Accept: */*`、
+`x-opencode-project` 按工作区稳定派生；客户端自带工具一律改名 `clint_*` 并在响应侧还原。
+
+### 已知限制
+
+- 内嵌的 ClientHello 与官方 prompt/工具集都是**快照**，上游换客户端或换白名单后必须重新抓取。
+- 未实证上游是「按 JA3 白名单」还是「按 Bot score 里的其它信号」——只实证了结果面（复刻即 200）。
+- 新增依赖（utls / x/crypto / x/sys / klauspost-compress / brotli）会让二进制变大。
+
+## 二、退出路径补上刷新收尾（R112b 补强）
+
+`POST /api/config/expiring_days` 之后是异步 `RefreshAll()`。它会在后台重新创建 `data/` 目录并写
+ledger/stats 文件，而 `App.Close()` 原先不等它收尾 —— Windows 上表现为测试/退出时
+`RemoveAll cleanup: ... directory is not empty`，面板侧则可能留下半截 `state.json`。
+现在 `Close()` 先 `waitRefresh(5s)`，并用 `closed` 标志堵住「goroutine 还没被调度就 Close」的窗口。
+
+## 三、测试健壮性
+
+- R146 粘性让位用例的到期时刻不再写死成 `now.Add(Δ)`，改由桶判据反推（`todayExpiry` /
+  `tomorrowExpiry`），并新增逐分钟扫 1440 个 `now` 的守卫（PR #216）；
+- `TestSetListenRequiresPassword` 改用系统分配的空闲端口，不再写死 17864（与并发/重跑抢端口）；
+- 新增 `internal/app/close_refresh_test.go` 锁住「Close 等在跑的刷新收尾」。
+
+# wild-work v2.11.6
+
+## DSH / WorkBuddy 脱敏（PR #219，issue #218）
+
+- 补充 DSH 品牌串的结构化脱敏：在适用的 system/assistant 文本中将 `DeepSeek Harness` 缩写为 `DSH`，不改写 user/tool/function 消息，也不做整包替换。依据 PR 附带的线上被拦请求重放；本次合并未重新向上游发起探针。
+- 新增工作目录 `sanitize.toml`：首次启动生成模板，可按国内版/国际版分别追加特征词、字面改写和正则规则；改动后须重启。配置解析问题写入同目录 `sanitize.log`，内置规则始终保留。
+- 合并评审补强：配置文件实际读取限制为 1 MiB；自定义规则若把工具参数改成非法 JSON，则跳过该参数改写，并增加两渠道回归测试。
+
+## MonkeyCode 402（PR #220）
+
+上游 HTTP 402「积分已耗尽」归类为 `hard_credit`，交由现有账号冷却与模型降级链处理，而非当普通透传错误。429 仍维持模型级软限流分类。
+
+## 合并前已进入 master 的修复
+
+- 临期预测区分余额下降与当日作废，修复「已耗尽却预计仍作废」的矛盾显示（PR #217）；花费与作废来自不同采样链路，预测为估算值。
+- 积分流水月末保留期修正；同账号 refresh 单飞；小浣熊到期发放记录取数与余额归属修正；千问办公网页登录改走设备授权流；Loomy 余额字段全缺时不再伪装为零。
+
+## 已知限制
+
+- `sanitize.toml` 只追加规则、不覆盖内置规则，不自动补特征预检；填写错误只记日志并跳过相应条目。配置修改需重启。
+- DSH 规则随上游审核变化可能失效；脱敏文本若涉及工具调用参数中的路径/命令可能改变其语义，复杂配置应先离线测试。
+- 临期预测不能逐笔还原发放、消费与过期：同一采样窗口内相抵的金额可能导致花费被低估。

@@ -17,6 +17,8 @@ import (
 	"wild-work/internal/auth"
 	"wild-work/internal/idle"
 	"wild-work/internal/provider"
+	"wild-work/internal/sanitize"
+	"wild-work/internal/upstream"
 )
 
 // Client 国际版上游 HTTP 客户端。Base 可覆盖以便测试。
@@ -324,8 +326,15 @@ func (c *Client) chatStreamOnce(a *auth.Auth, prepared []byte, conv, turn string
 		cancel()
 		raw, _ := io.ReadAll(io.LimitReader(resp.Body, 1<<20))
 		resp.Body.Close()
+		kind := Classify(resp.StatusCode, string(raw))
 		log.Printf("workbuddyai chat_stream uid=%s: upstream %d %s body=%s",
-			a.UID, resp.StatusCode, Classify(resp.StatusCode, string(raw)), truncate(string(raw), 200))
+			a.UID, resp.StatusCode, kind, truncate(string(raw), 200))
+		// diag：渠道指纹拦截时落盘 prepared body（零 token 口径：body 不含凭据头），
+		// 与 internal/upstream.ChatStream 同形。仅 ErrContentBlocked，正常请求零 IO。
+		if kind == provider.ErrContentBlocked {
+			log.Printf("[diag] content_blocked system_head=%q", sanitize.SystemHead(prepared, 120))
+			upstream.DumpBlocked(prepared)
+		}
 		return nil, resp.StatusCode, raw, nil
 	}
 	// 成功分支：cancel 所有权交给 idle.Monitor（其 Close 会 cancel；静默超时也会 cancel）。

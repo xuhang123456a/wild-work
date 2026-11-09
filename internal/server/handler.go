@@ -61,6 +61,17 @@ type Runtime struct {
 	//   - 其余分类：统一不罚账号（ErrHardCredit 无余额概念、ErrSessionDead 不可重登）。
 	SingleAccount bool
 
+	// ModelFilter 模型目录的**出口过滤**钩子（nil = 不过滤）。
+	//
+	// 为什么需要它：本结构自带 models 缓存（dynamicModelsTTL = 1h），而渠道内部的
+	// 目录缓存是另一层（如 codearts 的 catalogTTL）。渠道把某个模型标成不可用时，
+	// 只能清自己那层，**碰不到这里的 rt.models** ⇒ 被摘除的模型最长还会继续列出 1 小时
+	// （线上实测 2026-10-26：摘除记录已落盘，/v1/models 仍显示）。
+	//
+	// 故把过滤收敛到唯一出口：本字段在「缓存命中返回」和「新拉取写入」两条路都要过一遍。
+	// 由渠道装配层注入（当前仅 codearts），server 不需要认识具体渠道。
+	ModelFilter func([]provider.ModelInfo) []provider.ModelInfo
+
 	mu       sync.RWMutex
 	models   []provider.ModelInfo
 	fetched  time.Time
@@ -89,6 +100,9 @@ type Config struct {
 
 	// MaxRequestBody 请求体上限（字节）。0 = 用 DefaultMaxRequestBody（128MiB）。
 	MaxRequestBody int64
+
+	// StickyMaxRequests 同渠道粘性账号连续成功使用多少次后轮换。0 = 默认 50。
+	StickyMaxRequests int
 
 	HardCooldown time.Duration
 	SoftCooldown time.Duration
@@ -132,6 +146,9 @@ type Handler struct {
 
 	fbMu      sync.RWMutex               // 保护 fallbacks（面板可运行时修改）
 	fallbacks []config.ModelFallbackRule // 模型降级链（cfg.ModelFallbacks 初始，热更新经 SetModelFallbacks）
+	// aliases 是 fallbacks 的派生索引（别名 → 主力模型全路径），与 fallbacks 同锁同寿命：
+	// 任何写入 fallbacks 的地方都必须经 setFallbacks 重建，避免两份状态漂移（R129）。
+	aliases map[string]string
 
 	efMu    sync.RWMutex      // 保护 efforts（面板可运行时修改）
 	efforts map[string]string // 思考强度注入映射（cfg.ReasoningEfforts 初始，热更新经 SetReasoningEfforts）
@@ -161,9 +178,56 @@ func (h *Handler) getRuntime(k provider.Kind) *Runtime {
 
 // SetModelFallbacks 热更新模型降级链（面板保存后由 app 层回调；nil/空 = 清空禁用）。
 func (h *Handler) SetModelFallbacks(rules []config.ModelFallbackRule) {
+	h.setFallbacks(rules)
+}
+
+// setFallbacks 是 fallbacks 的唯一写入点：规则与别名索引在同一把锁内一起换，
+// 派生只走 config.AliasIndex（单一来源，R129）。
+func (h *Handler) setFallbacks(rules []config.ModelFallbackRule) {
+	idx := config.AliasIndex(rules)
 	h.fbMu.Lock()
 	h.fallbacks = rules
+	h.aliases = idx
 	h.fbMu.Unlock()
+}
+
+// resolveAlias 把客户端请求名解析为别名指向的主力模型全路径。
+// 命中时打一行 `alias resolved:` 日志（别名可观测性），未命中原样返回。
+// 别名只在入口解析：解析结果就是后续一切行为（路由/容量/降级/记账）的输入。
+func (h *Handler) resolveAlias(model string) string {
+	m := strings.TrimSpace(model)
+	if m == "" {
+		return model
+	}
+	h.fbMu.RLock()
+	target, ok := h.aliases[m]
+	h.fbMu.RUnlock()
+	if !ok || target == "" {
+		return model
+	}
+	log.Printf("alias resolved: %s -> %s", m, target)
+	return target
+}
+
+// aliasTarget 返回别名指向的主力模型全路径（无别名返回空串），供 /v1/models 现拼条目用。
+func (h *Handler) aliasTarget(name string) string {
+	h.fbMu.RLock()
+	defer h.fbMu.RUnlock()
+	return h.aliases[strings.TrimSpace(name)]
+}
+
+// aliasEntries 返回按配置顺序排列的「别名 → 主力模型」对（给 /v1/models 现拼条目用）。
+func (h *Handler) aliasEntries() [][2]string {
+	h.fbMu.RLock()
+	defer h.fbMu.RUnlock()
+	out := make([][2]string, 0, len(h.aliases))
+	for _, rule := range h.fallbacks {
+		name := strings.TrimSpace(rule.Name)
+		if target, ok := h.aliases[name]; ok && target != "" {
+			out = append(out, [2]string{name, target})
+		}
+	}
+	return out
 }
 
 // SetReasoningEfforts 热更新思考强度注入映射（面板保存后由 app 层回调；nil/空 = 清空禁用）。
@@ -197,7 +261,11 @@ func NewHandler(cfg Config) *Handler {
 	if cfg.MaxRequestBody > 0 {
 		MaxRequestBody = cfg.MaxRequestBody
 	}
+	if cfg.StickyMaxRequests <= 0 {
+		cfg.StickyMaxRequests = config.DefaultStickyMaxRequests
+	}
 	h := &Handler{cfg: cfg, mux: http.NewServeMux(), sticky: make(map[string]*stickyEntry), ledger: cfg.Ledger, stats: cfg.Stats, fallbacks: cfg.ModelFallbacks, efforts: cfg.ReasoningEfforts}
+	h.aliases = config.AliasIndex(cfg.ModelFallbacks) // 别名索引与规则同源派生（R129）
 	h.mux.HandleFunc("POST /v1/chat/completions", h.withAuth(h.chatCompletions))
 	h.mux.HandleFunc("POST /v1/images/generations", h.withAuth(h.imagesGenerations))
 	h.mux.HandleFunc("POST /v1/images/edits", h.withAuth(h.imagesEdits))
@@ -222,6 +290,9 @@ func NewHandler(cfg Config) *Handler {
 
 func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) { h.mux.ServeHTTP(w, r) }
 
+// stickyMaxReqs 粘性路由连续成功轮换阈值（默认 50）。
+const stickyMaxReqs = 50
+
 // stickyKey 粘性路由 key（按渠道独立）
 func (h *Handler) stickyKey(kind provider.Kind) string { return kind.String() }
 
@@ -232,8 +303,6 @@ func (h *Handler) stickyKey(kind provider.Kind) string { return kind.String() }
 //
 // 任一条件触发则降级为 PickForModel(model) 选新账号并重置粘性记录。
 func (h *Handler) pickWithSticky(rt *Runtime, model string) *auth.Auth {
-	const defaultMaxReqs = 50
-
 	h.stickyMu.RLock()
 	sticky := h.sticky[h.stickyKey(rt.Kind)]
 	h.stickyMu.RUnlock()
@@ -250,6 +319,12 @@ func (h *Handler) pickWithSticky(rt *Runtime, model string) *auth.Auth {
 			// 仍被粘住 ⇒ 每个请求都白打一次必 401 的上游探测。
 			// （MonkeyCode 实测：全日志 16 条 session_dead 401，且一次刷新都没发起。）
 			if ok && !status.Cooling && !status.Disabled && !status.SessionDead && !modelCooled {
+				// R146：粘性账号今天没有额度到期、而池内有账号今天有 ⇒ 立刻让位，
+				// 并把粘性改钉到那个账号（会话粘性不丢）。低流量下 50 次阈值可能横跨数小时，
+				// 快过期的额度等不起。
+				if alt := h.yieldForExpiringToday(rt, model, sticky.uid, time.Now()); alt != nil {
+					return alt
+				}
 				log.Printf("sticky route platform=%s uid=%s count=%d/%d",
 					rt.Kind, sticky.uid, sticky.reqCount, sticky.maxReqs)
 				return acct
@@ -269,10 +344,49 @@ func (h *Handler) pickWithSticky(rt *Runtime, model string) *auth.Auth {
 
 	// 新建粘性记录
 	h.stickyMu.Lock()
-	h.sticky[h.stickyKey(rt.Kind)] = &stickyEntry{uid: acct.UID, maxReqs: defaultMaxReqs}
+	h.sticky[h.stickyKey(rt.Kind)] = &stickyEntry{uid: acct.UID, maxReqs: h.cfg.StickyMaxRequests}
 	h.stickyMu.Unlock()
-	log.Printf("new sticky route platform=%s uid=%s maxReqs=%d", rt.Kind, acct.UID, defaultMaxReqs)
+	log.Printf("new sticky route platform=%s uid=%s maxReqs=%d", rt.Kind, acct.UID, h.cfg.StickyMaxRequests)
 	return acct
+}
+
+// expiresToday unix 到期时刻是否落在「今天」桶（R105 单一口径：自然日 + 次日 00:00 的抖动缓冲）。
+// 0 或负值 = 无到期信息，返回 false。
+func expiresToday(unixSec int64, now time.Time) bool {
+	if unixSec <= 0 {
+		return false
+	}
+	return provider.ExpireBucketOf(time.Unix(unixSec, 0).Format(time.RFC3339), now) == provider.BucketToday
+}
+
+// yieldForExpiringToday 粘性让位（R146）：粘性账号今天没有额度到期、而池内最优账号今天有，
+// 就把粘性改钉到最优账号并返回它。返回 nil 表示维持粘性。
+//
+// 必须与「会话粘性」共存：让位只发生一次，之后 sticky 记录指向新账号（reqCount 归零），
+// 后续请求继续走同一账号，直到 50 次阈值或它变得不健康。
+func (h *Handler) yieldForExpiringToday(rt *Runtime, model, stickyUID string, now time.Time) *auth.Auth {
+	best := rt.Pool.PickForModel(model)
+	if best == nil || best.UID == stickyUID {
+		return nil
+	}
+	stExp, okSt := rt.Pool.EarliestExpireOf(stickyUID)
+	bsExp, okBs := rt.Pool.EarliestExpireOf(best.UID)
+	if !okSt || !okBs {
+		return nil
+	}
+	// 两者都今天到期时保持粘性：否则两个账号会按到期时刻反复互抢，会话被拆碎。
+	stToday := !stExp.IsZero() && expiresToday(stExp.Unix(), now)
+	bsToday := !bsExp.IsZero() && expiresToday(bsExp.Unix(), now)
+	if !bsToday || stToday {
+		return nil
+	}
+
+	h.stickyMu.Lock()
+	h.sticky[h.stickyKey(rt.Kind)] = &stickyEntry{uid: best.UID, maxReqs: stickyMaxReqs}
+	h.stickyMu.Unlock()
+	log.Printf("sticky yield platform=%s from=%s to=%s reason=expiring_today",
+		rt.Kind, stickyUID, best.UID)
+	return best
 }
 
 // stickySuccess 粘性路由成功：递增请求计数。
@@ -391,14 +505,32 @@ var dynamicModelsCache struct {
 const (
 	dynamicModelsTTL        = time.Hour
 	modelsFetchFailCooldown = 5 * time.Minute
+	// maxModelsFetchAccounts 限制一次目录拉取最多尝试几个账号。
+	// 取值理由：目录是渠道级的，理论上要试到「有一个账号能给出目录」为止；
+	// 但一个池若全是坏账号（20 个），逐个串行探测会让 /v1/models 首字节等上
+	// 几十秒。3 个候选覆盖绝大多数真实场景（同人多开 / 少数号未开通），
+	// 剩下的坏号由 5min 负缓存与下一轮刷新兜底。
+	maxModelsFetchAccounts = 3
 )
+
+// errEmptyModelCatalog 表示上游正常应答但目录为空（如 WPS Comate 账号
+// 未开通模型时 /models 返回 items=[]）。它不是传输/鉴权错误，
+// 但对「渠道维度」的目录来说等价于这次尝试失败，需要换号重试。
+var errEmptyModelCatalog = errors.New("upstream returned an empty model catalog")
 
 func (h *Handler) models(w http.ResponseWriter, r *http.Request) {
 	writeJSON(w, http.StatusOK, map[string]any{"object": "list", "data": h.modelList()})
 }
 
+// modelList 构造 /v1/models 的 data 数组。
+//
+// 别名条目（R129）**排在真实模型之前**，每次请求现拼、不进上游目录缓存：
+// 别名表随降级链热更新即时生效，无需任何缓存失效通道。
+// 能力字段**逐字段继承主力模型**（不新增任何推断），另带一个 alias 字段指向主力全路径。
+// 沿用现有过滤：主力所在渠道未接入任何账号时该别名不出现。
 func (h *Handler) modelList() []map[string]any {
 	out := []map[string]any{}
+	out = append(out, h.aliasModelEntries()...)
 	for _, k := range h.runtimeKinds() {
 		rt := h.getRuntime(k)
 		if rt == nil || rt.Pool == nil || len(rt.Pool.List()) == 0 { // 只暴露已接入账号的平台
@@ -406,11 +538,57 @@ func (h *Handler) modelList() []map[string]any {
 		}
 		infos := h.fetchRuntimeModels(rt)
 		if len(infos) == 0 {
-			infos = rt.StaticModels
+			// 静态兜底同样要过出口过滤：staticCatalog 里就含被摘除的模型
+			// （deepseek-v4-pro / glm-5.3-flash），不过滤就等于把摘除撤销。
+			infos = applyModelFilter(rt.ModelFilter, rt.StaticModels)
 		}
 		for _, mi := range infos {
 			out = append(out, buildModelEntry(k, mi))
 		}
+	}
+	return out
+}
+
+// aliasModelEntries 把别名表现拼成 /v1/models 条目（按降级链配置顺序）。
+//
+// 只做两件事：① 找到主力模型的 ModelInfo（找不到 = 主力所在渠道没接入账号 / 模型不在目录里
+// ⇒ 整个条目不出现，沿用现有过滤口径）；② 拿 buildModelEntry 的**同一份输出**换掉 id
+// 并加 alias 字段。为什么不另写一份能力拼装：那等于给能力字段开第二个来源，
+// 迟早与真实模型条目漂移（R49「不编造」+ 单一来源）。
+func (h *Handler) aliasModelEntries() []map[string]any {
+	pairs := h.aliasEntries()
+	if len(pairs) == 0 {
+		return nil
+	}
+	out := make([]map[string]any, 0, len(pairs))
+	for _, p := range pairs {
+		name, target := p[0], p[1]
+		kind, upstream, ok := provider.SplitModelID(target)
+		if !ok {
+			continue
+		}
+		rt := h.getRuntime(kind)
+		if rt == nil || rt.Pool == nil || len(rt.Pool.List()) == 0 {
+			continue // 主力渠道没接入账号：别名不出现
+		}
+		infos := h.fetchRuntimeModels(rt)
+		if len(infos) == 0 {
+			infos = rt.StaticModels
+		}
+		var found *provider.ModelInfo
+		for i := range infos {
+			if infos[i].ID == upstream {
+				found = &infos[i]
+				break
+			}
+		}
+		if found == nil {
+			continue // 主力模型不在当前目录：不凭空造一条条目
+		}
+		entry := buildModelEntry(kind, *found)
+		entry["id"] = name
+		entry["alias"] = target
+		out = append(out, entry)
 	}
 	return out
 }
@@ -472,12 +650,15 @@ func buildModelEntry(k provider.Kind, mi provider.ModelInfo) map[string]any {
 }
 
 func (h *Handler) fetchRuntimeModels(rt *Runtime) []provider.ModelInfo {
+	// 先取出口过滤函数（nil = 不过滤）。缓存命中与新拉取都要过它，否则
+	// 渠道层刚摘除的模型会被本层的 1h 缓存继续列出（见 Runtime.ModelFilter 注释）。
+	filter := rt.ModelFilter
 	if rt.Kind == provider.WorkBuddy { // 兼容旧单平台缓存观察点
 		dynamicModelsCache.RLock()
 		if len(dynamicModelsCache.ids) > 0 && time.Since(dynamicModelsCache.fetched) < dynamicModelsTTL {
 			out := dynamicModelsCache.ids
 			dynamicModelsCache.RUnlock()
-			return out
+			return applyModelFilter(filter, out)
 		}
 		if !dynamicModelsCache.lastFail.IsZero() && time.Since(dynamicModelsCache.lastFail) < modelsFetchFailCooldown {
 			dynamicModelsCache.RUnlock()
@@ -489,32 +670,59 @@ func (h *Handler) fetchRuntimeModels(rt *Runtime) []provider.ModelInfo {
 	if len(rt.models) > 0 && time.Since(rt.fetched) < dynamicModelsTTL {
 		out := rt.models
 		rt.mu.RUnlock()
-		return out
+		return applyModelFilter(filter, out)
 	}
 	if rt.Kind != provider.WorkBuddy && !rt.lastFail.IsZero() && time.Since(rt.lastFail) < modelsFetchFailCooldown {
 		rt.mu.RUnlock()
 		return nil
 	}
 	rt.mu.RUnlock()
-	acct := rt.Pool.Pick()
-	if acct == nil {
-		return nil
-	}
-	// 401 自愈：与费率路径（RefreshPricing）同款——拉取前先检查 token 有效性，
-	// 过期先 refresh + 落盘。否则冷启动时 qodercn/qodercom 等无静态兑底渠道
-	// 拿过期 token 拉 FetchModels → 401 → 静默失败 → 负缓存 5min，
-	// 费率面板整组消失，最坏要等 30min ticker 才补拉（不变量 19）。
-	if acct.NeedsRefresh(10 * time.Minute) {
-		if err := rt.Upstream.RefreshToken(acct); err != nil {
-			log.Printf("models fetch token refresh failed platform=%s uid=%s err=%v", rt.Kind, acct.UID, err)
-		} else if serr := acct.SaveAtomic(); serr != nil {
-			log.Printf("models fetch token save failed platform=%s uid=%s err=%v", rt.Kind, acct.UID, serr)
+	// 多账号回退（R143）：模型目录是**渠道维度**的，而 Pick 只取一个账号。
+	// 只要池里有一个「拉不到目录」的账号——comate 未开通模型时 /models 返回
+	// items=[]，token 失效时返回 401——单次 Pick 抽中它的那一刻，整条渠道的
+	// 模型面就归零并进入 5min 负缓存。实测事故：加了第二个 WPS 账号后
+	// comate 的 9 个模型瞬间变 0，面板里整条渠道消失，要等负缓存过期或重启。
+	// 因此「拉不到」不等于「渠道没有模型」：换下一个账号重试，
+	// 只有所有候选账号都失败，才认领渠道级失败（与旧语义一致，进负缓存）。
+	tried := make(map[string]bool, 4)
+	var (
+		lastUID string
+		lastErr error
+		infos   []provider.ModelInfo
+	)
+	for attempt := 0; attempt < maxModelsFetchAccounts; attempt++ {
+		acct := rt.Pool.PickExcluding(tried)
+		if acct == nil {
+			break
 		}
-	}
-	infos, err := rt.Upstream.FetchModels(acct)
-	if err != nil || len(infos) == 0 {
+		tried[acct.UID] = true
+		lastUID = acct.UID
+		// 401 自愈：与费率路径（RefreshPricing）同款——拉取前先检查 token 有效性，
+		// 过期先 refresh + 落盘。否则冷启动时 qodercn/qodercom 等无静态兑底渠道
+		// 拿过期 token 拉 FetchModels → 401 → 静默失败 → 负缓存 5min，
+		// 费率面板整组消失，最坏要等 30min ticker 才补拉（不变量 19）。
+		if acct.NeedsRefresh(10 * time.Minute) {
+			if err := rt.Upstream.RefreshToken(acct); err != nil {
+				log.Printf("models fetch token refresh failed platform=%s uid=%s err=%v", rt.Kind, acct.UID, err)
+			} else if serr := acct.SaveAtomic(); serr != nil {
+				log.Printf("models fetch token save failed platform=%s uid=%s err=%v", rt.Kind, acct.UID, serr)
+			}
+		}
+		got, err := rt.Upstream.FetchModels(acct)
+		if err == nil && len(got) > 0 {
+			infos = got
+			break
+		}
+		lastErr = err
+		if err == nil {
+			lastErr = errEmptyModelCatalog
+		}
 		// 失败不再静默：无静态兑底渠道（qodercn/qodercom）整组消失时，
 		// 至少日志里要有原因可查（曾致 issue #40 复发 40 分钟无法定位）。
+		// 换号重试时同样逐条留痕，否则用户只看到渠道消失、查不到是谁拖垮的。
+		log.Printf("models fetch failed platform=%s uid=%s err=%v n=%d", rt.Kind, acct.UID, lastErr, len(got))
+	}
+	if len(infos) == 0 {
 		now := time.Now()
 		rt.mu.Lock()
 		rt.lastFail = now
@@ -524,7 +732,9 @@ func (h *Handler) fetchRuntimeModels(rt *Runtime) []provider.ModelInfo {
 			dynamicModelsCache.lastFail = now
 			dynamicModelsCache.Unlock()
 		}
-		log.Printf("models fetch failed platform=%s uid=%s err=%v n=%d", rt.Kind, acct.UID, err, len(infos))
+		if lastUID != "" {
+			log.Printf("models fetch failed platform=%s uid=%s err=%v n=0 (no account yielded a catalog)", rt.Kind, lastUID, lastErr)
+		}
 		return nil
 	}
 	now := time.Now()
@@ -540,7 +750,15 @@ func (h *Handler) fetchRuntimeModels(rt *Runtime) []provider.ModelInfo {
 		dynamicModelsCache.lastFail = time.Time{}
 		dynamicModelsCache.Unlock()
 	}
-	return infos
+	return applyModelFilter(filter, infos)
+}
+
+// applyModelFilter 出口过滤的薄封装：filter 为 nil 时原样返回（零开销，不受影响渠道）。
+func applyModelFilter(filter func([]provider.ModelInfo) []provider.ModelInfo, models []provider.ModelInfo) []provider.ModelInfo {
+	if filter == nil {
+		return models
+	}
+	return filter(models)
 }
 
 func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
@@ -562,12 +780,17 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_request", "invalid JSON body: "+err.Error())
 		return
 	}
-	rt, model, err := h.runtimeForModel(peek.Model)
+	// clientModel = 客户端请求的原始模型名（可能是别名），用于回填响应体 model 字段、
+	// X-Model-Fallback 头与降级记录事件——那几处的语义是「客户端视角发了什么名字」。
+	clientModel := peek.Model
+	// 别名解析（R129）：别名是主力模型的另一个名字，命中即等价于请求主力模型。
+	// 只在这里解析一次，reqModel 是后续一切（路由 / 容量判定 / 降级链 / 记账 / 档位）的输入。
+	reqModel := h.resolveAlias(clientModel)
+	rt, model, err := h.runtimeForModel(reqModel)
 	if err != nil {
 		writeOpenAIError(w, http.StatusBadRequest, "invalid_model", err.Error())
 		return
 	}
-	clientModel := peek.Model // 客户端请求的原始模型名（含 channel/ 前缀），回填进响应
 	// 诊断：记录上下文构成摘要（config.body_log 关闭时立即返回，无实际开销）。
 	// 必须放在 rewriteModel 之前——要记的是客户端发来的原始体，而非改写后的。
 	if h.ledger != nil {
@@ -575,7 +798,9 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	}
 	// 统计/流水的归一 ID：新旧写法（cline-free/x 与 cline/cline-free/x）归一到同一串，
 	// 否则同一模型会在用量榜/请求日志里裂成两行（R59）；其余渠道为恒等变换。
-	canonModel := provider.CanonicalModelID(clientModel)
+	// 别名已在上面解析成主力全路径，故记账记的是**主力模型的规范对外 ID**，
+	// 用量榜永远不会出现别名（R129「账本完全透明」）。
+	canonModel := provider.CanonicalModelID(reqModel)
 	// 模型降级链：请求模型在本渠道已无账号可承载（no_healthy_account 的两种形态——
 	// 「模型全冷」或「整渠道全灭」，pickWithSticky 必败）时，按用户配置的链找第一个
 	// 仍有可用账号的备胎模型顶上；备胎可跨渠道，渠道全灭时不至于直接 503。
@@ -626,7 +851,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 	// 思考强度注入：客户端未传 reasoning_effort 且面板配置命中（按客户端请求模型 ID 匹配，
 	// 含 `*` 全局默认）时补上档位。未配置 = 零开销直通（applyEffort 内部快检）；
 	// 注入失败仅记日志、原 body 照发，绝不因此中断请求。
-	body = h.applyEffort(body, clientModel)
+	body = h.applyEffort(body, reqModel)
 
 	// 运行统计插桩：每客户端请求一行（最终结果；中间换号尝试不逐行——对齐 sidecar 口径）。
 	// TTFB 由 statWriter 记首字节，耗时/吞吐在出口由 defer 收口；
@@ -646,6 +871,13 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 			statRow.Time = now.Format("01-02 15:04:05")
 			statRow.TTFBMs = sw.ttfbMs
 			statRow.TotalSec = now.Sub(sw.start).Seconds()
+			// 单行 tok/s 用**端到端**口径（token ÷ 总耗时）：这一行要回答
+			// 「这个请求我等了多久才等到这些 token」，因此排队与 prefill 必须
+			// 计入分母。旧口径（减去 TTFB）会给 33 秒只吐 93 token 的请求标
+			// 309 tok/s，与实际感知完全相反（R147）。
+			if statRow.Tok > 0 && statRow.TotalSec > 0 {
+				statRow.TokPerSec = float64(statRow.Tok) / statRow.TotalSec
+			}
 			if statRow.Status == 0 {
 				statRow.Status = http.StatusOK
 			}
@@ -697,7 +929,7 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 						// 改写成功才发——失败走透传时不得残留降级头（S1）。
 						w.Header().Set("X-Model-Fallback", clientModel+" -> "+fb2)
 						body = nb
-						body = h.applyEffort(body, clientModel) // 与入口同参数；键已存在不碰（双注入守卫）
+						body = h.applyEffort(body, reqModel) // 与入口同参数；键已存在不碰（双注入守卫）
 						rt, model = rt2, m2
 						dispModel = fb2
 						acctModel = provider.CanonicalModelID(fb2) // 记账归属=备胎（0021/PR #148 口径）
@@ -715,6 +947,33 @@ func (h *Handler) chatCompletions(w http.ResponseWriter, r *http.Request) {
 		if res.lastKind == provider.ErrQueued {
 			// 全号排队：给合规的重试信号（与 body 里的 retry_after_seconds 一致）。
 			w.Header().Set("Retry-After", "30")
+		}
+		// 429 软限流透传前也补 Retry-After。
+		//
+		// 动机（实测 2026-10-31）：raccoon 的 429 报文里没有任何重置时间戳
+		// （{"code":"user_model_rate_limited","message":"您的模型请求频率超限，请稍后重试"}），
+		// 故 softRateCooldown 落回固定窗口，而客户端拿不到重试信号后自己按默认策略退避
+		// （实测 22s）→ 正好撞进冷却窗口 → 又吃一次 429。
+		// 把同一信号透给客户端：上游给了就照抄，没给就兜底 60s（与 SoftCooldown 同值）。
+		//
+		// 为什么兜底 60s 而不是官方指数退避的首次值 1s（2026-10-31 实测修正）：
+		// 官方 429 后**立刻放弃**（is_fatal=True、2.5s 结束、total_tokens=0），根本不走它
+		// 自己那套 1s/2s/4s 退避；真正恢复靠「静默等窗口过去」——实测我方最后一次 429
+		// （14:12:12）之后，官方客户端到 14:53:30 仍在 429，直到 15:15 才恢复，即窗口是
+		// 分钟级。给 1s 会让客户端每秒一撞、把窗口越撞越长。
+		//
+		// ⚠️ 只在本分支**尚未**设过 Retry-After 时生效：排队（ErrQueued）也是 429 且上一步
+		// 已按上游 retry_after_seconds 给了 30，覆盖它会把排队语义改坏（下一个号并非限流，
+		// 重试节奏应与排队提示一致）。实测踩到：不加这个判断时
+		// TestAllQueuedReturns429WithRetryAfter 从 30 变成 1。
+		if res.lastKind == provider.ErrSoftRate || res.lastStatus == http.StatusTooManyRequests {
+			if w.Header().Get("Retry-After") == "" {
+				retry := "60"
+				if ra, ok := clientRetryAfter(res.lastBody); ok {
+					retry = ra
+				}
+				w.Header().Set("Retry-After", retry)
+			}
 		}
 		transparentError(w, res.lastStatus, res.lastBody)
 		return
@@ -788,7 +1047,21 @@ func (h *Handler) serveRotation(
 		tried[acct.UID] = true
 		if acct.NeedsRefresh(h.cfg.RefreshSkew) {
 			log.Printf("refresh start platform=%s uid=%s reason=request", rt.Kind, acct.UID)
-			if err := rt.Upstream.RefreshToken(acct); err != nil {
+			// 单飞 + 内层重检：同一账号的并发请求只放一次刷新出去。这一步最关键 ——
+			// refresh_token 是单会话的，并发刷新必然一方拿到 refresh_conflict，而失败方
+			// 会被下面这个分支推进冷却（默认 10 分钟），表现为「一并发就 503」。
+			if err := provider.RefreshOnce(acct, func() error {
+				if !acct.NeedsRefresh(h.cfg.RefreshSkew) {
+					return nil // 已被并发的另一次刷新刷过
+				}
+				if rerr := rt.Upstream.RefreshToken(acct); rerr != nil {
+					return rerr
+				}
+				if serr := acct.SaveAtomic(); serr != nil {
+					log.Printf("refresh save failed platform=%s uid=%s err=%v", rt.Kind, acct.UID, serr)
+				}
+				return nil
+			}); err != nil {
 				log.Printf("refresh failed platform=%s uid=%s err=%v", rt.Kind, acct.UID, err)
 				lastErr = err
 				h.stickyClear(rt)
@@ -809,9 +1082,6 @@ func (h *Handler) serveRotation(
 					rt.Pool.Cooldown(acct.UID, pool.CoolErr, h.cfg.ErrCooldown, "refresh: "+err.Error())
 				}
 				continue
-			}
-			if err := acct.SaveAtomic(); err != nil {
-				log.Printf("refresh save failed platform=%s uid=%s err=%v", rt.Kind, acct.UID, err)
 			}
 			log.Printf("refresh success platform=%s uid=%s expires_at=%d", rt.Kind, acct.UID, acct.ExpiresAt)
 		}
@@ -1037,19 +1307,21 @@ func (h *Handler) serveRotation(
 			if h.ledger != nil {
 				pt, ct, src := usageTokens(usage)
 				h.ledger.AppendUsage(ledger.UsageEntry{Ch: rt.Kind.String(), UID: acct.UID,
-					Model: ledgerModelOf(acctModel), PT: pt, CT: ct, CR: cu.cached, CRC: cu.reported, Src: src})
+					Model: ledgerModelOf(acctModel), PT: pt, CT: ct, CR: cu.cached, CRC: cu.reported, Src: src,
+					Credit: usageCredit(usage)})
 			}
 			// 运行统计：模型维度记账（有 usage 才计，对齐 sidecar 的 u.found 语义）。
-			// 吞吐仅在流式下有意义：genSec = 总耗时 − TTFB；引擎内对 ≤50ms 的样本只计 TTFB。
 			if h.stats != nil {
 				pt, ct, _ := usageTokens(usage)
 				if pt > 0 || ct > 0 {
-					gen := time.Since(sw.start).Seconds() - float64(sw.ttfbMs)/1000
-					h.stats.AddUsage(acctModel, pt, ct, usageCredit(usage), sw.ttfbMs, gen, cu.cached, cu.reported, time.Now())
+					h.stats.AddUsage(acctModel, pt, ct, usageCredit(usage), sw.ttfbMs, cu.cached, cu.reported, time.Now())
+					// 滑动窗口吞吐：把 completion token 按「每秒写帧数占比」摊到秒桶，
+					// 面板显示窗口内平均 tok/s。为什么不在这里算比值：分母用
+					// 「总耗时 − TTFB」会把排队/prefill 整段抹掉（实测小浣熊夸大
+					// 3.56×），而单请求比值本身也无法表达「某一秒吐出多少」——
+					// 上游吞吐每秒都在变（见 docs/adr/accepted/r132-*.md）。
+					h.stats.AddTput(acctModel, ct, sw.chunks, time.Now())
 					statRow.Tok = ct
-					if gen > 0 {
-						statRow.TokPerSec = float64(ct) / gen
-					}
 				}
 				statRow.Credit = usageCredit(usage)
 			}
@@ -1134,7 +1406,8 @@ func (h *Handler) serveRotation(
 			pt, ct, src := usageTokens(u)
 			cu := cacheUsageOf(u)
 			h.ledger.AppendUsage(ledger.UsageEntry{Ch: rt.Kind.String(), UID: acct.UID,
-				Model: ledgerModelOf(acctModel), PT: pt, CT: ct, CR: cu.cached, CRC: cu.reported, Src: src})
+				Model: ledgerModelOf(acctModel), PT: pt, CT: ct, CR: cu.cached, CRC: cu.reported, Src: src,
+				Credit: usageCredit(u)})
 		}
 		writeJSON(w, http.StatusOK, resp)
 		// 运行统计：必须在写回之后——此刻 statWriter 才记到首字节，TTFB 为真值；
@@ -1144,9 +1417,10 @@ func (h *Handler) serveRotation(
 			u, _ := resp["usage"].(map[string]any)
 			pt, ct, _ := usageTokens(u)
 			if pt > 0 || ct > 0 {
-				gen := time.Since(sw.start).Seconds() - float64(sw.ttfbMs)/1000
 				cu := cacheUsageOf(u)
-				h.stats.AddUsage(acctModel, pt, ct, usageCredit(u), sw.ttfbMs, gen, cu.cached, cu.reported, time.Now())
+				h.stats.AddUsage(acctModel, pt, ct, usageCredit(u), sw.ttfbMs, cu.cached, cu.reported, time.Now())
+				// 非流式一次性写回：无分帧时序可依，故不产生窗口速率样本
+				// （前端显示「—」比显示一个端到端假速率更诚实）。
 				statRow.Tok = ct
 			}
 			statRow.Credit = usageCredit(u)
@@ -1292,12 +1566,25 @@ func noLoginChannel(k provider.Kind) bool { return k == provider.Oczen || k == p
 // cline 的官方 API Key 不过期、不轮换，被禁用只会是 Key 本身无效/被删。
 func keyPasteChannel(k provider.Kind) bool { return k == provider.Cline }
 
+// aliasHint 拼给「未知模型名」错误的可行动提示（未配置别名时为空串，不产生噪声）。
+// 别名是裸名（不含 `/`），所以只会在「没写渠道前缀」这一分支上被需要——
+// 让用户知道「打错别名」与「忘了写前缀」可以去 /v1/models 自查（R129）。
+func (h *Handler) aliasHint() string {
+	h.fbMu.RLock()
+	n := len(h.aliases)
+	h.fbMu.RUnlock()
+	if n == 0 {
+		return ""
+	}
+	return "（可用别名见 /v1/models 中带 alias 标记的条目）"
+}
+
 func (h *Handler) runtimeForModel(model string) (*Runtime, string, error) {
 	// 解析与 provider.PublicModelID 同源：既接受 `<渠道>/<上游ID>`，也接受上游 ID 自带命名空间的
 	// 直通形态（`cline-free/*`）——后者首段不是渠道名，必须整串当上游模型名（决议 R59）。
 	kind, upstream, ok := provider.SplitModelID(model)
 	if !ok {
-		return nil, "", fmt.Errorf("model must use explicit prefix: workbuddy/<model> / workbuddyai/<model> / traework/<model> / qoder/<model> / qodercn/<model> / qodercom/<model> / qwenwork/<model> / glm/<model> / oczen/<model> / kilo/<model> / minimax/<model> / lobsterai/<model> / zcode/<model> / gemini/<model> / codearts/<model>；Cline 免费池直接用上游 ID（cline-free/<model>）")
+		return nil, "", fmt.Errorf("model must use explicit prefix: workbuddy/<model> / workbuddyai/<model> / traework/<model> / qoder/<model> / qodercn/<model> / qodercom/<model> / qwenwork/<model> / glm/<model> / oczen/<model> / kilo/<model> / minimax/<model> / lobsterai/<model> / zcode/<model> / gemini/<model> / codearts/<model>；Cline 免费池直接用上游 ID（cline-free/<model>）%s", h.aliasHint())
 	}
 	rt := h.getRuntime(kind)
 	if rt == nil || rt.Pool == nil || rt.Upstream == nil {
@@ -1423,22 +1710,36 @@ func (h *Handler) pickModelFallback(rt *Runtime, model string, skipSameChannel b
 	return "", false
 }
 
-// usageCredit 从 usage 对象取上游下发的单次积分（WorkBuddy 系会回；
+// usageCredit 从 usage 对象取上游下发的单次积分（WorkBuddy 系会回 `credit`；
+// comate 回 `credits`（复数，如 0.01）→ 两种都接；
 // TraeWork 系 token_usage 帧无此字段 → 0，引擎侧按渠道余额差值分摊估算）。
+//
+// 为什么必须接复数：`internal/comate/constants.go` 实测上游下发
+// `{"prompt_tokens":…,"completion_tokens":…,"credits":0.01}`，而该渠道
+// **没有余额端点**（UserResource 恒 0）⇒ 只认单数就等于“comate 的积分永远不入账”，
+// README 承诺的“按每次回答的 usage.credits 记账”落空（2026-10-28 修正）。
 func usageCredit(u map[string]any) float64 {
-	if v, ok := u["credit"].(float64); ok {
-		return v
+	for _, k := range []string{"credit", "credits"} {
+		if v, ok := u[k].(float64); ok {
+			return v
+		}
 	}
 	return 0
 }
 
 // statWriter 记录首字节写出时刻（TTFB 口径：客户端等到的第一个响应字节，
-// 含状态行/响应头——WriteHeader/Write/Flush 三者先到先记）。
+// 含状态行/响应头——WriteHeader/Write/Flush 三者先到先记），并顺带按秒统计
+// 写出的帧数（流式吞吐滑动窗口的唯一数据源）。
 type statWriter struct {
 	http.ResponseWriter
 	start   time.Time
 	ttfbMs  int64
 	written bool
+	// chunks unix 秒 -> 该秒写出的非空 Write 次数。
+	// 一次 SSE 帧 = 一次 Write（streamCore/各渠道 Stream 都是逐帧 Write），
+	// 故这是「token 投递按秒分布」的代理量：token 精确值只有末帧 usage 才有，
+	// 完成后按本表占比把 completion token 摊到各秒（见 stats.AddTput）。
+	chunks map[int64]int
 }
 
 func (sw *statWriter) noteFirstByte() {
@@ -1455,6 +1756,13 @@ func (sw *statWriter) WriteHeader(code int) {
 
 func (sw *statWriter) Write(p []byte) (int, error) {
 	sw.noteFirstByte()
+	// 空写不计帧：JSON 空帧与心跳不该算成一次 token 投递。
+	if len(p) > 0 {
+		if sw.chunks == nil {
+			sw.chunks = map[int64]int{}
+		}
+		sw.chunks[time.Now().Unix()]++
+	}
 	return sw.ResponseWriter.Write(p)
 }
 
@@ -1599,7 +1907,7 @@ func (h *Handler) ChannelModels() map[provider.Kind][]provider.ModelInfo {
 		}
 		infos := h.fetchRuntimeModels(rt)
 		if len(infos) == 0 {
-			infos = rt.StaticModels
+			infos = applyModelFilter(rt.ModelFilter, rt.StaticModels)
 		}
 		out[k] = infos
 	}
@@ -1625,10 +1933,10 @@ func (h *Handler) CachedChannelModels() map[provider.Kind][]provider.ModelInfo {
 		models := rt.models
 		rt.mu.RUnlock()
 		if len(models) > 0 {
-			out[k] = models
+			out[k] = applyModelFilter(rt.ModelFilter, models)
 			continue
 		}
-		out[k] = rt.StaticModels
+		out[k] = applyModelFilter(rt.ModelFilter, rt.StaticModels)
 	}
 	return out
 }
@@ -1817,6 +2125,30 @@ func (h *Handler) softRateCooldown(body string) time.Duration {
 		d = softRateResetMaxCap
 	}
 	return d
+}
+
+// clientRetryAfter 透传给客户端的 Retry-After 秒数。
+//
+// 优先用上游响应体里的重置时间戳（与 softRateCooldown 同一判据，不重复实现）；
+// 未命中返回 ok=false，调用方回退 60s（见调用点注释的实测理由）。
+// 上限取 60s —— 限流窗口一般就在这个量级，给更大的值只会让客户端白等。
+func clientRetryAfter(body []byte) (string, bool) {
+	ts, ok := softRateResetTs(string(body))
+	if !ok {
+		return "", false
+	}
+	d := time.Until(ts)
+	if d <= 0 {
+		return "", false
+	}
+	secs := int(d.Seconds() + 0.5)
+	if secs < 1 {
+		secs = 1
+	}
+	if secs > 60 {
+		secs = 60
+	}
+	return strconv.Itoa(secs), true
 }
 
 // softRateResetTs 提取限流响应体中的重置时间戳（UTC+8 墙钟）；未命中返回 false。

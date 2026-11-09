@@ -288,21 +288,18 @@ func TestBuildFeesChannels(t *testing.T) {
 // 没在表里的渠道**永远不会出现在面板**，而 /v1/models 与 CachedChannelModels 都有它
 // ⇒ 表现为「接口能调、模型列表里有、但费率面板没这个 tab」。cline 渠道接入时漏登此表，
 // 症状持续到手动排查才发现（与 R34「声明了没接线」同族：不报错、不崩溃、纯静默）。
-// 本测试直接以 provider.Kind 常量全集为准，新增渠道若不登记就会失败。
+//
+// 2026-10-30（R142）：判据从手写 all 列表改为 **provider.BuiltinKinds()** ——
+// 原先每加一个渠道都要手动补进 all，漏补就等于该渠道裸奔；现在新增渠道只要登记
+// builtinKindList 就自动被覆盖（真正兜住漏项）。
 //
 // 例外：旧 Qoder（QoderWork）已从界面下线（路由保留供存量账号用），故显式豁免。
 func TestFeeChannelOrderCoversAllKinds(t *testing.T) {
-	all := []provider.Kind{
-		provider.WorkBuddy, provider.WorkBuddyAI, provider.TraeWork, provider.TraeCode,
-		provider.QoderCN, provider.QoderCOM, provider.QwenWork, provider.GLM,
-		provider.MonkeyCode, provider.Raccoon, provider.Loomy, provider.Oczen, provider.Cline,
-		provider.Qoder, // 已下线，仅存量路由保留
-	}
 	inOrder := map[provider.Kind]bool{}
 	for _, k := range feeChannelOrder {
 		inOrder[k] = true
 	}
-	for _, k := range all {
+	for _, k := range provider.ChannelDisplayOrder { // 内建渠道全集（不含 cline-free 这类命名空间别名）
 		if k == provider.Qoder {
 			continue // 旧 Qoder 已下线，不应出现在面板
 		}
@@ -312,6 +309,43 @@ func TestFeeChannelOrderCoversAllKinds(t *testing.T) {
 	}
 	if inOrder[provider.Qoder] {
 		t.Error("旧 Qoder 已从界面下线，不应再登记进 feeChannelOrder")
+	}
+}
+
+// TestFeeChannelOrderFollowsDisplayOrder：费率 tab 序 = provider.ChannelDisplayOrder 原序
+// 去掉旧 Qoder（R142：三处（账号卡片/汇总条/费率 tab）必须看到同一个渠道顺序）。
+func TestFeeChannelOrderFollowsDisplayOrder(t *testing.T) {
+	var want []provider.Kind
+	for _, k := range provider.ChannelDisplayOrder {
+		if k != provider.Qoder {
+			want = append(want, k)
+		}
+	}
+	if len(feeChannelOrder) != len(want) {
+		t.Fatalf("feeChannelOrder 长 %d，ChannelDisplayOrder(去 Qoder) 长 %d", len(feeChannelOrder), len(want))
+	}
+	for i := range want {
+		if feeChannelOrder[i] != want[i] {
+			t.Fatalf("第 %d 位 = %s，want %s（费率序必须与 ChannelDisplayOrder 一致）", i, feeChannelOrder[i], want[i])
+		}
+	}
+}
+
+// TestSortChannelsByOrderCustomLast：账号卡片排序必须把自定义渠道钉最末，
+// 即便它的标识在字母序里比某个内建渠道小（
+// 例："abccustom" < "zcode"）。旧实现按 channelRank 未知渠道恒 100 ⇒ 这条恒真，
+// 但 tier 语义变了（R142 要求自定义渠道按名字排序而不是 undefined 顺序），故锁死。
+func TestSortChannelsByOrderCustomLast(t *testing.T) {
+	type row struct{ kind provider.Kind }
+	items := []row{
+		{provider.Kind("abccustom")}, {provider.ZCode}, {provider.Kind("zzcustom")}, {provider.Cline},
+	}
+	sortChannelsByOrder(items, func(r row) provider.Kind { return r.kind })
+	want := []provider.Kind{provider.Cline, provider.ZCode, provider.Kind("abccustom"), provider.Kind("zzcustom")}
+	for i := range want {
+		if items[i].kind != want[i] {
+			t.Fatalf("第 %d 位 = %s，want %s（内建按显示名序，自定义挑名字升序钉最末）", i, items[i].kind, want[i])
+		}
 	}
 }
 

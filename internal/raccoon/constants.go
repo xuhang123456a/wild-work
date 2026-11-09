@@ -29,8 +29,11 @@ const (
 	// reward_points,topup_points,topup_frozen}}。路径取自 renderer chunk
 	// `75741-*.js` 的 `class extends ... static get baseUrl(){return `${origin}/api/web/points/v1`}`。
 	EpPointsBalance = "/api/web/points/v1/balance"
-	// EpPointsBills 积分流水（分页参数为 `paging.limit` / `paging.offset` 或 `cursor`，
-	// 另需合法 `type`；暂无必要，保留备查）。
+	// EpPointsBills 积分流水。`paging.limit` 有效、`paging.offset` 实测无效
+	// （offset>0 恒空），条数另有上限（limit=1000 仍只回 100 条）。
+	// `type` 是筛选枚举 all / expense / income（缺省 all，其它值 400）——
+	// 官方桌面客户端「积分明细」页的「全部/消耗/收入」页签即靠它切换。
+	// 本渠道取发放记录时固定带 `type=income`，理由见 fetchDailyGrants。
 	EpPointsBills = "/api/web/points/v1/bills"
 
 	// EpOfficeSettingInfo 工作台设置（配额/空间/功能开关），也是**每日积分落账的触发点**。
@@ -63,19 +66,39 @@ const ClientAliasModel = "raccoon-chat-ml-5-5"
 
 // staticModels 静态兜底模型表（模型目录接口不可用时）。
 // 数据来源：2026-09-22 实测 GET /model_catalog。
-// SupportsTools/SupportsImages/SupportsReasoning 按上游 tags 与约定：
-// 仅当上游明确声明时才置 true（provider.ModelInfo 的约定：未知保持 false）。
+// SupportsTools/SupportsImages/SupportsReasoning 优先取上游 tags；其中图片能力另有
+// 2026-10-28 实测兜底（见 measuredVisionModels / R140）。
+// measuredVisionModels 是 2026-10-28 通过 wild-work → 小浣熊真实链路逐个实测
+// 确认能消费 OpenAI image_url（data:image/png;base64）并正确识别图像的模型。
+//
+// 采用「有图/无图对照」排除按提示猜答案：同一问题无图均答「无图」，附测试图后
+// 才正确识别「左红/右蓝/顶部绿色矩形」。sn-glm-5-3 明确返回
+// `当前纯文本模型不支持 image_url`，故刻意不在此表。
+//
+// 上游 catalog 的 vision tag 曾漏标 raccoon-19b265 / raccoon-405a1c，若只信 tag，
+// /v1/models 会把实测可识图的模型错误声明为 text-only（R140）。
+var measuredVisionModels = map[string]bool{
+	"raccoon-8c4485":              true,
+	"raccoon-19b265":              true,
+	"raccoon-405a1c":              true,
+	"sn-sensenova-6-8-flash":      true,
+	"sn-sensenova-6-8-flash-lite": true,
+	"sn-kimi-k3":                  true,
+	"sn-glm-5-3-flash":            true,
+	"sn-deepseek-v4-1-flash-1017": true,
+}
+
 var staticModels = []provider.ModelInfo{
 	{ID: "raccoon-8c4485", Name: "Raccoon-Work", ContextWindow: 1_000_000, MaxTokens: 100_000,
 		ContextFromAPI: true, SupportsImages: true, SupportsReasoning: true},
 	{ID: "raccoon-19b265", Name: "Raccoon-Work-260817-A", ContextWindow: 1_000_000, MaxTokens: 100_000,
-		ContextFromAPI: true, SupportsReasoning: true},
+		ContextFromAPI: true, SupportsImages: true, SupportsReasoning: true},
 	{ID: "raccoon-405a1c", Name: "Raccoon-Work-260817-B", ContextWindow: 1_000_000, MaxTokens: 100_000,
-		ContextFromAPI: true},
+		ContextFromAPI: true, SupportsImages: true},
 	{ID: "sn-sensenova-6-8-flash-lite", Name: "SenseNova-6.8-Flash-Lite", ContextWindow: 256_000, MaxTokens: 63_999,
 		ContextFromAPI: true, SupportsImages: true},
 	{ID: "sn-glm-5-3", Name: "GLM-5-3", ContextWindow: 1_000_000, MaxTokens: 100_000,
-		ContextFromAPI: true, SupportsImages: true, SupportsReasoning: true},
+		ContextFromAPI: true, SupportsReasoning: true},
 	{ID: "sn-kimi-k3", Name: "Kimi-K3", ContextWindow: 1_000_000, MaxTokens: 100_000,
 		ContextFromAPI: true, SupportsImages: true, SupportsReasoning: true},
 	{ID: "sn-glm-5-3-flash", Name: "GLM-5-3-Flash", ContextWindow: 1_000_000, MaxTokens: 100_000,

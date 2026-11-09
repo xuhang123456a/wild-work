@@ -33,6 +33,7 @@ import (
 	"wild-work/internal/auth"
 	"wild-work/internal/cline"
 	"wild-work/internal/codearts"
+	"wild-work/internal/comate"
 	"wild-work/internal/config"
 	"wild-work/internal/custom"
 	"wild-work/internal/devdump"
@@ -41,6 +42,7 @@ import (
 	"wild-work/internal/glm"
 	"wild-work/internal/kilo"
 	"wild-work/internal/ledger"
+	"wild-work/internal/lingxi"
 	"wild-work/internal/lobsterai"
 	"wild-work/internal/loomy"
 	"wild-work/internal/loopguard"
@@ -56,6 +58,8 @@ import (
 	"wild-work/internal/qodercom"
 	"wild-work/internal/qwenwork"
 	"wild-work/internal/raccoon"
+	"wild-work/internal/sanitize"
+	"wild-work/internal/sanitizecfg"
 	"wild-work/internal/scheduler"
 	"wild-work/internal/server"
 	"wild-work/internal/stats"
@@ -113,6 +117,11 @@ func main() {
 		} else {
 			fatal("加载配置失败：%v\n\n请检查 config.json 后重新启动", err)
 		}
+	}
+	// 脱敏规则：sanitize.toml 首次运行生成完整模板；存在时把用户条目追加到内置表末尾。
+	if sanitizecfg.EnsureFile("sanitize.toml") {
+		sanitize.Load("sanitize.toml")
+		upstream.Load("sanitize.toml")
 	}
 	// 管理面板鉴权：监听非环回地址（0.0.0.0 / 网卡 IP）时必须设置管理员密码，
 	// 否则局域网任何设备都能无凭据打开面板、退出程序。启动层与面板保存层双重把关。
@@ -191,6 +200,19 @@ func main() {
 	if err != nil {
 		fatal("读取 Cline 账号目录失败：%v", err)
 	}
+	// Comate：粘贴型渠道，凭据是 WPS 账号的 wps_sid Cookie，由面板「粘贴 wps_sid」写入 auths/。
+	// Cookie 不轮换 ⇒ 无 refresh、无保活、无签到。
+	cmAuths, err := auth.LoadComateDir(cfg.AuthDir)
+	if err != nil {
+		fatal("读取 Comate 账号目录失败：%v", err)
+	}
+	// Lingxi：粘贴型渠道，凭据同为 WPS 账号的 wps_sid Cookie（灵犀侧门禁独立，须灵犀已开通），
+	// 由面板「粘贴 wps_sid」写入 auths/lingxi-*.json。Cookie 不轮换 ⇒ 无 refresh/保活；
+	// 但有每日签到（领智点），由调度器按 checkinMinutes 执行。
+	lxAuths, err := auth.LoadLingxiDir(cfg.AuthDir)
+	if err != nil {
+		fatal("读取 Lingxi 账号目录失败：%v", err)
+	}
 	// OfficeAce：导入型渠道，凭据由面板从本机 OfficeAce 客户端文件发现或自助 OAuth 登录写入 auths/。
 	oaAuths, err := auth.LoadOfficeAceDir(cfg.AuthDir)
 	if err != nil {
@@ -227,8 +249,8 @@ func main() {
 	if err != nil {
 		fatal("读取 CodeArts 账号目录失败：%v", err)
 	}
-	log.Printf("loaded accounts: workbuddy=%d %s, traework=%d, qoder=%d, qodercn=%d, qodercom=%d, workbuddyai=%d, qwenwork=%d, glm=%d, monkeycode=%d, raccoon=%d, loomy=%d, cline=%d, officeace=%d, oczen=%d(匿名), kilo=%d(匿名), minimax=%d, lobsterai=%d, zcode=%d, gemini=%d, codearts=%d from %s",
-		len(wbAuths), cfg.Region, len(trAuths), len(qdAuths), len(qcnAuths), len(qcmAuths), len(wbaAuths), len(qwAuths), len(glmAuths), len(mcAuths), len(rcAuths), len(lmAuths), len(clAuths), len(oaAuths), len(ocAuths), len(kiAuths), len(mimAuths), len(lobAuths), len(zcdAuths), len(gemAuths), len(caAuths), cfg.AuthDir)
+	log.Printf("loaded accounts: workbuddy=%d %s, traework=%d, qoder=%d, qodercn=%d, qodercom=%d, workbuddyai=%d, qwenwork=%d, glm=%d, monkeycode=%d, raccoon=%d, loomy=%d, cline=%d, comate=%d, lingxi=%d, officeace=%d, oczen=%d(匿名), kilo=%d(匿名), minimax=%d, lobsterai=%d, zcode=%d, gemini=%d, codearts=%d from %s",
+		len(wbAuths), cfg.Region, len(trAuths), len(qdAuths), len(qcnAuths), len(qcmAuths), len(wbaAuths), len(qwAuths), len(glmAuths), len(mcAuths), len(rcAuths), len(lmAuths), len(clAuths), len(cmAuths), len(lxAuths), len(oaAuths), len(ocAuths), len(kiAuths), len(mimAuths), len(lobAuths), len(zcdAuths), len(gemAuths), len(caAuths), cfg.AuthDir)
 
 	wbPool := pool.New(filepath.Join(stateDir, "state-workbuddy.json"))
 	for _, a := range wbAuths {
@@ -285,6 +307,16 @@ func main() {
 	clPool := pool.New(filepath.Join(stateDir, "state-cline.json"))
 	for _, a := range clAuths {
 		clPool.Add(a)
+	}
+	// Comate：真多账号池（一份 wps_sid = 一个 WPS 账号），不置 SingleAccount。
+	cmPool := pool.New(filepath.Join(stateDir, "state-comate.json"))
+	for _, a := range cmAuths {
+		cmPool.Add(a)
+	}
+	// Lingxi：真多账号池（一份 wps_sid = 一个 WPS 账号，灵犀侧开通），不置 SingleAccount。
+	lxPool := pool.New(filepath.Join(stateDir, "state-lingxi.json"))
+	for _, a := range lxAuths {
+		lxPool.Add(a)
 	}
 	// OfficeAce：真多账号池（每个华为账号一份凭据），不置 SingleAccount。
 	oaPool := pool.New(filepath.Join(stateDir, "state-officeace.json"))
@@ -363,6 +395,14 @@ func main() {
 	// 长回答必被从中间掐断。共用 Transport 以复用连接池。
 	clUp.HTTP.Timeout = time.Duration(cfg.Upstream.TimeoutSeconds) * time.Second
 	clUp.StreamHTTP.Transport = clUp.HTTP.Transport
+	cmUp := comate.New()
+	// Comate：与 cline 同款——非流式 client 保留总超时；StreamHTTP 不设 Timeout（R35）。
+	cmUp.HTTP.Timeout = time.Duration(cfg.Upstream.TimeoutSeconds) * time.Second
+	cmUp.StreamHTTP.Transport = cmUp.HTTP.Transport
+	lxUp := lingxi.New()
+	// Lingxi：与 comate 同款——非流式 client 保留总超时；StreamHTTP 不设 Timeout（R35）。
+	lxUp.HTTP.Timeout = time.Duration(cfg.Upstream.TimeoutSeconds) * time.Second
+	lxUp.StreamHTTP.Transport = lxUp.HTTP.Transport
 	oaUp := officeace.New()
 	// OfficeAce 上游为华为 AgentArts 网关：恒 stream=true，长回答（含思维链）常见，
 	// 非流式 client 保留总超时兜底；StreamHTTP 不设 Timeout（R35）。
@@ -396,6 +436,13 @@ func main() {
 	// CodeArts：对话走华为 snap-access（HMAC 签名）且长思考常见；非流式 client 留总超时兜底，
 	// StreamHTTP 不设 Timeout（R35），两者共用 Transport。
 	caUp := codearts.New()
+	// 不可用模型摘除记录落盘（R143）：81009.404/002002009 是账号权限结论、不会自愈，
+	// 故持久化且无过期；重新登录成功后由 login 路径 ClearUnusable 清空。
+	//
+	// ⚠️ **绝不能**写进 state-codearts.json：那个文件由 pool.saveLocked 整文件覆写
+	// （它不认识额外键），一次积分刷新/签到就会把摘除记录抹掉——线上实测 2026-10-26，
+	// 表现为被摘除的模型重启后重新出现。两个写入者必须各用各的文件。
+	caUp.UnusableFile = filepath.Join(stateDir, "models-codearts.json")
 	caUp.HTTP.Timeout = time.Duration(cfg.Upstream.TimeoutSeconds) * time.Second
 	caUp.StreamHTTP.Transport = caUp.HTTP.Transport
 	glmUp := glm.New()
@@ -437,6 +484,8 @@ func main() {
 		provider.Raccoon.String():     {rcUp.HTTP, rcUp.StreamHTTP},
 		provider.Loomy.String():       {lmUp.HTTP, lmUp.StreamHTTP},
 		provider.Cline.String():       {clUp.HTTP, clUp.StreamHTTP},
+		provider.Comate.String():      {cmUp.HTTP, cmUp.StreamHTTP},
+		provider.Lingxi.String():      {lxUp.HTTP, lxUp.StreamHTTP},
 		provider.OfficeAce.String():   {oaUp.HTTP, oaUp.StreamHTTP},
 		provider.Oczen.String():       {ocUp.HTTP, ocUp.StreamHTTP},
 		provider.Kilo.String():        {kiUp.HTTP, kiUp.StreamHTTP},
@@ -466,8 +515,8 @@ func main() {
 		log.Printf("ledger init failed（统计功能不可用）: %v", lgerr)
 	}
 
-	wbSch := scheduler.New(scheduler.Config{Pool: wbPool, Upstream: wbUp, Name: "workbuddy", CheckinMinutes: checkinMinutes, KeepaliveHours: cfg.Schedule.KeepaliveHours, Ledger: lg})
-	trSch := scheduler.New(scheduler.Config{Pool: trPool, Upstream: trUp, Name: "traework", CheckinMinutes: checkinMinutes, KeepaliveHours: cfg.Schedule.KeepaliveHours, Ledger: lg})
+	wbSch := scheduler.New(scheduler.Config{Pool: wbPool, Upstream: wbUp, Name: "workbuddy", FollowGlobalCheckin: true, CheckinMinutes: checkinMinutes, KeepaliveHours: cfg.Schedule.KeepaliveHours, Ledger: lg})
+	trSch := scheduler.New(scheduler.Config{Pool: trPool, Upstream: trUp, Name: "traework", FollowGlobalCheckin: true, CheckinMinutes: checkinMinutes, KeepaliveHours: cfg.Schedule.KeepaliveHours, Ledger: lg})
 	// Qoder 无签到活动：调度器只做 token keepalive（每日 refresh 保活）。
 	// CheckinMinutes 用显式空切片关闭（传 nil 会被 scheduler.New 补成默认 9:00/21:00）。
 	qdSch := scheduler.New(scheduler.Config{Pool: qdPool, Upstream: qdUp, Name: "qoder", CheckinMinutes: []int{}, KeepaliveHours: cfg.Schedule.KeepaliveHours, Ledger: lg})
@@ -476,7 +525,7 @@ func main() {
 	// 不记录/上报签到状态，保持对用户透明。
 	// Keepalive 关闭（token 有效期 365 天，无需每日刷新），用显式空切片关闭
 	// （传 nil 会被 scheduler.New 补成默认 22:00）。
-	wbaSch := scheduler.New(scheduler.Config{Pool: wbaPool, Upstream: wbaUp, Name: "workbuddyai",
+	wbaSch := scheduler.New(scheduler.Config{Pool: wbaPool, Upstream: wbaUp, Name: "workbuddyai", FollowGlobalCheckin: true,
 		CheckinMinutes: checkinMinutes, KeepaliveHours: []int{}, ActivitiesOnly: true, Ledger: lg})
 	// 千问办公：无签到活动（每日积分服务端被动发放，无需保活/领取）；
 	// CheckinMinutes + KeepaliveHours 均为显式空切片，本渠道没有任何定时任务
@@ -496,7 +545,7 @@ func main() {
 	// ——它是「直接领一次」的接口，没有 Qoder 那种「活动整点后才创建」的延迟，
 	// 每个签到时刻单次尝试即可（失败状态会在下一个时刻重试），避免窗口内每分钟空跑。
 	// KeepaliveHours 仍为显式空切片：上游无 refresh 端点，保活没有可刷的东西。
-	mcSch := scheduler.New(scheduler.Config{Pool: mcPool, Upstream: mcUp, Name: "monkeycode",
+	mcSch := scheduler.New(scheduler.Config{Pool: mcPool, Upstream: mcUp, Name: "monkeycode", FollowGlobalCheckin: true,
 		CheckinMinutes: checkinMinutes, KeepaliveHours: []int{}, Ledger: lg})
 	// 小浣熊：签到走 setting_info（每日积分惰性落账的触发点，见 internal/raccoon/checkin.go）。
 	// access_token 实测仅 ≈2h，而 refresh_token ≈30 天，
@@ -505,7 +554,7 @@ func main() {
 	//
 	// 签到时间用全局配置（checkinMinutes）：上游按天去重、无活动上线延迟问题，
 	// 故**不设 CheckinRetryUntil**（窗口重试是为「活动尚未创建」设计的，本渠道无此语义）。
-	rcSch := scheduler.New(scheduler.Config{Pool: rcPool, Upstream: rcUp, Name: "raccoon",
+	rcSch := scheduler.New(scheduler.Config{Pool: rcPool, Upstream: rcUp, Name: "raccoon", FollowGlobalCheckin: true,
 		CheckinMinutes: checkinMinutes, KeepaliveHours: []int{1, 5, 9, 13, 17, 21}, Ledger: lg})
 	// Loomy：已实现签到（宠物每日打工奖励，POST /api/v1/pet-work/rewards，
 	// 见 internal/loomy/checkin.go）——判据是该账号当日**有效对话轮次**（上游算），
@@ -514,16 +563,26 @@ func main() {
 	// 窗口内每分钟重试既无意义又违反 §0.1；每个签到时刻单次尝试即可。
 	// KeepaliveHours 仍为显式空切片：**上游无 refresh 端点**（session 14 天，到期需重新登录/导入），
 	// 保活没有可刷的东西（refreshToken 为空，调度器会跳过并只记一条日志）。
-	lmSch := scheduler.New(scheduler.Config{Pool: lmPool, Upstream: lmUp, Name: "loomy",
+	lmSch := scheduler.New(scheduler.Config{Pool: lmPool, Upstream: lmUp, Name: "loomy", FollowGlobalCheckin: true,
 		CheckinMinutes: checkinMinutes, KeepaliveHours: []int{}, Ledger: lg})
 	// Cline：官方 API Key **不过期**、无签到活动、无 refresh token ⇒ 定时任务全部关闭。
 	// 必须传显式空切片 []int{}（R39）：传 nil 会被 scheduler.New 的零值兜底补上默认时间，
 	// 于是每天空跑一次必然失败的签到，并在面板渲染红色「签到失败」。
 	clSch := scheduler.New(scheduler.Config{Pool: clPool, Upstream: clUp, Name: "cline",
 		CheckinMinutes: []int{}, KeepaliveHours: []int{}, Ledger: lg})
+	// Comate：wps_sid Cookie **不过期**、无签到活动、无 refresh token ⇒ 定时任务全部关闭。
+	// 必须传显式空切片 []int{}（R39）：传 nil 会被 scheduler.New 的零值兜底补上默认时间，
+	// 于是每天空跑一次必然失败的签到，并在面板渲染红色「签到失败」。
+	cmSch := scheduler.New(scheduler.Config{Pool: cmPool, Upstream: cmUp, Name: "comate",
+		CheckinMinutes: []int{}, KeepaliveHours: []int{}, Ledger: lg})
+	// Lingxi：有每日签到（daily_check_in 领智点，见 internal/lingxi/checkin.go），
+	// 但 wps_sid Cookie 不过期、无 refresh token ⇒ 只开签到、不开保活。
+	// 签到时刻用全局配置（上游按天去重、无活动上线延迟，不设 CheckinRetryUntil）。
+	lxSch := scheduler.New(scheduler.Config{Pool: lxPool, Upstream: lxUp, Name: "lingxi", FollowGlobalCheckin: true,
+		CheckinMinutes: checkinMinutes, KeepaliveHours: []int{}, Ledger: lg})
 	// OfficeAce：有每日签到（bonus/claim）但要先有临时凭据（V11 签名），保活用于续期。
 	// CheckinMinutes 用全局签到时间；KeepaliveHours 用配置保活时段（临时凭据约 2h 到期）。
-	oaSch := scheduler.New(scheduler.Config{Pool: oaPool, Upstream: oaUp, Name: "officeace",
+	oaSch := scheduler.New(scheduler.Config{Pool: oaPool, Upstream: oaUp, Name: "officeace", FollowGlobalCheckin: true,
 		CheckinMinutes: checkinMinutes, KeepaliveHours: cfg.Schedule.KeepaliveHours, Ledger: lg})
 	// OpenCodeZen 匿名：无账号、无签到、无 token 可保活（凭证是常量 public）。
 	// CheckinMinutes/KeepaliveHours 均为显式空切片 → 调度器不发生任何上游调用。
@@ -536,11 +595,11 @@ func main() {
 		CheckinMinutes: []int{}, KeepaliveHours: []int{}})
 	// MiniMax：有每日签到（7 天面板，claim 幂等判据是响应里的 claim_result），
 	// 也需要 token 保活（refresh_token 会轮换，刷新后必须落盘）。
-	mimSch := scheduler.New(scheduler.Config{Pool: mimPool, Upstream: mimUp, Name: "minimax",
+	mimSch := scheduler.New(scheduler.Config{Pool: mimPool, Upstream: mimUp, Name: "minimax", FollowGlobalCheckin: true,
 		CheckinMinutes: checkinMinutes, KeepaliveHours: cfg.Schedule.KeepaliveHours, Ledger: lg})
 	// LobsterAI：有每日签到（三步：slot → context → check_in，客户端幂等键），
 	// 也需要 token 保活（refresh 会轮换，刷新后必须落盘）。
-	lobSch := scheduler.New(scheduler.Config{Pool: lobPool, Upstream: lobUp, Name: "lobsterai",
+	lobSch := scheduler.New(scheduler.Config{Pool: lobPool, Upstream: lobUp, Name: "lobsterai", FollowGlobalCheckin: true,
 		CheckinMinutes: checkinMinutes, KeepaliveHours: cfg.Schedule.KeepaliveHours, Ledger: lg})
 	// ZCode：**无签到**（积分领取依赖阿里云验证码 + headful 浏览器，本仓不实现；
 	// DailyCheckin 返回明确的「不支持」错误而不是伪造成功），且凭据**不可续期**
@@ -555,13 +614,13 @@ func main() {
 		CheckinMinutes: []int{}, KeepaliveHours: cfg.Schedule.KeepaliveHours, Ledger: lg})
 	// CodeArts：有每日签到（三步，走 HMAC 签名；本包实现了 CheckinReporter/CheckinGranter，
 	// 签到结果按结构化状态上报），也需要 token 保活（续期后必须落盘，不变量 20）。
-	caSch := scheduler.New(scheduler.Config{Pool: caPool, Upstream: caUp, Name: "codearts",
+	caSch := scheduler.New(scheduler.Config{Pool: caPool, Upstream: caUp, Name: "codearts", FollowGlobalCheckin: true,
 		CheckinMinutes: checkinMinutes, KeepaliveHours: cfg.Schedule.KeepaliveHours, Ledger: lg})
 	// 智谱清言：签到与对话联动（当日需先对话才能领打卡进度），故保活与签到
 	// 合成一个流程（glm.Client.Keepalive 先发最小对话再签到）。
 	// 用 DailyCheckin 通道驱动：CheckinMinutes 用全局签到时间，
 	// KeepaliveHours 也用同一时段（保活=签到，不必额外一次）。
-	glmSch := scheduler.New(scheduler.Config{Pool: glmPool, Upstream: glmUp, Name: "glm",
+	glmSch := scheduler.New(scheduler.Config{Pool: glmPool, Upstream: glmUp, Name: "glm", FollowGlobalCheckin: true,
 		CheckinMinutes: checkinMinutes, KeepaliveHours: cfg.Schedule.KeepaliveHours, Ledger: lg})
 
 	runtimes := map[provider.Kind]*server.Runtime{
@@ -582,6 +641,8 @@ func main() {
 		provider.Loomy:      {Kind: provider.Loomy, Pool: lmPool, Upstream: lmUp, StaticModels: loomy.StaticModels()},
 		provider.GLM:        {Kind: provider.GLM, Pool: glmPool, Upstream: glmUp, StaticModels: glm.StaticModels()},
 		provider.Cline:      {Kind: provider.Cline, Pool: clPool, Upstream: clUp, StaticModels: cline.StaticModels()},
+		provider.Comate:     {Kind: provider.Comate, Pool: cmPool, Upstream: cmUp, StaticModels: comate.StaticModels()},
+		provider.Lingxi:     {Kind: provider.Lingxi, Pool: lxPool, Upstream: lxUp, StaticModels: lingxi.StaticModels()},
 		provider.OfficeAce:  {Kind: provider.OfficeAce, Pool: oaPool, Upstream: oaUp, StaticModels: officeace.StaticModels()},
 		// 注意：GLM **不**置 SingleAccount。
 		//
@@ -610,7 +671,8 @@ func main() {
 		// Gemini：真多账号渠道 ⇒ 不置 SingleAccount。
 		provider.Gemini: {Kind: provider.Gemini, Pool: gemPool, Upstream: gemUp, StaticModels: gemini.StaticModels()},
 		// CodeArts：真多账号渠道 ⇒ 不置 SingleAccount。
-		provider.CodeArts: {Kind: provider.CodeArts, Pool: caPool, Upstream: caUp, StaticModels: codearts.StaticModels()},
+		provider.CodeArts: {Kind: provider.CodeArts, Pool: caPool, Upstream: caUp, StaticModels: codearts.StaticModels(),
+			ModelFilter: caUp.FilterUnusable},
 	}
 	appRuntimes := map[provider.Kind]*app.Runtime{
 		provider.WorkBuddy:   {Kind: provider.WorkBuddy, Pool: wbPool, Upstream: wbUp, Scheduler: wbSch},
@@ -626,6 +688,8 @@ func main() {
 		provider.Loomy:       {Kind: provider.Loomy, Pool: lmPool, Upstream: lmUp, Scheduler: lmSch},
 		provider.GLM:         {Kind: provider.GLM, Pool: glmPool, Upstream: glmUp, Scheduler: glmSch},
 		provider.Cline:       {Kind: provider.Cline, Pool: clPool, Upstream: clUp, Scheduler: clSch},
+		provider.Comate:      {Kind: provider.Comate, Pool: cmPool, Upstream: cmUp, Scheduler: cmSch},
+		provider.Lingxi:      {Kind: provider.Lingxi, Pool: lxPool, Upstream: lxUp, Scheduler: lxSch},
 		provider.OfficeAce:   {Kind: provider.OfficeAce, Pool: oaPool, Upstream: oaUp, Scheduler: oaSch},
 		provider.Oczen:       {Kind: provider.Oczen, Pool: ocPool, Upstream: ocUp, Scheduler: ocSch},
 		provider.Kilo:        {Kind: provider.Kilo, Pool: kiPool, Upstream: kiUp, Scheduler: kiSch},
@@ -685,15 +749,16 @@ func main() {
 		// 硬冷却截到每日发奖窗口（方案 B）：qwenwork 每日 00:00 UTC+8 发额度，
 		// 账本实测 00:01~00:20 到账。固定 12h 会把 19:07 的 402 锁到次日 07:07，
 		// 白锁 7 小时；按窗口截断后 00:30 即解冻，额度一到账就能用。
-		HardCooldownFor:  cfg.HardCooldownFor,
-		SoftCooldown:     cfg.SoftRateDur,
-		ErrThreshold:     cfg.Cooldown.ErrThresh,
-		ErrCooldown:      cfg.ErrCooldownDur,
-		ModelFallbacks:   cfg.ModelFallback,    // 启动时载入降级链（此前仅面板保存后热更新，重启即丢）
-		ReasoningEfforts: cfg.ReasoningEfforts, // 启动时载入思考强度映射（同上）
-		MaxRequestBody:   int64(cfg.Server.MaxRequestBodyMB) << 20, // 0 = server 默认 128MiB
-		WebUI:            sub,
-		AttachAPI:        appInst.HandleAPI,
+		HardCooldownFor:   cfg.HardCooldownFor,
+		SoftCooldown:      cfg.SoftRateDur,
+		ErrThreshold:      cfg.Cooldown.ErrThresh,
+		ErrCooldown:       cfg.ErrCooldownDur,
+		ModelFallbacks:    cfg.ModelFallback,                        // 启动时载入降级链（此前仅面板保存后热更新，重启即丢）
+		ReasoningEfforts:  cfg.ReasoningEfforts,                     // 启动时载入思考强度映射（同上）
+		MaxRequestBody:    int64(cfg.Server.MaxRequestBodyMB) << 20, // 0 = server 默认 128MiB
+		StickyMaxRequests: cfg.Server.StickyMaxRequests,
+		WebUI:             sub,
+		AttachAPI:         appInst.HandleAPI,
 	})
 	inner.SetCustomRuntimes(initCustomServerRts)
 
@@ -721,6 +786,9 @@ func main() {
 			Default:  cfg.Compat.DefaultChannel,
 			Map:      cfg.Compat.ModelMap,
 			Channels: gateway.SortChannels(currentChannels()),
+			// 启动时也要带上别名表（R129）：不得只靠面板热更新——否则重启后
+			// 「Chat 能用别名、Codex 不能用」，直到用户重新保存一次降级链。
+			Aliases: config.AliasIndex(cfg.ModelFallback),
 		},
 		MaxTokensCap: cfg.Compat.MaxTokensCap,
 	})
@@ -728,9 +796,13 @@ func main() {
 	appInst.SetCompatSyncer(func(defaultChannel string, maxTokensCap int, modelMap map[string]string) {
 		compat.SetCompat(defaultChannel, maxTokensCap, modelMap, currentChannels())
 	})
-	// 面板保存模型降级链时热更新内层 handler（不然新链要重启才生效）
+	// 面板保存模型降级链时热更新**两处**（R129）：内层 handler（降级路由 + 别名解析）
+	// 与兼容层（Responses / Anthropic 的别名表）。旧实现只推内层，这是既有接线缺口——
+	// 漏推的表现是「Chat 能用别名、Codex 不能」。兼容层的别名表走独立的 SetAliases，
+	// 不扩展 SetCompat（后者由另一条保存路径负责，两条通道互不覆盖）。
 	appInst.SetModelFallbackSyncer(func(rules []config.ModelFallbackRule) {
 		inner.SetModelFallbacks(rules)
+		compat.SetAliases(config.AliasIndex(rules))
 	})
 	// 面板保存思考强度映射时热更新内层 handler（不然新映射要重启才生效）
 	appInst.SetReasoningEffortsSyncer(func(efforts map[string]string) {
@@ -797,6 +869,11 @@ func main() {
 	// Cline 的 Run 同样不可漏（R34：漏了不报错，只表现为该渠道定时逻辑从不运行）。
 	// 本渠道任务全关，Run 只会阻塞等 ctx/配置变更，但缺了它将来加任务即静默失效。
 	go clSch.Run(sctx)
+	// Comate 的 Run 同样不可漏（R34）：本渠道当前无任何定时任务，Run 只会阻塞等
+	// ctx/配置变更；但漏了它，将来给它加任务就会静默不跑。
+	go cmSch.Run(sctx)
+	// Lingxi 的 Run 不可漏（R34）：本渠道有每日签到任务。
+	go lxSch.Run(sctx)
 	// OfficeAce 的 Run 不可漏（R34）：本渠道有签到与保活。
 	go oaSch.Run(sctx)
 	// kilo 的 Run 同样不可漏（R34）：本渠道当前无任何定时任务，Run 只会阻塞等
@@ -840,11 +917,21 @@ func main() {
 		// 已按 InfoOnly 呈现在明细里、不参与积分算术，纳入只会刷出一个无意义的 0。
 		// CodeArts 有 benefit 额度（按 UTC+8 自然日重置）与积分账户形态，必须纳入。
 		provider.CodeArts,
+		// Lingxi 有 credits/balance 余额端点（智点）：不纳入就只在每日签到时刷一次，
+		// 对话消耗后面板数字最长滞后一个签到周期（2026-10-29 审查 W2 补登）。
+		provider.Lingxi,
 	}, app.CreditRefreshInterval)
 
 	// 启动即刷新「模型列表 + 费率」，之后每 30 分钟。
 	// 否则刚启动时费率缓存为空，面板下方全是 unknown（需手动点刷新才正常）。
 	appInst.StartPricingAutoRefresh(sctx, app.PricingRefreshInterval)
+
+	// Comate 空目录账号巡检（R135）：SubmitComateSID 只挡「新增」账号，
+	// 而线上已有一批在 R135 之前加进去、账号侧一个模型都没有的 WPS 号。
+	// 它们按 uid 顺序被选走 → mock 帧「未配置可用模型」→ 整条渠道对所有人失败，
+	// 且该帧是 HTTP 200，handler 无法在同一请求内换号。
+	// 故启动后异步扫一遍（零积分、一次 GET /models/账号），把这类号停用。
+	go appInst.SweepComateEmptyAccounts()
 
 	// 运行统计喂入器（账号状态差值/粘性路由/今日作废，30s 一轮）：
 	// 进程内直调各数据源，面板「运行统计」tab 即时可用。

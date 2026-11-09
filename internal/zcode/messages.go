@@ -38,7 +38,12 @@ const defaultMaxTokens = 8192
 //
 // entry/known 是该模型在「动态目录 ∪ 静态兜底」里的能力声明（不认识时 known=false）：
 // 思考档位是否合法必须以模型声明为输入（R49：只透传上游声明的档位，绝不编造）。
-func buildMessagesBody(raw []byte, entry catalogEntry, known bool) ([]byte, error) {
+//
+// deviceID 是账号的 `device_mid`（= `X-Device-Mid`）：本渠道要求出站体带
+// `metadata.user_id = JSON.stringify({device_id, account_uuid:"", session_id:""})`
+// （参考实现 magpie 的 Start Plan 契约，2026-10-23 实测必需）。旧实现完全不发
+// metadata，虽非 3012 根因（根因是第 4 块），但四个参考实现全部下发，照发零代价。
+func buildMessagesBody(raw []byte, entry catalogEntry, known bool, deviceID string) ([]byte, error) {
 	var in map[string]any
 	if err := json.Unmarshal(raw, &in); err != nil {
 		return nil, fmt.Errorf("请求体不是合法 JSON：%w", err)
@@ -68,6 +73,13 @@ func buildMessagesBody(raw []byte, entry catalogEntry, known bool) ([]byte, erro
 		// 非流式客户端由网关用 Aggregate 收敛；一旦透传 false，上游会回**单个 JSON 对象**，
 		// 被 SSE 转换器整包丢弃 → HTTP 200 + 空 content + 0 usage 的静默失败。
 		"stream": true,
+	}
+	// metadata.user_id = {device_id, account_uuid:"", session_id:""}（参考实现 magpie
+	// 的 Start Plan 契约，2026-10-23 实测）。device_id 必须与 X-Device-Mid 一致
+	// （同一账号同一设备）。旧实现缺失此字段，四个参考实现全部下发，照发零代价。
+	m := map[string]any{"device_id": deviceID, "account_uuid": "", "session_id": ""}
+	if mj, err := json.Marshal(m); err == nil {
+		out["metadata"] = map[string]any{"user_id": string(mj)}
 	}
 	// max_tokens：**恒下发**（官方如此）。有值用值，无值用兜底。
 	if n, ok := posNum(in, "max_tokens"); ok {

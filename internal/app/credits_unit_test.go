@@ -1,6 +1,7 @@
 package app
 
 import (
+	"errors"
 	"testing"
 
 	"wild-work/internal/config"
@@ -38,5 +39,80 @@ func TestCreditsUnitTokenChannels(t *testing.T) {
 		if !a.creditsNAKind(k.String()) {
 			t.Errorf("%s 应保持 credits_na（无额度概念）", k)
 		}
+	}
+}
+
+// TestCreditsNAComate 守门 comate 的积分口径（R136，推翻 R130 的结论）：
+// 额度真实端点是 /llmproxy/v1/user/token-usage（每日 limit/remain/used）+ WPS 账号级
+// 每日额度，能查 ⇒ 必须走正常积分口径，**不得**再标 credits_na
+// （标了面板就显示「不适用」、也没有「刷新积分」入口，用户看不到真实剩余）。
+//
+// R130 曾据「/credits /userinfo /me 全 404」判成 NA —— 那是把「端点名猜错」当成了
+// 「上游没有额度」。这条测试就是那次反转的护栏。
+func TestCreditsNAComate(t *testing.T) {
+	a := &App{cfg: &config.Config{}}
+	if a.creditsNAKind(provider.Comate.String()) {
+		t.Error("comate 有真实额度端点（token-usage 的每日额度），不应标 credits_na")
+	}
+	if got := a.creditsUnit(provider.Comate.String()); got != "" {
+		t.Errorf("comate creditsUnit = %q，期望空串（它不是 token 计量渠道）", got)
+	}
+}
+
+// TestComateNicknameFor：用户手工改过的昵称不能被「重贴 sid / 启动巡检」冲掉。
+// 实测事故：一位用户把企业号改名成「business」，重贴一次 sid 就变回「李柠希（西南大学）」。
+func TestComateNicknameFor(t *testing.T) {
+	cases := []struct {
+		name  string
+		uid   string
+		prev  string
+		fetch func() (string, error)
+		want  string
+	}{
+		{
+			name: "已有自定义昵称：原样保留，且不再请求上游",
+			uid:  "sid-9d1e0d534e2f4da9",
+			prev: "business",
+			fetch: func() (string, error) {
+				t.Fatal("已有自定义昵称时不该再请求上游")
+				return "", nil
+			},
+			want: "business",
+		},
+		{
+			name:  "占位昵称：换成上游身份",
+			uid:   "sid-9d1e0d534e2f4da9",
+			prev:  "WPS 账号 2f4da9",
+			fetch: func() (string, error) { return "李柠希（西南大学）", nil },
+			want:  "李柠希（西南大学）",
+		},
+		{
+			name:  "新账号：用上游身份",
+			uid:   "sid-9d1e0d534e2f4da9",
+			prev:  "",
+			fetch: func() (string, error) { return "李柠希（西南大学）", nil },
+			want:  "李柠希（西南大学）",
+		},
+		{
+			name:  "上游取不到：回退 uid 尾号",
+			uid:   "sid-9d1e0d534e2f4da9",
+			prev:  "",
+			fetch: func() (string, error) { return "", errors.New("超时") },
+			want:  "WPS 账号 2f4da9",
+		},
+		{
+			name:  "上游回空串：同样回退 uid 尾号",
+			uid:   "sid-9d1e0d534e2f4da9",
+			prev:  "",
+			fetch: func() (string, error) { return "  ", nil },
+			want:  "WPS 账号 2f4da9",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			if got := comateNicknameFor(c.uid, c.prev, c.fetch); got != c.want {
+				t.Fatalf("got %q, want %q", got, c.want)
+			}
+		})
 	}
 }

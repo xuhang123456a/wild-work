@@ -315,7 +315,7 @@ Windows 图标嵌入：`rsrc -ico cmd/wild-work/icon.ico -o cmd/wild-work/rsrc_w
    - 继续使用上次选择的账号 A，递增请求计数
    - 除非触发以下任一条件：
      a. **遭遇上游错误**：按原有冷却逻辑处理（硬冷却 12h/软冷却 1min/错误阈值 10min），清除粘性记录
-     b. **连续请求次数达到上限**：`reqCount >= maxReqs`（默认 50），自动降级换账号
+     b. **连续请求次数达到上限**：`reqCount >= maxReqs`（阈值取 `config.server.sticky_max_requests`，默认 50，R127），自动降级换账号
 
 > **为什么不使用 credits 阈值？** pool 中的 credits 仅在定时签到/手动刷新时更新，对话后是 stale 数据，
 > 无法反映实时消耗。改用请求计数简单可靠，不依赖上游余额接口。
@@ -323,7 +323,7 @@ Windows 图标嵌入：`rsrc -ico cmd/wild-work/icon.ico -o cmd/wild-work/rsrc_w
 #### 伪代码
 
 ```go
-const defaultMaxReqs = 50
+// 阈值来源：config.server.sticky_max_requests（默认 config.DefaultStickyMaxRequests = 50，R127）
 
 // 粘性路由
 sticky := getSticky(kind)
@@ -334,9 +334,9 @@ if sticky != nil && sticky.reqCount < sticky.maxReqs {
     }
 }
 
-// 降级：选择余额最高的 healthy 账号
-acct := pickHighest(healthy)
-setSticky(kind, &stickyEntry{uid: acct.UID, maxReqs: defaultMaxReqs})
+// 降级：按最早到期优先选 healthy 账号（R112）
+acct := pickEarliestExpire(healthy)
+setSticky(kind, &stickyEntry{uid: acct.UID, maxReqs: h.cfg.StickyMaxRequests})
 
 // 成功响应时递增计数
 stickySuccess(kind)  // reqCount++
@@ -378,7 +378,7 @@ const (
 2. **healthy 判断**：只考虑 `disabled=false` 且 `until.IsZero() || now.After(until)` 的账号
 3. **错误时清除**：上游错误（≥400、传输失败、refresh 失败）均调用 `stickyClear` 清除粘性记录
 4. **成功时递增**：`stickySuccess` 仅在 ChatStream 成功返回后调用
-5. **计数上限**：`maxReqs` 默认 50，连续成功 50 次后自动降级换号
+5. **计数上限**：`maxReqs` 取 `config.server.sticky_max_requests`（默认 50，R127），连续成功到阈值后自动降级换号；阈值在建记录时快照，运行中改配置只影响新记录
 6. **错误透传**：≥400 错误仍直接透传原始响应体给客户端
 
 ### 9.6 预期效果
